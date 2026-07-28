@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Literal
 
 from pydantic import ConfigDict
@@ -16,6 +17,7 @@ from pydantic import ConfigDict
 from pyquality.domain.models import (
     ApprovalDecision,
     Finding,
+    PolicyDecision,
     PolicyOutcome,
     PublicModel,
     TaskResult,
@@ -69,10 +71,26 @@ class ApprovalRecord(_StorageRecord):
     action_json: str
     action_digest: str
     repository_snapshot_digest: str
+    policy_decision: PolicyDecision | None
     decision: ApprovalDecision | None
     execution_state: Literal["pending", "intent_recorded", "completed"]
+    expected_after_digests: dict[str, str | None]
+    result_digest: str | None
     decided_at: datetime | None
     executed_at: datetime | None
+
+
+class TransitionIntentRecord(_StorageRecord):
+    id: str
+    task_id: str
+    kind: str
+    evidence_digest: str
+    summary: str
+    state: Literal["pending", "completed"]
+    result_digest: str | None
+    completion_summary: str | None
+    created_at: datetime
+    completed_at: datetime | None
 
 
 class DecisionRecord(_StorageRecord):
@@ -92,7 +110,9 @@ class RecoverySnapshot(_StorageRecord):
     findings: tuple[FindingRecord, ...]
     decisions: tuple[DecisionRecord, ...]
     pending_approval: ApprovalRecord | None
+    decided_approval: ApprovalRecord | None
     executable_approval: ApprovalRecord | None
+    transition_intents: tuple[TransitionIntentRecord, ...]
 
 
 _TERMINAL_STATUSES = frozenset(
@@ -268,15 +288,25 @@ class SQLiteTaskRepository:
         action_json: str,
         action_digest: str,
         repository_snapshot_digest: str,
+        *,
+        policy_decision: PolicyDecision | None = None,
     ) -> ApprovalRecord:
+        _require_digest(action_digest, "action_digest")
+        _require_digest(repository_snapshot_digest, "repository_snapshot_digest")
+        if policy_decision is not None and (
+            policy_decision.action_digest != action_digest
+            or policy_decision.repository_snapshot_digest != repository_snapshot_digest
+        ):
+            raise StorageStateError("policy decision does not match approval digests")
         approval_id = _new_id()
         with self._transaction() as connection:
             self._require_iteration(connection, task_id, iteration_id)
             connection.execute(
                 """INSERT INTO approvals
                    (id, task_id, iteration_id, action_json, action_digest, repository_snapshot_digest,
-                    decision, execution_state, decided_at, executed_at, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, NULL, 'pending', NULL, NULL, ?)""",
+                    policy_decision_json, decision, execution_state, expected_after_digests_json,
+                    result_digest, decided_at, executed_at, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, NULL, 'pending', '{}', NULL, NULL, NULL, ?)""",
                 (
                     approval_id,
                     task_id,
@@ -284,6 +314,9 @@ class SQLiteTaskRepository:
                     _canonical_json(action_json),
                     action_digest,
                     repository_snapshot_digest,
+                    _canonical_json(policy_decision.model_dump(mode="json"))
+                    if policy_decision is not None
+                    else None,
                     _dump_datetime(_utc_now()),
                 ),
             )
@@ -312,18 +345,31 @@ class SQLiteTaskRepository:
             )
         return self._approval_by_id(approval_id)
 
-    def mark_execution_intent(self, approval_id: str) -> ApprovalRecord:
+    def mark_execution_intent(
+        self,
+        approval_id: str,
+        *,
+        expected_after_digests: dict[str, str | None] | None = None,
+    ) -> ApprovalRecord:
+        normalized_digests = _validated_path_digests(expected_after_digests or {})
         with self._transaction() as connection:
             row = self._require_approval(connection, approval_id)
             if row["decision"] != ApprovalDecision.APPROVE.value or row["execution_state"] != "pending":
                 raise StorageStateError("approval is not ready for execution intent")
             self._require_running_lease(connection, row["task_id"])
             connection.execute(
-                "UPDATE approvals SET execution_state = 'intent_recorded' WHERE id = ?", (approval_id,)
+                """UPDATE approvals
+                   SET execution_state = 'intent_recorded', expected_after_digests_json = ?
+                   WHERE id = ?""",
+                (_canonical_json(normalized_digests), approval_id),
             )
         return self._approval_by_id(approval_id)
 
-    def mark_execution_completed(self, approval_id: str) -> ApprovalRecord:
+    def mark_execution_completed(
+        self, approval_id: str, *, result_digest: str | None = None
+    ) -> ApprovalRecord:
+        if result_digest is not None:
+            _require_digest(result_digest, "result_digest")
         executed_at = _utc_now()
         with self._transaction() as connection:
             row = self._require_approval(connection, approval_id)
@@ -333,10 +379,83 @@ class SQLiteTaskRepository:
             ):
                 raise StorageStateError("approval execution intent is not recorded")
             connection.execute(
-                "UPDATE approvals SET execution_state = 'completed', executed_at = ? WHERE id = ?",
-                (_dump_datetime(executed_at), approval_id),
+                """UPDATE approvals
+                   SET execution_state = 'completed', result_digest = ?, executed_at = ?
+                   WHERE id = ?""",
+                (result_digest, _dump_datetime(executed_at), approval_id),
             )
         return self._approval_by_id(approval_id)
+
+    def mark_rejection_consumed(self, approval_id: str) -> ApprovalRecord:
+        consumed_at = _utc_now()
+        with self._transaction() as connection:
+            row = self._require_approval(connection, approval_id)
+            if (
+                row["decision"] != ApprovalDecision.REJECT.value
+                or row["execution_state"] != "pending"
+            ):
+                raise StorageStateError("rejected approval is not ready to be consumed")
+            self._require_running_lease(connection, row["task_id"])
+            connection.execute(
+                """UPDATE approvals
+                   SET execution_state = 'completed', executed_at = ? WHERE id = ?""",
+                (_dump_datetime(consumed_at), approval_id),
+            )
+        return self._approval_by_id(approval_id)
+
+    def record_transition_intent(
+        self,
+        task_id: str,
+        *,
+        kind: str,
+        evidence_digest: str,
+        summary: str,
+    ) -> TransitionIntentRecord:
+        _require_transition_text(kind, 64, "kind")
+        _require_transition_text(summary, 1_024, "summary")
+        _require_digest(evidence_digest, "evidence_digest")
+        intent_id = _new_id()
+        created_at = _utc_now()
+        with self._transaction() as connection:
+            self._require_running_lease(connection, task_id)
+            connection.execute(
+                """INSERT INTO transition_intents
+                   (id, task_id, kind, evidence_digest, summary, state, result_digest,
+                    completion_summary, created_at, completed_at)
+                   VALUES (?, ?, ?, ?, ?, 'pending', NULL, NULL, ?, NULL)""",
+                (
+                    intent_id,
+                    task_id,
+                    kind,
+                    evidence_digest,
+                    summary,
+                    _dump_datetime(created_at),
+                ),
+            )
+        return self._transition_intent_by_id(intent_id)
+
+    def complete_transition_intent(
+        self,
+        intent_id: str,
+        *,
+        result_digest: str,
+        summary: str,
+    ) -> TransitionIntentRecord:
+        _require_digest(result_digest, "result_digest")
+        _require_transition_text(summary, 1_024, "summary")
+        completed_at = _utc_now()
+        with self._transaction() as connection:
+            row = self._require_transition_intent(connection, intent_id)
+            if row["state"] != "pending":
+                raise StorageStateError("transition intent is already completed")
+            self._require_running_lease(connection, row["task_id"])
+            connection.execute(
+                """UPDATE transition_intents
+                   SET state = 'completed', result_digest = ?, completion_summary = ?,
+                       completed_at = ? WHERE id = ?""",
+                (result_digest, summary, _dump_datetime(completed_at), intent_id),
+            )
+        return self._transition_intent_by_id(intent_id)
 
     def acquire_project_lease(self, task_id: str) -> bool:
         with self._transaction() as connection:
@@ -446,6 +565,19 @@ class SQLiteTaskRepository:
                    ORDER BY created_at DESC, id DESC LIMIT 1""",
                 (task_id,),
             ).fetchone()
+            decided_row = connection.execute(
+                """SELECT * FROM approvals WHERE task_id = ? AND decision IS NOT NULL
+                   ORDER BY decided_at DESC, id DESC LIMIT 1""",
+                (task_id,),
+            ).fetchone()
+            transition_intents = tuple(
+                _transition_intent_from_row(row)
+                for row in connection.execute(
+                    """SELECT * FROM transition_intents
+                       WHERE task_id = ? ORDER BY created_at, id""",
+                    (task_id,),
+                )
+            )
             lease_row = connection.execute(
                 "SELECT task_id FROM project_leases WHERE project_id = ?", (task_row["project_id"],)
             ).fetchone()
@@ -467,9 +599,11 @@ class SQLiteTaskRepository:
                 findings=findings,
                 decisions=decisions,
                 pending_approval=_approval_from_row(pending_row) if pending_row is not None else None,
+                decided_approval=_approval_from_row(decided_row) if decided_row is not None else None,
                 executable_approval=_approval_from_row(executable_row)
                 if executable_row is not None
                 else None,
+                transition_intents=transition_intents,
             )
 
     @contextmanager
@@ -539,8 +673,11 @@ class SQLiteTaskRepository:
                 action_json TEXT NOT NULL,
                 action_digest TEXT NOT NULL,
                 repository_snapshot_digest TEXT NOT NULL,
+                policy_decision_json TEXT,
                 decision TEXT,
                 execution_state TEXT NOT NULL,
+                expected_after_digests_json TEXT NOT NULL DEFAULT '{}',
+                result_digest TEXT,
                 decided_at TEXT,
                 executed_at TEXT,
                 created_at TEXT NOT NULL
@@ -567,8 +704,32 @@ class SQLiteTaskRepository:
                 task_id TEXT NOT NULL UNIQUE REFERENCES tasks(id),
                 acquired_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS transition_intents (
+                id TEXT PRIMARY KEY,
+                task_id TEXT NOT NULL REFERENCES tasks(id),
+                kind TEXT NOT NULL,
+                evidence_digest TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                state TEXT NOT NULL,
+                result_digest TEXT,
+                completion_summary TEXT,
+                created_at TEXT NOT NULL,
+                completed_at TEXT
+            );
             """
         )
+        self._ensure_column("approvals", "policy_decision_json", "TEXT")
+        self._ensure_column(
+            "approvals", "expected_after_digests_json", "TEXT NOT NULL DEFAULT '{}'"
+        )
+        self._ensure_column("approvals", "result_digest", "TEXT")
+
+    def _ensure_column(self, table: str, column: str, declaration: str) -> None:
+        columns = {
+            row["name"] for row in self._connection.execute(f"PRAGMA table_info({table})")
+        }
+        if column not in columns:
+            self._connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
 
     @staticmethod
     def _require_task(connection: sqlite3.Connection, task_id: str) -> sqlite3.Row:
@@ -595,6 +756,17 @@ class SQLiteTaskRepository:
             raise StorageStateError("approval does not exist")
         return row
 
+    @staticmethod
+    def _require_transition_intent(
+        connection: sqlite3.Connection, intent_id: str
+    ) -> sqlite3.Row:
+        row = connection.execute(
+            "SELECT * FROM transition_intents WHERE id = ?", (intent_id,)
+        ).fetchone()
+        if row is None:
+            raise StorageStateError("transition intent does not exist")
+        return row
+
     @classmethod
     def _require_running_lease(cls, connection: sqlite3.Connection, task_id: str) -> None:
         task = cls._require_task(connection, task_id)
@@ -609,6 +781,14 @@ class SQLiteTaskRepository:
         if row is None:
             raise StorageStateError("approval does not exist")
         return _approval_from_row(row)
+
+    def _transition_intent_by_id(self, intent_id: str) -> TransitionIntentRecord:
+        row = self._connection.execute(
+            "SELECT * FROM transition_intents WHERE id = ?", (intent_id,)
+        ).fetchone()
+        if row is None:
+            raise StorageStateError("transition intent does not exist")
+        return _transition_intent_from_row(row)
 
 
 def _new_id() -> str:
@@ -667,10 +847,32 @@ def _approval_from_row(row: sqlite3.Row) -> ApprovalRecord:
         action_json=row["action_json"],
         action_digest=row["action_digest"],
         repository_snapshot_digest=row["repository_snapshot_digest"],
+        policy_decision=PolicyDecision.model_validate(json.loads(row["policy_decision_json"]))
+        if row["policy_decision_json"]
+        else None,
         decision=ApprovalDecision(row["decision"]) if row["decision"] else None,
         execution_state=row["execution_state"],
+        expected_after_digests=json.loads(row["expected_after_digests_json"]),
+        result_digest=row["result_digest"],
         decided_at=_load_datetime(row["decided_at"]),
         executed_at=_load_datetime(row["executed_at"]),
+    )
+
+
+def _transition_intent_from_row(row: sqlite3.Row) -> TransitionIntentRecord:
+    created_at = _load_datetime(row["created_at"])
+    assert created_at is not None
+    return TransitionIntentRecord(
+        id=row["id"],
+        task_id=row["task_id"],
+        kind=row["kind"],
+        evidence_digest=row["evidence_digest"],
+        summary=row["summary"],
+        state=row["state"],
+        result_digest=row["result_digest"],
+        completion_summary=row["completion_summary"],
+        created_at=created_at,
+        completed_at=_load_datetime(row["completed_at"]),
     )
 
 
@@ -701,3 +903,25 @@ def _decision_from_row(row: sqlite3.Row) -> DecisionRecord:
         created_at=created_at,
         updated_at=updated_at,
     )
+
+
+def _require_digest(value: str, field: str) -> None:
+    if re.fullmatch(r"[0-9a-f]{64}", value) is None:
+        raise StorageStateError(f"{field} must be lowercase SHA-256 hex")
+
+
+def _validated_path_digests(values: dict[str, str | None]) -> dict[str, str | None]:
+    normalized: dict[str, str | None] = {}
+    for path, digest in values.items():
+        candidate = PurePosixPath(path)
+        if not path or "\\" in path or candidate.is_absolute() or ".." in candidate.parts:
+            raise StorageStateError("digest path must be repository-relative POSIX text")
+        if digest is not None:
+            _require_digest(digest, "expected after digest")
+        normalized[candidate.as_posix()] = digest
+    return dict(sorted(normalized.items()))
+
+
+def _require_transition_text(value: str, limit: int, field: str) -> None:
+    if not value or len(value.encode("utf-8")) > limit:
+        raise StorageStateError(f"{field} must contain at most {limit} UTF-8 bytes")

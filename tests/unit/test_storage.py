@@ -4,7 +4,14 @@ from pathlib import Path
 
 import pytest
 
-from pyquality.domain.models import ApprovalDecision, Finding, PolicyOutcome, TaskResult, TaskStatus
+from pyquality.domain.models import (
+    ApprovalDecision,
+    Finding,
+    PolicyDecision,
+    PolicyOutcome,
+    TaskResult,
+    TaskStatus,
+)
 from pyquality.storage.sqlite import SQLiteTaskRepository, StorageStateError
 
 
@@ -15,6 +22,16 @@ def repo(tmp_path: Path) -> SQLiteTaskRepository:
 
 def _start(repo: SQLiteTaskRepository, task_id: str) -> None:
     assert repo.set_status(task_id, TaskStatus.CREATED, TaskStatus.RUNNING) is True
+
+
+def _approval_decision() -> PolicyDecision:
+    return PolicyDecision(
+        outcome=PolicyOutcome.REQUIRE_APPROVAL,
+        matched_rule="dependency_manifest",
+        impact_summary="Dependency declarations require explicit approval.",
+        action_digest="b" * 64,
+        repository_snapshot_digest="c" * 64,
+    )
 
 
 def test_second_active_task_cannot_lease_same_project(repo: SQLiteTaskRepository) -> None:
@@ -235,3 +252,100 @@ def test_repositories_contend_for_a_running_project_lease(tmp_path: Path) -> Non
 
     assert first_repo.acquire_project_lease(first.id) is True
     assert second_repo.acquire_project_lease(second.id) is False
+
+
+def test_reopen_recovers_rejected_approval_and_saved_policy_decision(tmp_path: Path) -> None:
+    """Dropping decided approval data would lose rejection feedback after a restart."""
+    db_path = tmp_path / "state.sqlite"
+    repo = SQLiteTaskRepository(db_path)
+    task = repo.create_task("C:/work/demo", "fix sum", round_limit=8)
+    _start(repo, task.id)
+    iteration = repo.append_iteration(task.id, sequence=1, context_digest="a" * 64)
+    approval = repo.record_approval(
+        task.id,
+        iteration.id,
+        '{"arguments":{},"kind":"apply_patch","rationale":"update deps"}',
+        "b" * 64,
+        "c" * 64,
+        policy_decision=_approval_decision(),
+    )
+    assert repo.set_status(task.id, TaskStatus.RUNNING, TaskStatus.WAITING_APPROVAL) is True
+    repo.decide_approval(approval.id, ApprovalDecision.REJECT)
+
+    recovered = SQLiteTaskRepository(db_path).resume_snapshot(task.id).decided_approval
+
+    assert recovered is not None
+    assert recovered.id == approval.id
+    assert recovered.decision is ApprovalDecision.REJECT
+    assert recovered.policy_decision == _approval_decision()
+
+    assert repo.set_status(task.id, TaskStatus.WAITING_APPROVAL, TaskStatus.RUNNING) is True
+    assert repo.acquire_project_lease(task.id) is True
+    consumed = repo.mark_rejection_consumed(approval.id)
+    assert consumed.execution_state == "completed"
+    assert SQLiteTaskRepository(db_path).resume_snapshot(task.id).decided_approval == consumed
+
+
+def test_reopen_recovers_expected_after_digests_before_dispatch_completion(
+    tmp_path: Path,
+) -> None:
+    """Losing expected digests at the crash boundary would force blind patch replay."""
+    db_path = tmp_path / "state.sqlite"
+    repo = SQLiteTaskRepository(db_path)
+    task = repo.create_task("C:/work/demo", "fix sum", round_limit=8)
+    _start(repo, task.id)
+    assert repo.acquire_project_lease(task.id) is True
+    iteration = repo.append_iteration(task.id, sequence=1, context_digest="a" * 64)
+    approval = repo.record_approval(
+        task.id,
+        iteration.id,
+        '{"arguments":{},"kind":"apply_patch","rationale":"update deps"}',
+        "b" * 64,
+        "c" * 64,
+        policy_decision=_approval_decision(),
+    )
+    repo.decide_approval(approval.id, ApprovalDecision.APPROVE)
+    repo.mark_execution_intent(
+        approval.id,
+        expected_after_digests={"pyproject.toml": "d" * 64, "requirements.txt": None},
+    )
+
+    recovered = SQLiteTaskRepository(db_path).resume_snapshot(task.id).executable_approval
+
+    assert recovered is not None
+    assert recovered.execution_state == "intent_recorded"
+    assert recovered.expected_after_digests == {
+        "pyproject.toml": "d" * 64,
+        "requirements.txt": None,
+    }
+    completed = repo.mark_execution_completed(approval.id, result_digest="e" * 64)
+    assert completed.result_digest == "e" * 64
+
+
+def test_transition_intent_evidence_survives_reopen_and_completion(tmp_path: Path) -> None:
+    """Without durable pre/post evidence, resume could repeat an external transition."""
+    db_path = tmp_path / "state.sqlite"
+    repo = SQLiteTaskRepository(db_path)
+    task = repo.create_task("C:/work/demo", "fix sum", round_limit=8)
+    _start(repo, task.id)
+    assert repo.acquire_project_lease(task.id) is True
+    intent = repo.record_transition_intent(
+        task.id,
+        kind="model_call",
+        evidence_digest="a" * 64,
+        summary="context prepared",
+    )
+
+    reopened = SQLiteTaskRepository(db_path)
+    pending = reopened.resume_snapshot(task.id).transition_intents
+    assert len(pending) == 1
+    assert pending[0].id == intent.id
+    assert pending[0].state == "pending"
+    completed = reopened.complete_transition_intent(
+        intent.id,
+        result_digest="b" * 64,
+        summary="response persisted",
+    )
+    assert completed.state == "completed"
+    assert completed.result_digest == "b" * 64
+    assert completed.completion_summary == "response persisted"
