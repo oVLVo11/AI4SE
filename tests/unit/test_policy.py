@@ -11,16 +11,19 @@ from pyquality.policy import PolicyEngine
 
 
 def _patch_for(path: str, *, deleted: bool = False) -> str:
-    operation = "Delete" if deleted else "Update"
-    body = "-old\n" if deleted else "+new\n"
-    return f"*** Begin Patch\n*** {operation} File: {path}\n@@\n{body}*** End Patch\n"
+    new_header = "/dev/null" if deleted else f"b/{path}"
+    return (
+        f"--- a/{path}\n+++ {new_header}\n@@ -1,2 +1,1 @@\n context\n-old\n"
+        if deleted
+        else f"--- a/{path}\n+++ {new_header}\n@@ -1,2 +1,2 @@\n context\n-old\n+new\n"
+    )
 
 
 def _patch_for_files(count: int) -> str:
-    chunks = ["*** Begin Patch"]
+    chunks: list[str] = []
     for index in range(count):
-        chunks.extend((f"*** Update File: src/file_{index}.py", "@@", "+value = 1"))
-    chunks.append("*** End Patch")
+        path = f"src/file_{index}.py"
+        chunks.extend((f"--- a/{path}", f"+++ b/{path}", "@@ -1,2 +1,2 @@", " context", "-old", "+new"))
     return "\n".join(chunks) + "\n"
 
 
@@ -28,7 +31,13 @@ def _symlink_or_skip(link: Path, target: Path) -> None:
     try:
         link.symlink_to(target, target_is_directory=True)
     except OSError as error:
-        pytest.skip(f"symlinks are unavailable in this test environment: {error}")
+        if getattr(error, "winerror", None) == 1314:
+            pytest.skip(f"symlinks are unavailable in this test environment: {error}")
+        raise
+
+
+def _valid_patch(path: str = "src/module.py") -> str:
+    return f"--- a/{path}\n+++ b/{path}\n@@ -1,2 +1,2 @@\n context\n-old\n+new\n"
 
 
 @pytest.mark.parametrize("path", ["../outside.txt", ".env", "id_rsa", ".git/config"])
@@ -87,8 +96,13 @@ def test_broad_patch_requires_approval(tmp_path: Path) -> None:
 
 def test_patch_over_three_hundred_changed_lines_requires_approval(tmp_path: Path) -> None:
     """Ignoring the total-line gate would allow a high-impact patch automatically."""
-    lines = "\n".join("+value = 1" for _ in range(301))
-    patch = f"*** Begin Patch\n*** Update File: src/large.py\n@@\n{lines}\n*** End Patch\n"
+    patch = (
+        "--- a/src/large.py\n+++ b/src/large.py\n@@ -1,302 +1,302 @@\n context\n"
+        + "\n".join("-old" for _ in range(301))
+        + "\n"
+        + "\n".join("+new" for _ in range(301))
+        + "\n"
+    )
     action = Action(kind="apply_patch", arguments={"patch": patch}, rationale="Repair it.")
 
     decision = PolicyEngine(tmp_path).evaluate(action)
@@ -97,7 +111,9 @@ def test_patch_over_three_hundred_changed_lines_requires_approval(tmp_path: Path
     assert decision.matched_rule == "broad_patch"
 
 
-@pytest.mark.parametrize("path", ["pyproject.toml", ".github/workflows/check.yml"])
+@pytest.mark.parametrize(
+    "path", ["pyproject.toml", ".github/workflows/check.yml", ".GITHUB/WORKFLOWS/check.yml", ".CircleCI/config.yml"]
+)
 def test_dependency_and_ci_patch_requires_approval(tmp_path: Path, path: str) -> None:
     """Dropping protected-path classification would alter dependencies or CI unattended."""
     action = Action(
@@ -108,6 +124,52 @@ def test_dependency_and_ci_patch_requires_approval(tmp_path: Path, path: str) ->
 
     assert decision.outcome is PolicyOutcome.REQUIRE_APPROVAL
     assert decision.matched_rule == "protected_patch_path"
+
+
+@pytest.mark.parametrize(
+    "patch",
+    [
+        "*** Update File: src/module.py\n@@\n+new\n",
+        "--- a/src/module.py\n+++ b/src/module.py\n",
+        "--- a/src/module.py\n+++ b/src/module.py\n@@ -1,2 +1,1 @@\n context\n-old\n+new\n",
+        '--- "a/src/module.py"\n+++ "b/src/module.py"\n@@ -1,2 +1,2 @@\n context\n-old\n+new\n',
+        "--- a/src/has space.py\n+++ b/src/has space.py\n@@ -1,2 +1,2 @@\n context\n-old\n+new\n",
+    ],
+)
+def test_denies_malformed_or_contextless_patch_before_approval(tmp_path: Path, patch: str) -> None:
+    """Permissive patch scanning would let malformed targets bypass governance classification."""
+    action = Action(kind="apply_patch", arguments={"patch": patch}, rationale="Apply the repair.")
+
+    decision = PolicyEngine(tmp_path).evaluate(action)
+
+    assert decision.outcome is PolicyOutcome.DENY
+    assert decision.matched_rule == "malformed_patch"
+
+
+def test_allows_a_valid_contextual_unified_patch(tmp_path: Path) -> None:
+    """Rejecting valid contextual unified diffs would block ordinary repository repairs."""
+    action = Action(kind="apply_patch", arguments={"patch": _valid_patch()}, rationale="Apply it.")
+
+    decision = PolicyEngine(tmp_path).evaluate(action)
+
+    assert decision.outcome is PolicyOutcome.ALLOW
+
+
+def test_symlink_helper_reraises_errors_other_than_missing_windows_privilege(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Skipping arbitrary symlink failures would conceal broken test environments."""
+    def raise_access_denied(self: Path, target: Path, target_is_directory: bool = False) -> None:
+        del self, target, target_is_directory
+        raise OSError("access denied")
+
+    monkeypatch.setattr(Path, "symlink_to", raise_access_denied)
+
+    with pytest.raises(BaseException) as raised:
+        _symlink_or_skip(tmp_path / "link", tmp_path / "target")
+
+    assert isinstance(raised.value, OSError)
+    assert "access denied" in str(raised.value)
 
 
 def test_repository_file_deletion_requires_approval(tmp_path: Path) -> None:

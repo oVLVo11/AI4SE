@@ -48,8 +48,7 @@ _DEPENDENCY_PATHS = {
     "pipfile.lock",
 }
 _CI_FILENAMES = {".gitlab-ci.yml", "azure-pipelines.yml", "jenkinsfile"}
-_CUSTOM_PATCH_FILE = re.compile(r"^\*\*\* (Add|Delete|Update) File: (.+)$")
-_GIT_DIFF_FILE = re.compile(r"^diff --git a/(.+) b/(.+)$")
+_HUNK_HEADER = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@$")
 _UNAVAILABLE_SNAPSHOT_DIGEST = hashlib.sha256(b"repository snapshot unavailable").hexdigest()
 
 
@@ -101,7 +100,9 @@ class PolicyEngine:
             )
         paths, impact, error = self._action_paths(action)
         if error is not None:
-            return _decision(PolicyOutcome.DENY, "invalid_action", error, digest, snapshot_digest)
+            rule = "malformed_patch" if error == "malformed_patch" else "invalid_action"
+            summary = "Patch is not a valid contextual unified diff." if rule == "malformed_patch" else error
+            return _decision(PolicyOutcome.DENY, rule, summary, digest, snapshot_digest)
 
         for path in paths:
             denial = self._path_denial(path, root)
@@ -211,8 +212,8 @@ class PolicyEngine:
         if not isinstance(patch, str):
             return (), None, "Patch must be text."
         impact = _parse_patch(patch)
-        if not impact.paths:
-            return (), None, "Patch does not identify any repository files."
+        if impact is None:
+            return (), None, "malformed_patch"
         return impact.paths, impact, None
 
     def _path_denial(self, raw_path: str, root: Path) -> str | None:
@@ -308,45 +309,85 @@ def _is_sensitive(path: PurePosixPath, patterns: tuple[str, ...]) -> bool:
     )
 
 
-def _parse_patch(patch: str) -> _PatchImpact:
+def _parse_patch(patch: str) -> _PatchImpact | None:
     paths: set[str] = set()
     changed_lines = 0
     deletes_file = False
-    pending_old_path: str | None = None
-    for line in patch.splitlines():
-        custom_match = _CUSTOM_PATCH_FILE.match(line)
-        if custom_match is not None:
-            operation, path = custom_match.groups()
-            paths.add(path)
-            deletes_file = deletes_file or operation == "Delete"
-            continue
-        git_match = _GIT_DIFF_FILE.match(line)
-        if git_match is not None:
-            paths.update(git_match.groups())
-            continue
-        if line.startswith("--- "):
-            pending_old_path = _patch_header_path(line[4:])
-            if pending_old_path is not None:
-                paths.add(pending_old_path)
-            continue
-        if line.startswith("+++ "):
-            new_path = _patch_header_path(line[4:])
-            if new_path is None and pending_old_path is not None:
-                deletes_file = True
-            elif new_path is not None:
-                paths.add(new_path)
-            continue
-        if line.startswith(("+", "-")):
-            changed_lines += 1
+    lines = patch.splitlines()
+    index = 0
+    while index < len(lines):
+        old_path = _header_path(lines[index], "--- a/")
+        if old_path is None and lines[index] != "--- /dev/null":
+            return None
+        index += 1
+        if index == len(lines):
+            return None
+        new_path = _header_path(lines[index], "+++ b/")
+        if new_path is None and lines[index] != "+++ /dev/null":
+            return None
+        index += 1
+        if old_path is None and new_path is None:
+            return None
+        if old_path is not None and new_path is not None and old_path != new_path:
+            return None
+        path = old_path or new_path
+        assert path is not None
+        paths.add(path)
+        deletes_file = deletes_file or new_path is None
+        found_hunk = False
+        requires_context = old_path is not None and new_path is not None
+        while index < len(lines) and not lines[index].startswith("--- "):
+            hunk_match = _HUNK_HEADER.match(lines[index])
+            if hunk_match is None:
+                return None
+            found_hunk = True
+            old_count = int(hunk_match.group(2) or "1")
+            new_count = int(hunk_match.group(4) or "1")
+            index += 1
+            old_seen = 0
+            new_seen = 0
+            has_context = False
+            while index < len(lines) and not lines[index].startswith(("@@ ", "--- ")):
+                line = lines[index]
+                if line == r"\ No newline at end of file":
+                    index += 1
+                    continue
+                if not line.startswith((" ", "+", "-")):
+                    return None
+                if line.startswith(" "):
+                    old_seen += 1
+                    new_seen += 1
+                    has_context = True
+                elif line.startswith("+"):
+                    new_seen += 1
+                    changed_lines += 1
+                else:
+                    old_seen += 1
+                    changed_lines += 1
+                index += 1
+            if old_seen != old_count or new_seen != new_count:
+                return None
+            if requires_context and not has_context:
+                return None
+        if not found_hunk:
+            return None
     return _PatchImpact(tuple(sorted(paths)), changed_lines, deletes_file)
 
 
-def _patch_header_path(value: str) -> str | None:
-    path = value.split("\t", 1)[0].strip()
-    if path == "/dev/null":
+def _header_path(line: str, prefix: str) -> str | None:
+    if not line.startswith(prefix):
         return None
-    if path.startswith(("a/", "b/")):
-        return path[2:]
+    path = line.removeprefix(prefix)
+    if not path or any(character.isspace() for character in path) or '"' in path:
+        return None
+    try:
+        path.encode("utf-8")
+    except UnicodeEncodeError:
+        return None
+    if "\\" in path or ".." in path.split("/") or "" in path.split("/") or "." in path.split("/"):
+        return None
+    if _normalized_relative_path(path) is None:
+        return None
     return path
 
 
@@ -356,6 +397,7 @@ def _has_protected_path(paths: tuple[str, ...]) -> bool:
         normalized = str(path).casefold()
         if normalized in _DEPENDENCY_PATHS or path.name.casefold() in _CI_FILENAMES:
             return True
-        if path.parts[:2] == (".github", "workflows") or path.parts[:1] == (".circleci",):
+        parts = tuple(part.casefold() for part in path.parts)
+        if parts[:2] == (".github", "workflows") or parts[:1] == (".circleci",):
             return True
     return False
