@@ -321,7 +321,7 @@ git commit -m "feat: persist task state and select bounded memory"
 
 **Interfaces:**
 - Consumes: `Action`, `PolicyOutcome`.
-- Produces: `PolicyEngine(repo_root: Path, sensitive_patterns: tuple[str, ...])`, `evaluate(action: Action) -> PolicyDecision`, and `revalidate(decision: PolicyDecision) -> PolicyDecision`.
+- Produces: `PolicyEngine(repo_root: Path, sensitive_patterns: tuple[str, ...])`, `evaluate(action: Action) -> PolicyDecision`, and `revalidate(decision: PolicyDecision, action: Action, current_snapshot_digest: str) -> PolicyDecision`. `PolicyDecision` carries the canonical repository snapshot digest saved at evaluation.
 
 - [ ] **Step 1: Write the path-escape and sensitive-file failing tests**
 
@@ -367,7 +367,7 @@ Expected: FAIL until thresholds and protected paths are implemented.
 
 - [ ] **Step 4: Implement ALLOW/REQUIRE_APPROVAL/DENY and revalidation**
 
-Count additions plus deletions and unique touched files before applying. Require approval above 10 files or 300 lines, for deletion, and for dependency/CI paths. Bind decisions to a SHA-256 digest of normalized action JSON and canonical root; `revalidate` recomputes both.
+Count additions plus deletions and unique touched files before applying. Require approval above 10 files or 300 lines, for deletion, and for dependency/CI paths. Bind decisions to a SHA-256 digest of normalized action JSON and a repository snapshot digest; `revalidate` denies an action-digest mismatch or snapshot drift, then recomputes policy against the supplied action and current filesystem.
 
 - [ ] **Step 5: Verify and commit**
 
@@ -1040,6 +1040,6 @@ Before claiming completion, invoke `superpowers:verification-before-completion` 
 
 Task 1 must implement the public-model, configuration-source, secure-default, argument-grammar, and status/iteration contracts in Specification section 14.1 before later tasks consume them. In particular, it produces `PolicyOutcome` and `PolicyDecision`, typed `ToolResult`, `QualityReport`, `TaskResult`, `ApprovalDecision`, and `AuditEvent`, and treats `pyquality.toml` as the sole repository configuration file.
 
-Task 2 must expose compare-and-set transitions, approval lookup/decision/execution marking, durable transition intents, lease methods, and repository snapshots. Task 3 revalidation receives both the normalized action and current snapshot. Task 4 returns changed paths and before/after digests in `ToolResult`. Task 6 consumes those digests when making a stall decision. Task 7 exposes provider retry metadata only through the injected client policy; transport retries remain inside one model round.
+Task 2 must expose compare-and-set transitions, approval lookup/decision/execution marking, durable transition intents, lease methods, and repository snapshots. Task 3 revalidation receives the saved `PolicyDecision`, supplied normalized action, and current snapshot digest; it denies digest mismatch or drift before reevaluating policy. Task 4 returns changed paths and before/after digests in `ToolResult`. Task 6 consumes those digests when making a stall decision. Task 7 exposes provider retry metadata only through the injected client policy; transport retries remain inside one model round.
 
 Task 8 must use the state, round-accounting, approval, recovery, audit-sink, and idempotent-dispatch rules in Specification section 14.2. Its declared interface additionally includes `pending_approval(task_id: str) -> Approval`; its constructor receives all listed core protocols explicitly. Its tests must distinguish provider retries from model rounds and prove terminal resume idempotency, drift blocking, duplicate-decision rejection, and recovery of a persisted dispatch intent.

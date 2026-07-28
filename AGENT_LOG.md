@@ -31,3 +31,7 @@ Agent `/root/task1_domain_config` implemented the typed package foundation and s
 ## 2026-07-28 Task 2 implementation and review fixes
 
 Agent `/root/task2_storage_memory` implemented SQLite task state, leases, recovery snapshots, and bounded memory in `73261de`, then addressed four blocking review findings in `a606267`: running-only leases, approval intent ownership, executable-recovery gating, and atomic snapshot reads. Actual final verification reported 64 passed and Ruff clean; the Task 2 spec and quality review is clean after fix round 1. Two minor follow-ups remain deferred: repository close/context-manager support and explicit directory-prefix/validator-scope selector tests.
+
+## 2026-07-28 Task 3 revalidation ruling
+
+The human ruling makes Specification section 14.2 binding for Task 3 revalidation. `PolicyDecision` now records the canonical repository snapshot digest; `revalidate` receives the saved decision, the supplied `Action`, and the caller's current snapshot digest. It denies action-digest mismatch or repository snapshot drift before reevaluating the supplied action against current filesystem policy. This replaces the earlier in-process action-cache interpretation.

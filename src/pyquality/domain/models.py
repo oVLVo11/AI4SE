@@ -241,12 +241,15 @@ class PolicyDecision(PublicModel):
     matched_rule: str | None = None
     impact_summary: str = Field(min_length=1)
     action_digest: str = Field(min_length=64, max_length=64)
+    repository_snapshot_digest: str = Field(min_length=64, max_length=64)
 
     @model_validator(mode="after")
     def normalize_digest(self) -> PolicyDecision:
-        if re.fullmatch(r"[0-9a-fA-F]{64}", self.action_digest) is None:
-            raise ValueError("action_digest must be SHA-256 hex")
-        self.action_digest = self.action_digest.lower()
+        for field in ("action_digest", "repository_snapshot_digest"):
+            value = getattr(self, field)
+            if re.fullmatch(r"[0-9a-fA-F]{64}", value) is None:
+                raise ValueError(f"{field} must be SHA-256 hex")
+            setattr(self, field, value.lower())
         return self
 
 

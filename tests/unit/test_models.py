@@ -95,6 +95,7 @@ def test_policy_decision_has_a_closed_outcome() -> None:
             matched_rule=None,
             impact_summary="Needs a decision.",
             action_digest="a" * 64,
+            repository_snapshot_digest="b" * 64,
         )
 
     assert PolicyOutcome.REQUIRE_APPROVAL.value == "require_approval"
@@ -238,15 +239,36 @@ def test_policy_digest_normalizes_uppercase_hex_and_rejects_non_hex() -> None:
         outcome="allow",
         impact_summary="Read-only inspection.",
         action_digest="A" * 64,
+        repository_snapshot_digest="B" * 64,
     )
 
     assert decision.action_digest == "a" * 64
+    assert decision.repository_snapshot_digest == "b" * 64
     with pytest.raises(ValueError):
         PolicyDecision(
             outcome="allow",
             impact_summary="Read-only inspection.",
             action_digest="g" * 64,
+            repository_snapshot_digest="b" * 64,
         )
+
+
+def test_policy_decision_requires_a_canonical_repository_snapshot_digest() -> None:
+    """Omitting or corrupting the saved snapshot would make approval drift uncheckable."""
+    with pytest.raises(ValueError):
+        PolicyDecision(
+            outcome="allow",
+            impact_summary="Read-only inspection.",
+            action_digest="a" * 64,
+        )
+    decision = PolicyDecision(
+        outcome="allow",
+        impact_summary="Read-only inspection.",
+        action_digest="a" * 64,
+        repository_snapshot_digest="B" * 64,
+    )
+
+    assert decision.repository_snapshot_digest == "b" * 64
 
 
 def test_action_schema_contains_real_union_mapping() -> None:
