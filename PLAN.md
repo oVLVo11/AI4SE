@@ -4,7 +4,8 @@
 | --- | --- | --- | --- | --- | --- |
 | 0 | Complete | `/root/task0_docs_coldstart`, `/root/task0_docs_coldstart/coldstart_validator` | Clean re-review | Documentation contract checks clean | `2fdb099`, `b5cdd29`, `efc73b3` |
 | 1 | Complete | `/root/task1_domain_config` | Clean after fix round 3 | 47 passed; Ruff clean | `297d277`, `6df8353`, `a3908f9`, `920983e`, `a200b8b` |
-| 2–13 | Not started | — | — | — | — |
+| 2 | Complete | `/root/task2_storage_memory` | Clean after fix round 1 | 64 passed; Ruff clean; two deferred minors: repository close/context-manager support and directory-prefix/validator-scope selector tests | `73261de`, `a606267` |
+| 3–13 | Not started | — | — | — | — |
 
 # PyQuality Harness Implementation Plan
 

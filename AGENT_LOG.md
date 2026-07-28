@@ -27,3 +27,7 @@ The Task 0 fix-round re-review is clean. The required placeholder scan returned 
 ## 2026-07-28 Task 1 implementation and review fixes
 
 Agent `/root/task1_domain_config` implemented the typed package foundation and secure configuration in `297d277`, then addressed the review rounds in `6df8353` (public bounds and strict TOML types), `a3908f9` (real discriminated action union with compatibility accessors), `920983e` (contextual lowered Settings caps), and `a200b8b` (lowered configuration path caps). Each fix used focused RED-to-GREEN tests. The final Task 1 suite reported 47 passed and Ruff clean; the Task 1 spec and quality re-review is clean after fix round 3.
+
+## 2026-07-28 Task 2 implementation and review fixes
+
+Agent `/root/task2_storage_memory` implemented SQLite task state, leases, recovery snapshots, and bounded memory in `73261de`, then addressed four blocking review findings in `a606267`: running-only leases, approval intent ownership, executable-recovery gating, and atomic snapshot reads. Actual final verification reported 64 passed and Ruff clean; the Task 2 spec and quality review is clean after fix round 1. Two minor follow-ups remain deferred: repository close/context-manager support and explicit directory-prefix/validator-scope selector tests.
