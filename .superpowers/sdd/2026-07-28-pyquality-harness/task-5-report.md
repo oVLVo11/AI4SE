@@ -76,3 +76,33 @@ exit 0
 duration and output digest are carried on `RawValidationResult`; normalized report
 status, findings, commands, timeout labels, and changed paths remain in the
 existing `QualityReport` contract.
+
+## Review fix round 2
+
+- Bounded timeout, missing-tool, and malformed-output summaries by the effective
+  `max_finding_summary_bytes` setting before Finding validation.
+- Made UTF-8 truncation return a one-byte `~` marker when a byte cut contains no
+  complete code point, preserving the required non-empty evidence contract.
+
+TDD evidence for this round:
+
+1. The focused RED run collected 18 tests and failed four new minimum-limit cases:
+   all three fixed-summary paths exceeded a one-byte setting, and emoji evidence
+   became an invalid empty string.
+2. The focused GREEN run passed all 18 parser tests.
+
+Fresh verification after review fixes:
+
+```text
+python -m pytest tests/unit/test_parsers.py -v --basetemp .superpowers/sdd/2026-07-28-pyquality-harness/pytest-tmp-task5-fix2
+18 passed in 0.12s
+
+python -m pytest -v --basetemp .superpowers/sdd/2026-07-28-pyquality-harness/pytest-tmp-task5-fix2-full
+140 passed, 5 skipped in 3.12s
+
+python -m ruff check src tests
+All checks passed!
+
+git diff --check
+exit 0
+```

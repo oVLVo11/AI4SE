@@ -126,3 +126,31 @@ def test_ruff_order_includes_code_for_otherwise_identical_findings() -> None:
         "ruff:A001:a.py:1",
         "ruff:Z999:a.py:1",
     ]
+
+
+@pytest.mark.parametrize(
+    "parse",
+    [
+        lambda settings: parse_pytest("partial", None, timed_out=True, settings=settings),
+        lambda settings: parse_pytest(
+            "No module named 'pytest'", 1, settings=settings
+        ),
+        lambda settings: parse_ruff("not-json", 1, settings=settings),
+    ],
+)
+def test_harness_findings_obey_minimum_summary_limit(parse: object) -> None:
+    """Fixed harness summaries must not violate a stricter effective Settings limit."""
+    settings = Settings(max_finding_summary_bytes=1)
+
+    finding = parse(settings)[0]  # type: ignore[operator]
+
+    assert 0 < len(finding.summary.encode("utf-8")) <= 1
+
+
+def test_multibyte_evidence_has_nonempty_byte_safe_minimum_fallback() -> None:
+    """Cutting inside a UTF-8 code point must not produce invalid empty Finding evidence."""
+    settings = Settings(max_finding_evidence_bytes=1)
+
+    finding = parse_pytest("🔥", 1, settings=settings)[0]
+
+    assert 0 < len(finding.evidence.encode("utf-8")) <= 1

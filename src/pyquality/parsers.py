@@ -181,15 +181,18 @@ def _missing_tool(output: str, tool: str) -> bool:
 
 
 def _harness_finding(category: str, output: str, settings: Settings | None) -> Finding:
+    summary = {
+        "timeout": "quality command timed out",
+        "missing_tool_dependency": "quality tool dependency is unavailable",
+    }[category]
     return _finding(
         settings,
         source="harness",
         category=category,
         severity="error",
-        summary={
-            "timeout": "quality command timed out",
-            "missing_tool_dependency": "quality tool dependency is unavailable",
-        }[category],
+        summary=_compact(
+            summary, _limit(settings, "max_finding_summary_bytes", _SUMMARY_LIMIT)
+        ),
         evidence=_compact(output, _limit(settings, "max_finding_evidence_bytes", _EVIDENCE_LIMIT)),
         group_key=_compact(
             f"harness:{category}", _limit(settings, "max_group_key_bytes", _SUMMARY_LIMIT)
@@ -205,7 +208,10 @@ def _infrastructure_finding(
         source="harness" if source == "ruff" else "pytest",
         category="infrastructure",
         severity="error",
-        summary=f"{source} exited with unrecognized failure output",
+        summary=_compact(
+            f"{source} exited with unrecognized failure output",
+            _limit(settings, "max_finding_summary_bytes", _SUMMARY_LIMIT),
+        ),
         evidence=_compact(output, _limit(settings, "max_finding_evidence_bytes", _EVIDENCE_LIMIT)),
         group_key=_compact(
             f"{source}:infrastructure", _limit(settings, "max_group_key_bytes", _SUMMARY_LIMIT)
@@ -240,4 +246,5 @@ def _compact(value: str, limit: int = _EVIDENCE_LIMIT) -> str:
     encoded = normalized.encode("utf-8")
     if len(encoded) <= limit:
         return normalized
-    return encoded[:limit].decode("utf-8", errors="ignore").rstrip()
+    truncated = encoded[:limit].decode("utf-8", errors="ignore").rstrip()
+    return truncated or "~"
