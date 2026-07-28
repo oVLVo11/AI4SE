@@ -10,7 +10,8 @@
 | 5 | Complete | Initial implementer identity unavailable after context compaction; `/root/task5_fix1` (fix rounds) | `/root/task5_review`: clean after fix round 2 | 140 passed; 5 skipped; Ruff and diff-check clean | `411f7ae`, `ba45a82`, `f5e8145` |
 | 6 | Complete | `/root/task6_feedback` | `/root/task5_review`: clean after fix round 3 | Primary implementation verification: 164 passed; 5 skipped; focused 24 passed; Ruff and diff-check clean. Final reviewer full runs encountered unrelated pre-existing Task 4 one-second timeout flakes that passed in isolation; no Task 6 regression found | `7a55808`, `c45d2da`, `4831d09`, `b8b54d6` |
 | 7 | Complete | `/root/task7_llm_context` | `/root/task7_review`: clean after fix round 1 | 177 passed; 5 skipped; focused 13 passed; Ruff and diff-check clean; deferred Minor: explicit primitive-root, undeclared-extra-field, and lowered contextual-limit parser tests | `9941c80`, `08b93a6` |
-| 8–13 | Not started | — | — | — | — |
+| 8 | Complete | `/root/task8_agent_loop`, `/root/task8_fix4` | `/root/task8_review`: clean after fix round 4 | Pristine full suite: 264 passed; 6 skipped; focused 98 passed, 1 WinError-1314 alias skip; exact round-4 regression 3 passed; Ruff and diff-check clean; deferred Minor: constructor dependencies are not all protocols | `80d54ec`, `7712349`, `adc6777`, `c3b5c0a`, `3a50249`, `4c9ea1a` |
+| 9–13 | Not started | — | — | — | — |
 
 # PyQuality Harness Implementation Plan
 
