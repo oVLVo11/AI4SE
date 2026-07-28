@@ -10,6 +10,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
+from tempfile import TemporaryDirectory
 from typing import Literal
 
 from pydantic import ConfigDict
@@ -146,9 +147,24 @@ class SQLiteTaskRepository:
     """Owns atomic persistence of task state and recovery records."""
 
     def __init__(self, db_path: Path) -> None:
-        self._lock_root = db_path.parent / f".{db_path.name}.lease-locks"
+        raw_path = str(db_path)
+        self._temporary_lock_directory: TemporaryDirectory[str] | None = None
+        if raw_path == ":memory:":
+            self._temporary_lock_directory = TemporaryDirectory(
+                prefix="pyquality-memory-lease-"
+            )
+            connection_path: str | Path = ":memory:"
+            self._lock_root = Path(self._temporary_lock_directory.name)
+        elif raw_path.casefold().startswith("file:"):
+            raise StorageStateError("SQLite URI database paths are not supported")
+        else:
+            connection_path = db_path.resolve(strict=False)
+            self._lock_root = (
+                connection_path.parent
+                / f".{connection_path.name}.lease-locks"
+            )
         self._held_leases: dict[str, tuple[str, str, LocalProjectLock]] = {}
-        self._connection = sqlite3.connect(db_path, isolation_level=None)
+        self._connection = sqlite3.connect(connection_path, isolation_level=None)
         self._connection.row_factory = sqlite3.Row
         self._connection.execute("PRAGMA foreign_keys = ON")
         self._connection.execute("PRAGMA journal_mode = WAL")
@@ -895,9 +911,16 @@ class SQLiteTaskRepository:
         return self._transition_intent_by_id(intent_id)
 
     def close(self) -> None:
-        for owner_token in tuple(self._held_leases):
-            self._release_local_lease(owner_token)
-        self._connection.close()
+        try:
+            for owner_token in tuple(self._held_leases):
+                self._release_local_lease(owner_token)
+        finally:
+            try:
+                self._connection.close()
+            finally:
+                if self._temporary_lock_directory is not None:
+                    self._temporary_lock_directory.cleanup()
+                    self._temporary_lock_directory = None
 
     def fail_inconsistent_task(self, task_id: str, summary: str) -> TaskResult:
         """Durably fail a task whose typed snapshot cannot be reconstructed."""

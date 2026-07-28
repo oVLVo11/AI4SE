@@ -496,15 +496,20 @@ class AgentLoop:
                 task_id, TaskStatus.FAILED, "Approval iteration is missing."
             )
         if approval.execution_state == "completed":
-            completed_dispatch = self._recover_transition(
-                task_id, "dispatch", saved.action_digest
+            completed_dispatches = self._recover_transitions(
+                task_id,
+                "dispatch",
+                saved.action_digest,
+                repository_snapshot_digest=saved.repository_snapshot_digest,
             )
             if iteration.quality_outcome is not None:
-                if completed_dispatch is not None:
+                if completed_dispatches:
                     self._repository.consume_intents_for_completed_iteration(
                         task_id,
                         iteration.id,
-                        source_intent_ids=(completed_dispatch.id,),
+                        source_intent_ids=tuple(
+                            intent.id for intent in completed_dispatches
+                        ),
                         owner_token=self._owner(),
                     )
                 return None
@@ -517,8 +522,7 @@ class AgentLoop:
                     "Completed approval does not match its effect evidence.",
                 )
             recovered = _recovered_tool_result(action, approval.expected_after_digests)
-            if completed_dispatch is not None:
-                self._remember_intent(completed_dispatch.id)
+            self._remember_intents(completed_dispatches)
             self._changed(task_id).update(recovered.changed_paths)
             return self._verify_approved_effect(
                 task_id, approval, recovered, already_completed=True
@@ -527,15 +531,18 @@ class AgentLoop:
             approval.execution_state == "intent_recorded"
             and iteration.quality_outcome in {"passed", "failed", "blocked"}
         ):
-            completed_dispatch = self._recover_transition(
-                task_id, "dispatch", saved.action_digest
+            completed_dispatches = self._recover_transitions(
+                task_id,
+                "dispatch",
+                saved.action_digest,
+                repository_snapshot_digest=saved.repository_snapshot_digest,
             )
             self._repository.mark_execution_completed(
                 approval.id,
                 result_digest=iteration.tool_result_digest,
-                source_intent_ids=(completed_dispatch.id,)
-                if completed_dispatch is not None
-                else (),
+                source_intent_ids=tuple(
+                    intent.id for intent in completed_dispatches
+                ),
                 owner_token=self._owner(),
             )
             if iteration.quality_outcome == "blocked":
@@ -563,15 +570,18 @@ class AgentLoop:
             approval.execution_state == "intent_recorded"
             and iteration.quality_outcome == "not_run"
         ):
-            completed_dispatch = self._recover_transition(
-                task_id, "dispatch", saved.action_digest
+            completed_dispatches = self._recover_transitions(
+                task_id,
+                "dispatch",
+                saved.action_digest,
+                repository_snapshot_digest=saved.repository_snapshot_digest,
             )
             self._repository.mark_execution_completed(
                 approval.id,
                 result_digest=iteration.tool_result_digest,
-                source_intent_ids=(completed_dispatch.id,)
-                if completed_dispatch is not None
-                else (),
+                source_intent_ids=tuple(
+                    intent.id for intent in completed_dispatches
+                ),
                 owner_token=self._owner(),
             )
             if any(item.iteration_id == iteration.id for item in snapshot.findings):
@@ -589,11 +599,13 @@ class AgentLoop:
             )
         ):
             recovered = _recovered_tool_result(action, approval.expected_after_digests)
-            completed_dispatch = self._recover_transition(
-                task_id, "dispatch", saved.action_digest
+            completed_dispatches = self._recover_transitions(
+                task_id,
+                "dispatch",
+                saved.action_digest,
+                repository_snapshot_digest=saved.repository_snapshot_digest,
             )
-            if completed_dispatch is not None:
-                self._remember_intent(completed_dispatch.id)
+            self._remember_intents(completed_dispatches)
             self._changed(task_id).update(recovered.changed_paths)
             return self._verify_approved_effect(
                 task_id, approval, recovered, already_completed=False
@@ -925,12 +937,15 @@ class AgentLoop:
         snapshot = self._repository.resume_snapshot(task_id)
         if self._deadline_reached(snapshot):
             return None
-        recovered = self._recover_transition(
-            task_id, "dispatch", decision.action_digest
+        recovered = self._recover_transitions(
+            task_id,
+            "dispatch",
+            decision.action_digest,
+            repository_snapshot_digest=decision.repository_snapshot_digest,
         )
-        if recovered is not None:
-            self._remember_intent(recovered.id)
-            return _tool_from_transition(recovered)
+        if recovered:
+            self._remember_intents(recovered)
+            return _tool_from_transition(recovered[0])
         intent = self._begin_transition(
             task_id, "dispatch", decision.action_digest, "dispatch authorized"
         )
@@ -945,7 +960,10 @@ class AgentLoop:
             _digest_model(result),
             "tool result persisted",
             "dispatch_completed",
-            payload={"tool_result": result.model_dump(mode="json")},
+            payload={
+                "tool_result": result.model_dump(mode="json"),
+                "repository_snapshot_digest": decision.repository_snapshot_digest,
+            },
         )
         self._remember_intent(intent.id)
         return result
@@ -1074,18 +1092,40 @@ class AgentLoop:
     def _recover_transition(
         self, task_id: str, kind: str, evidence_digest: str
     ) -> TransitionIntentRecord | None:
+        recovered = self._recover_transitions(task_id, kind, evidence_digest)
+        return recovered[0] if recovered else None
+
+    def _recover_transitions(
+        self,
+        task_id: str,
+        kind: str,
+        evidence_digest: str,
+        *,
+        repository_snapshot_digest: str | None = None,
+    ) -> tuple[TransitionIntentRecord, ...]:
         snapshot = self._repository.resume_snapshot(task_id)
-        return next(
-            (
-                intent
-                for intent in snapshot.transition_intents
-                if intent.kind == kind
-                and intent.evidence_digest == evidence_digest
-                and intent.state == "completed"
-                and intent.consumed_at is None
-            ),
-            None,
+        return tuple(
+            intent
+            for intent in snapshot.transition_intents
+            if intent.kind == kind
+            and intent.evidence_digest == evidence_digest
+            and intent.state == "completed"
+            and intent.consumed_at is None
+            and (
+                kind != "dispatch"
+                or repository_snapshot_digest is None
+                or (intent.result_payload or {}).get(
+                    "repository_snapshot_digest"
+                )
+                in (None, repository_snapshot_digest)
+            )
         )
+
+    def _remember_intents(
+        self, intents: Sequence[TransitionIntentRecord]
+    ) -> None:
+        for intent in intents:
+            self._remember_intent(intent.id)
 
     def _remember_intent(self, intent_id: str) -> None:
         current = self._cycle_intents.get()

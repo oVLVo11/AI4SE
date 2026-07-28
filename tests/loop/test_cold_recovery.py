@@ -288,7 +288,7 @@ def test_already_applied_recovery_atomically_consumes_dispatch_with_verifier(
     assert seeded.consumed_at == verifiers[0].consumed_at
 
 
-def test_intent_recorded_approval_reconciles_pre_correction_unconsumed_dispatch(
+def test_recovery_drains_all_legacy_and_exact_snapshot_dispatches_atomically(
     loop_fixture,
 ) -> None:
     policy: SnapshotSwitchPolicy | None = None
@@ -321,19 +321,45 @@ def test_intent_recorded_approval_reconciles_pre_correction_unconsumed_dispatch(
         after_digests=harness.dispatcher.expected,
         normalized_metadata={"code": "ok"},
     )
-    dispatch_intent = harness.repository.record_transition_intent(
-        harness.task_id,
-        kind="dispatch",
-        evidence_digest=approval.action_digest,
-        summary="dispatch authorized",
-        owner_token="seed-owner",
+    def seed_dispatch(
+        evidence_digest: str, *, repository_snapshot_digest: str | None = None
+    ):
+        intent = harness.repository.record_transition_intent(
+            harness.task_id,
+            kind="dispatch",
+            evidence_digest=evidence_digest,
+            summary="dispatch authorized",
+            owner_token="seed-owner",
+        )
+        payload: dict[str, object] = {
+            "tool_result": applied.model_dump(mode="json")
+        }
+        if repository_snapshot_digest is not None:
+            payload["repository_snapshot_digest"] = repository_snapshot_digest
+        harness.repository.complete_transition_intent(
+            intent.id,
+            result_digest=hashlib.sha256(applied.model_dump_json().encode()).hexdigest(),
+            summary="tool result persisted",
+            result_payload=payload,
+            owner_token="seed-owner",
+        )
+        return intent
+
+    legacy_dispatches = (
+        seed_dispatch(approval.action_digest),
+        seed_dispatch(approval.action_digest),
     )
-    harness.repository.complete_transition_intent(
-        dispatch_intent.id,
-        result_digest=hashlib.sha256(applied.model_dump_json().encode()).hexdigest(),
-        summary="tool result persisted",
-        result_payload={"tool_result": applied.model_dump(mode="json")},
-        owner_token="seed-owner",
+    exact_dispatch = seed_dispatch(
+        approval.action_digest,
+        repository_snapshot_digest=approval.repository_snapshot_digest,
+    )
+    other_snapshot_dispatch = seed_dispatch(
+        approval.action_digest,
+        repository_snapshot_digest="9" * 64,
+    )
+    other_action_dispatch = seed_dispatch(
+        "8" * 64,
+        repository_snapshot_digest=approval.repository_snapshot_digest,
     )
     report = failed_report()
     verifier_intent = harness.repository.record_transition_intent(
@@ -364,14 +390,20 @@ def test_intent_recorded_approval_reconciles_pre_correction_unconsumed_dispatch(
     harness.repository.release_project_lease(
         harness.task_id, owner_token="seed-owner"
     )
-    seeded_before = next(
-        item
+    seeded_ids = {
+        *(item.id for item in legacy_dispatches),
+        exact_dispatch.id,
+        other_snapshot_dispatch.id,
+        other_action_dispatch.id,
+    }
+    seeded_before = {
+        item.id: item
         for item in harness.repository.resume_snapshot(
             harness.task_id
         ).transition_intents
-        if item.id == dispatch_intent.id
-    )
-    assert seeded_before.consumed_at is None
+        if item.id in seeded_ids
+    }
+    assert all(item.consumed_at is None for item in seeded_before.values())
 
     assert policy is not None
     policy.allow_same_action = True
@@ -385,14 +417,24 @@ def test_intent_recorded_approval_reconciles_pre_correction_unconsumed_dispatch(
 
     assert result.status is TaskStatus.SUCCEEDED
     assert harness.dispatcher.dispatch_count(raw_action) == 1
-    seeded_after = next(
-        item
+    seeded_after = {
+        item.id: item
         for item in harness.repository.resume_snapshot(
             harness.task_id
         ).transition_intents
-        if item.id == dispatch_intent.id
-    )
-    assert seeded_after.consumed_at is not None
+        if item.id in seeded_ids
+    }
+    matching_ids = {
+        *(item.id for item in legacy_dispatches),
+        exact_dispatch.id,
+    }
+    consumed_times = {
+        seeded_after[intent_id].consumed_at for intent_id in matching_ids
+    }
+    assert None not in consumed_times
+    assert len(consumed_times) == 1
+    assert seeded_after[other_snapshot_dispatch.id].consumed_at is None
+    assert seeded_after[other_action_dispatch.id].consumed_at is None
 
 
 def test_schema_repair_cap_survives_cold_reopen(loop_fixture) -> None:

@@ -379,6 +379,39 @@ def test_failed_durable_release_still_closes_local_kernel_lock(
     assert second.acquire_project_lease(task.id, owner_token=OWNER_B) is True
 
 
+def test_in_memory_repositories_have_isolated_temporary_lock_roots() -> None:
+    first = SQLiteTaskRepository(Path(":memory:"))
+    second = SQLiteTaskRepository(Path(":memory:"))
+    first_task = first.create_task("C:/work/first", "fix sum", round_limit=8)
+    second_task = second.create_task("C:/work/second", "fix sum", round_limit=8)
+    _start(first, first_task.id)
+    _start(second, second_task.id)
+
+    assert first.acquire_project_lease(first_task.id, owner_token=OWNER_A) is True
+    assert second.acquire_project_lease(second_task.id, owner_token=OWNER_B) is True
+    first_root = first._lock_root
+    second_root = second._lock_root
+    assert first_root != second_root
+    assert first_root.is_dir()
+    assert second_root.is_dir()
+
+    first.close()
+    assert not first_root.exists()
+    assert second_root.is_dir()
+    second.close()
+    assert not second_root.exists()
+
+
+def test_sqlite_uri_is_rejected_with_redacted_typed_error() -> None:
+    uri = Path("file:state.sqlite?mode=memory&token=sensitive-value")
+
+    with pytest.raises(StorageStateError) as captured:
+        SQLiteTaskRepository(uri)
+
+    assert "URI database paths are not supported" in str(captured.value)
+    assert "sensitive-value" not in str(captured.value)
+
+
 def test_approval_insert_and_waiting_transition_are_one_transaction(
     repo: SQLiteTaskRepository,
 ) -> None:
