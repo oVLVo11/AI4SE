@@ -293,3 +293,24 @@ def test_action_constructor_properties_and_dump_remain_compatible() -> None:
     assert action.model_dump() == {
         "kind": "read_file", "arguments": {"path": "src/a.py"}, "rationale": "Read it."
     }
+
+
+def test_model_context_enforces_lowered_settings_caps(tmp_path) -> None:
+    """Ignoring supplied settings would let repository-lowered input limits be bypassed."""
+    from pyquality.config import load_settings
+
+    (tmp_path / "pyquality.toml").write_text(
+        "max_rationale_bytes = 4\nmax_config_pattern_bytes = 16\n", encoding="utf-8"
+    )
+    settings = load_settings(tmp_path, None)
+
+    assert Action(kind="finish", arguments={}, rationale="hello").rationale == "hello"
+    with pytest.raises(ValueError):
+        Action.model_validate(
+            {"kind": "finish", "arguments": {}, "rationale": "hello"}, context={"settings": settings}
+        )
+    with pytest.raises(ValueError):
+        Finding.model_validate(
+            {"source": "pytest", "category": "assertion", "severity": "error", "path": "tests/very-long.py", "summary": "x", "evidence": "x", "group_key": "x"},
+            context={"settings": settings},
+        )

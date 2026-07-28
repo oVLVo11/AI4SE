@@ -9,7 +9,16 @@ from enum import StrEnum
 from pathlib import PurePosixPath
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, JsonValue, RootModel, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    JsonValue,
+    RootModel,
+    TypeAdapter,
+    ValidationInfo,
+    model_validator,
+)
 
 MAX_RATIONALE_BYTES = 4_096
 MAX_FINDING_SUMMARY_BYTES = 1_024
@@ -30,6 +39,11 @@ def _relative_path(value: str) -> None:
     path = PurePosixPath(value)
     if not value or "\\" in value or path.is_absolute() or ".." in path.parts:
         raise ValueError("path must be repository-relative POSIX text")
+
+
+def _limit(info: ValidationInfo, name: str, default: int) -> int:
+    settings = (info.context or {}).get("settings")
+    return getattr(settings, name, default)
 
 
 class PublicModel(BaseModel):
@@ -78,10 +92,10 @@ class ActionEnvelope(PublicModel):
     rationale: str = Field(min_length=1)
 
     @model_validator(mode="after")
-    def validate_envelope(self) -> ActionEnvelope:
-        _bounded(self.rationale, MAX_RATIONALE_BYTES, "rationale")
+    def validate_envelope(self, info: ValidationInfo) -> ActionEnvelope:
+        _bounded(self.rationale, _limit(info, "max_rationale_bytes", MAX_RATIONALE_BYTES), "rationale")
         arguments = self.arguments.model_dump(exclude_none=True)
-        _bounded(json.dumps(arguments, ensure_ascii=False, separators=(",", ":")), MAX_ACTION_ARGUMENTS_BYTES, "arguments")
+        _bounded(json.dumps(arguments, ensure_ascii=False, separators=(",", ":")), _limit(info, "max_action_arguments_bytes", MAX_ACTION_ARGUMENTS_BYTES), "arguments")
         return self
 
 
@@ -129,6 +143,12 @@ class Action(RootModel[ActionVariant]):
             raise ValueError("provide either root or action fields")
         super().__init__(root=root if root is not None else data)
 
+    @classmethod
+    def model_validate(
+        cls, obj: object, *, context: dict[str, object] | None = None, **_: object
+    ) -> Action:
+        return cls(root=TypeAdapter(ActionVariant).validate_python(obj, context=context))
+
     @property
     def kind(self) -> str:
         return self.root.kind
@@ -162,14 +182,15 @@ class Finding(PublicModel):
     group_key: str = Field(min_length=1)
 
     @model_validator(mode="after")
-    def validate_location(self) -> Finding:
+    def validate_location(self, info: ValidationInfo) -> Finding:
         if self.path is None and self.line is not None:
             raise ValueError("line requires path")
         if self.path is not None:
             _relative_path(self.path)
-        _bounded(self.summary, MAX_FINDING_SUMMARY_BYTES, "summary")
-        _bounded(self.evidence, MAX_FINDING_EVIDENCE_BYTES, "evidence")
-        _bounded(self.group_key, MAX_GROUP_KEY_BYTES, "group_key")
+            _bounded(self.path, _limit(info, "max_config_pattern_bytes", MAX_CONFIG_PATTERN_BYTES), "path")
+        _bounded(self.summary, _limit(info, "max_finding_summary_bytes", MAX_FINDING_SUMMARY_BYTES), "summary")
+        _bounded(self.evidence, _limit(info, "max_finding_evidence_bytes", MAX_FINDING_EVIDENCE_BYTES), "evidence")
+        _bounded(self.group_key, _limit(info, "max_group_key_bytes", MAX_GROUP_KEY_BYTES), "group_key")
         return self
 
 
@@ -240,17 +261,19 @@ class ToolResult(PublicModel):
     evidence: str | None = None
 
     @model_validator(mode="after")
-    def validate_digests(self) -> ToolResult:
+    def validate_digests(self, info: ValidationInfo) -> ToolResult:
         for path in self.changed_paths:
             _relative_path(path)
+            _bounded(path, _limit(info, "max_config_pattern_bytes", MAX_CONFIG_PATTERN_BYTES), "path")
         for path in (*self.before_digests, *self.after_digests):
             _relative_path(path)
+            _bounded(path, _limit(info, "max_config_pattern_bytes", MAX_CONFIG_PATTERN_BYTES), "path")
         changed_paths = set(self.changed_paths)
         if set(self.before_digests) - changed_paths or set(self.after_digests) - changed_paths:
             raise ValueError("content digests must belong to changed paths")
         if self.evidence is not None:
-            _bounded(self.evidence, MAX_TOOL_OUTPUT_BYTES, "evidence")
-        _bounded(json.dumps(self.normalized_metadata, ensure_ascii=False, separators=(",", ":")), MAX_TOOL_METADATA_BYTES, "normalized_metadata")
+            _bounded(self.evidence, _limit(info, "max_tool_output_bytes", MAX_TOOL_OUTPUT_BYTES), "evidence")
+        _bounded(json.dumps(self.normalized_metadata, ensure_ascii=False, separators=(",", ":")), _limit(info, "max_tool_metadata_bytes", MAX_TOOL_METADATA_BYTES), "normalized_metadata")
         return self
 
 
