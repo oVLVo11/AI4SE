@@ -6,7 +6,7 @@ import hashlib
 import json
 import re
 import stat
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from fnmatch import fnmatchcase
 from pathlib import Path, PurePosixPath
 
@@ -53,7 +53,43 @@ _UNAVAILABLE_SNAPSHOT_DIGEST = hashlib.sha256(b"repository snapshot unavailable"
 
 
 @dataclass(frozen=True)
-class _PatchImpact:
+class PatchLine:
+    """One validated unified-diff body line, without its trailing newline."""
+
+    prefix: str
+    text: str
+    no_newline: bool = False
+
+
+@dataclass(frozen=True)
+class PatchHunk:
+    """A contextual hunk that both policy and dispatch consume."""
+
+    old_start: int
+    old_count: int
+    new_start: int
+    new_count: int
+    lines: tuple[PatchLine, ...]
+
+
+@dataclass(frozen=True)
+class PatchFile:
+    """A validated file section from a unified patch."""
+
+    old_path: str | None
+    new_path: str | None
+    hunks: tuple[PatchHunk, ...]
+
+    @property
+    def path(self) -> str:
+        return self.old_path or self.new_path or ""
+
+
+@dataclass(frozen=True)
+class ValidatedPatch:
+    """Reusable, grammar-validated unified diff shared by policy and tools."""
+
+    files: tuple[PatchFile, ...]
     paths: tuple[str, ...]
     changed_lines: int
     deletes_file: bool
@@ -197,7 +233,7 @@ class PolicyEngine:
         except (OSError, ValueError):
             return None
 
-    def _action_paths(self, action: Action) -> tuple[tuple[str, ...], _PatchImpact | None, str | None]:
+    def _action_paths(self, action: Action) -> tuple[tuple[str, ...], ValidatedPatch | None, str | None]:
         arguments = action.arguments
         if action.kind in {"read_file", "search_text", "list_files"}:
             path = arguments.get("path")
@@ -211,7 +247,7 @@ class PolicyEngine:
         patch = arguments.get("patch")
         if not isinstance(patch, str):
             return (), None, "Patch must be text."
-        impact = _parse_patch(patch)
+        impact = parse_validated_patch(patch)
         if impact is None:
             return (), None, "malformed_patch"
         return impact.paths, impact, None
@@ -309,10 +345,17 @@ def _is_sensitive(path: PurePosixPath, patterns: tuple[str, ...]) -> bool:
     )
 
 
-def _parse_patch(patch: str) -> _PatchImpact | None:
+def parse_validated_patch(patch: str) -> ValidatedPatch | None:
+    """Return the complete contextual diff grammar used for policy and application.
+
+    This validates only patch syntax and confinement-safe header paths. Filesystem
+    context is deliberately checked by ``ToolDispatcher`` immediately after policy
+    revalidation, so policy cannot authorize a different parse than dispatch uses.
+    """
     paths: set[str] = set()
     changed_lines = 0
     deletes_file = False
+    files: list[PatchFile] = []
     lines = patch.splitlines()
     index = 0
     while index < len(lines):
@@ -335,6 +378,7 @@ def _parse_patch(patch: str) -> _PatchImpact | None:
         paths.add(path)
         deletes_file = deletes_file or new_path is None
         found_hunk = False
+        hunks: list[PatchHunk] = []
         requires_context = old_path is not None and new_path is not None
         while index < len(lines) and not lines[index].startswith("--- "):
             hunk_match = _HUNK_HEADER.match(lines[index])
@@ -343,13 +387,19 @@ def _parse_patch(patch: str) -> _PatchImpact | None:
             found_hunk = True
             old_count = int(hunk_match.group(2) or "1")
             new_count = int(hunk_match.group(4) or "1")
+            old_start = int(hunk_match.group(1))
+            new_start = int(hunk_match.group(3))
             index += 1
             old_seen = 0
             new_seen = 0
             has_context = False
+            body: list[PatchLine] = []
             while index < len(lines) and not lines[index].startswith(("@@ ", "--- ")):
                 line = lines[index]
                 if line == r"\ No newline at end of file":
+                    if not body:
+                        return None
+                    body[-1] = replace(body[-1], no_newline=True)
                     index += 1
                     continue
                 if not line.startswith((" ", "+", "-")):
@@ -364,14 +414,17 @@ def _parse_patch(patch: str) -> _PatchImpact | None:
                 else:
                     old_seen += 1
                     changed_lines += 1
+                body.append(PatchLine(line[0], line[1:]))
                 index += 1
             if old_seen != old_count or new_seen != new_count:
                 return None
             if requires_context and not has_context:
                 return None
+            hunks.append(PatchHunk(old_start, old_count, new_start, new_count, tuple(body)))
         if not found_hunk:
             return None
-    return _PatchImpact(tuple(sorted(paths)), changed_lines, deletes_file)
+        files.append(PatchFile(old_path, new_path, tuple(hunks)))
+    return ValidatedPatch(tuple(files), tuple(sorted(paths)), changed_lines, deletes_file)
 
 
 def _header_path(line: str, prefix: str) -> str | None:

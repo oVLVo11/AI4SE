@@ -389,7 +389,7 @@ git commit -m "feat: enforce repository governance policy"
 
 **Interfaces:**
 - Consumes: allowed `Action`, `ToolResult`, canonical root.
-- Produces: `ToolDispatcher.dispatch(action: Action) -> ToolResult`, `ProcessRunner.run(argv: list[str], cwd: Path, timeout_s: int, output_limit: int) -> ProcessResult`, and `SubprocessRunner`.
+- Produces: `ToolDispatcher.dispatch(action: Action, decision: PolicyDecision, current_snapshot_digest: str) -> ToolResult`, `ProcessRunner.run(argv: list[str], cwd: Path, timeout_s: int, output_limit: int) -> ProcessResult`, and `SubprocessRunner`. `ToolDispatcher(repo_root, policy, process_runner, settings)` revalidates the supplied action-bound decision immediately before every effect and performs work only when that revalidation resolves `ALLOW`; `REQUIRE_APPROVAL` and `DENY` return a bounded no-effect `policy_denied` result.
 
 - [ ] **Step 1: Write failing bounded read/search/list tests**
 

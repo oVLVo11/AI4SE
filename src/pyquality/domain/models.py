@@ -279,6 +279,22 @@ class ToolResult(PublicModel):
         _bounded(json.dumps(self.normalized_metadata, ensure_ascii=False, separators=(",", ":")), _limit(info, "max_tool_metadata_bytes", MAX_TOOL_METADATA_BYTES), "normalized_metadata")
         return self
 
+    @property
+    def code(self) -> str:
+        """Stable dispatcher status without widening the persisted result schema."""
+        value = self.normalized_metadata.get("code", "ok")
+        return value if isinstance(value, str) else "invalid_result_code"
+
+    @property
+    def ok(self) -> bool:
+        """Whether the effect completed successfully."""
+        return self.code == "ok"
+
+    @property
+    def output(self) -> str:
+        """Bounded human/model-readable output emitted by a non-mutating tool."""
+        return self.evidence or ""
+
 
 class ApprovalDecision(StrEnum):
     APPROVE = "approve"
