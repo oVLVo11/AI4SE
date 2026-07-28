@@ -1,15 +1,14 @@
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Callable
 from pathlib import Path
 
 import pytest
 
 from pyquality.config import Settings
-from pyquality.domain.models import Action, PolicyOutcome
+from pyquality.domain.models import Action, PolicyDecision, PolicyOutcome
 from pyquality.policy import PolicyEngine, parse_validated_patch
-from pyquality.tools import SubprocessRunner, ToolDispatcher
+from pyquality.tools import CommitObserver, SubprocessRunner, ToolDispatcher
 
 
 @pytest.fixture
@@ -23,14 +22,38 @@ def _action(patch: str) -> Action:
     return Action(kind="apply_patch", arguments={"patch": patch}, rationale="Apply repair.")
 
 
-def _dispatcher(repo: Path, pre_commit_hook: Callable[[], None] | None = None) -> ToolDispatcher:
-    return ToolDispatcher(repo, PolicyEngine(repo), SubprocessRunner(), Settings(), pre_commit_hook)
+def _dispatcher(repo: Path, observer: CommitObserver | None = None, policy: object | None = None) -> ToolDispatcher:
+    return ToolDispatcher(repo, policy or PolicyEngine(repo), SubprocessRunner(), Settings(), observer)
 
 
 def _dispatch(repo: Path, action: Action):
     decision = PolicyEngine(repo).evaluate(action)
     assert decision.outcome is PolicyOutcome.ALLOW
     return _dispatcher(repo).dispatch(action, decision, decision.repository_snapshot_digest)
+
+
+class _AllowPolicy:
+    """Approval-aware policy stand-in: task 8 will supply an equivalent boundary."""
+
+    def revalidate(
+        self, decision: PolicyDecision, action: Action, current_snapshot_digest: str
+    ) -> PolicyDecision:
+        del action, current_snapshot_digest
+        return decision.model_copy(update={"outcome": PolicyOutcome.ALLOW})
+
+
+class _ConcurrentObserver:
+    def __init__(self, *, after_capture=None, before_install=None) -> None:
+        self._after_capture = after_capture
+        self._before_install = before_install
+
+    def after_capture(self, path: Path) -> None:
+        if self._after_capture is not None:
+            self._after_capture(path)
+
+    def before_install_or_delete(self, path: Path, operation: str) -> None:
+        if self._before_install is not None:
+            self._before_install(path, operation)
 
 
 def test_patch_rejects_missing_context(repo: Path) -> None:
@@ -120,19 +143,119 @@ def test_patch_preserves_the_existing_line_ending_style(repo: Path, ending: byte
     assert (repo / "a.py").read_bytes() == b"context" + ending + b"new" + ending
 
 
-def test_patch_aborts_when_target_changes_after_preparation(repo: Path) -> None:
-    """Replacing a file after a stale snapshot check would overwrite a concurrent edit."""
+def test_modify_never_overwrites_a_target_created_after_atomic_capture(repo: Path) -> None:
+    """Replacing a target after capture without exclusive install would overwrite a concurrent edit."""
     patch = "--- a/a.py\n+++ b/a.py\n@@ -1,2 +1,2 @@\n context\n-old\n+new\n"
     action = _action(patch)
     decision = PolicyEngine(repo).evaluate(action)
 
-    def replace_target() -> None:
-        (repo / "a.py").write_text("concurrent\n", encoding="utf-8")
+    observer = _ConcurrentObserver(
+        after_capture=lambda path: path.write_text("concurrent\n", encoding="utf-8")
+    )
 
-    result = _dispatcher(repo, replace_target).dispatch(action, decision, decision.repository_snapshot_digest)
+    result = _dispatcher(repo, observer).dispatch(action, decision, decision.repository_snapshot_digest)
 
     assert (result.ok, result.code) == (False, "patch_target_changed")
     assert (repo / "a.py").read_text(encoding="utf-8") == "concurrent\n"
+
+
+def test_create_never_overwrites_a_target_created_before_exclusive_install(repo: Path) -> None:
+    """A create implemented with replace would overwrite a file created in the commit window."""
+    patch = "--- /dev/null\n+++ b/new.py\n@@ -0,0 +1 @@\n+created\n"
+    action = _action(patch)
+    decision = PolicyEngine(repo).evaluate(action)
+    observer = _ConcurrentObserver(
+        before_install=lambda path, operation: path.write_text("concurrent\n", encoding="utf-8")
+        if operation == "create"
+        else None
+    )
+
+    result = _dispatcher(repo, observer).dispatch(action, decision, decision.repository_snapshot_digest)
+
+    assert (result.ok, result.code) == (False, "patch_target_changed")
+    assert (repo / "new.py").read_text(encoding="utf-8") == "concurrent\n"
+
+
+def test_delete_never_deletes_a_target_created_after_atomic_capture(repo: Path) -> None:
+    """Deleting the target name after capture would remove a concurrent replacement object."""
+    patch = "--- a/a.py\n+++ /dev/null\n@@ -1,2 +0,0 @@\n-context\n-old\n"
+    action = _action(patch)
+    decision = PolicyEngine(repo).evaluate(action)
+    observer = _ConcurrentObserver(
+        after_capture=lambda path: path.write_text("concurrent\n", encoding="utf-8")
+    )
+
+    result = _dispatcher(repo, observer, _AllowPolicy()).dispatch(
+        action, decision, decision.repository_snapshot_digest
+    )
+
+    assert (result.ok, result.code) == (False, "patch_target_changed")
+    assert (repo / "a.py").read_text(encoding="utf-8") == "concurrent\n"
+
+
+def test_normal_create_modify_and_delete_leave_no_commit_artifacts(repo: Path) -> None:
+    """Capture backups or temps that survive a successful patch would corrupt later repository scans."""
+    modify = _action("--- a/a.py\n+++ b/a.py\n@@ -1,2 +1,2 @@\n context\n-old\n+new\n")
+    modify_decision = PolicyEngine(repo).evaluate(modify)
+    modified = _dispatcher(repo).dispatch(modify, modify_decision, modify_decision.repository_snapshot_digest)
+    created = _action("--- /dev/null\n+++ b/new.py\n@@ -0,0 +1 @@\n+created\n")
+    create_decision = PolicyEngine(repo).evaluate(created)
+    made = _dispatcher(repo).dispatch(created, create_decision, create_decision.repository_snapshot_digest)
+    delete = _action("--- a/new.py\n+++ /dev/null\n@@ -1 +0,0 @@\n-created\n")
+    delete_decision = PolicyEngine(repo).evaluate(delete)
+    removed = _dispatcher(repo, policy=_AllowPolicy()).dispatch(
+        delete, delete_decision, delete_decision.repository_snapshot_digest
+    )
+
+    assert (modified.ok, made.ok, removed.ok) == (True, True, True)
+    assert (repo / "a.py").read_text(encoding="utf-8") == "context\nnew\n"
+    assert not (repo / "new.py").exists()
+    assert not list(repo.glob(".pyquality-*"))
+
+
+def test_multi_file_failure_rolls_back_an_earlier_install(repo: Path) -> None:
+    """Leaving an earlier file patched after a later exclusive-install conflict violates all-or-safe semantics."""
+    patch = (
+        "--- a/a.py\n+++ b/a.py\n@@ -1,2 +1,2 @@\n context\n-old\n+new\n"
+        "--- a/b.py\n+++ b/b.py\n@@ -1,2 +1,2 @@\n context\n-old\n+new\n"
+    )
+    action = _action(patch)
+    decision = PolicyEngine(repo).evaluate(action)
+    observer = _ConcurrentObserver(
+        after_capture=lambda path: path.write_text("concurrent\n", encoding="utf-8")
+        if path.name == "b.py"
+        else None
+    )
+
+    result = _dispatcher(repo, observer).dispatch(action, decision, decision.repository_snapshot_digest)
+
+    assert (result.ok, result.code) == (False, "patch_target_changed")
+    assert (repo / "a.py").read_text(encoding="utf-8") == "context\nold\n"
+    assert (repo / "b.py").read_text(encoding="utf-8") == "concurrent\n"
+
+
+def test_incomplete_rollback_reports_affected_paths_without_overwriting_concurrency(repo: Path) -> None:
+    """A failed rollback must preserve concurrent content and report that recovery remains incomplete."""
+    patch = (
+        "--- a/a.py\n+++ b/a.py\n@@ -1,2 +1,2 @@\n context\n-old\n+new\n"
+        "--- a/b.py\n+++ b/b.py\n@@ -1,2 +1,2 @@\n context\n-old\n+new\n"
+    )
+    action = _action(patch)
+    decision = PolicyEngine(repo).evaluate(action)
+
+    def before_install(path: Path, operation: str) -> None:
+        if path.name == "b.py" and operation == "modify":
+            (repo / "a.py").write_text("concurrent-a\n", encoding="utf-8")
+            path.write_text("concurrent-b\n", encoding="utf-8")
+
+    result = _dispatcher(repo, _ConcurrentObserver(before_install=before_install)).dispatch(
+        action, decision, decision.repository_snapshot_digest
+    )
+
+    assert (result.ok, result.code) == (False, "patch_rollback_incomplete")
+    assert result.normalized_metadata["affected_paths"] == ["a.py"]
+    assert (repo / "a.py").read_text(encoding="utf-8") == "concurrent-a\n"
+    assert (repo / "b.py").read_text(encoding="utf-8") == "concurrent-b\n"
 
 
 def test_patch_aborts_when_target_parent_becomes_an_outside_symlink(
@@ -150,17 +273,17 @@ def test_patch_aborts_when_target_parent_becomes_an_outside_symlink(
     action = _action(patch)
     decision = PolicyEngine(repo).evaluate(action)
 
-    def swap_parent() -> None:
-        target.unlink()
-        nested.rmdir()
+    def swap_target_for_outside_link(path: Path) -> None:
         try:
-            nested.symlink_to(outside, target_is_directory=True)
+            path.symlink_to(outside_target)
         except OSError as error:
             if getattr(error, "winerror", None) == 1314:
                 pytest.skip(f"symlinks are unavailable in this test environment: {error}")
             raise
 
-    result = _dispatcher(repo, swap_parent).dispatch(action, decision, decision.repository_snapshot_digest)
+    result = _dispatcher(repo, _ConcurrentObserver(after_capture=swap_target_for_outside_link)).dispatch(
+        action, decision, decision.repository_snapshot_digest
+    )
 
     assert (result.ok, result.code) == (False, "patch_target_changed")
     assert outside_target.read_text(encoding="utf-8") == "outside\n"

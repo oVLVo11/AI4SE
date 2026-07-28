@@ -9,7 +9,6 @@ import subprocess
 import tempfile
 import threading
 import time
-from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import BinaryIO, Protocol
@@ -46,6 +45,22 @@ class ProcessRunner(Protocol):
     """Injectable subprocess boundary for quality validation."""
 
     def run(self, argv: list[str], cwd: Path, timeout_s: int, output_limit: int) -> ProcessResult: ...
+
+
+class CommitObserver(Protocol):
+    """Optional production coordination boundary around an atomic patch commit."""
+
+    def after_capture(self, path: Path) -> None: ...
+
+    def before_install_or_delete(self, path: Path, operation: str) -> None: ...
+
+
+class _NoopCommitObserver:
+    def after_capture(self, path: Path) -> None:
+        del path
+
+    def before_install_or_delete(self, path: Path, operation: str) -> None:
+        del path, operation
 
 
 class SubprocessRunner:
@@ -134,7 +149,7 @@ class ToolDispatcher:
         policy: PolicyEngine,
         process_runner: ProcessRunner,
         settings: Settings,
-        before_patch_commit: Callable[[], None] | None = None,
+        commit_observer: CommitObserver | None = None,
     ) -> None:
         self._root = Path(repo_root).resolve(strict=True)
         if not self._root.is_dir():
@@ -142,7 +157,7 @@ class ToolDispatcher:
         self._policy = policy
         self._process_runner = process_runner
         self._settings = settings
-        self._before_patch_commit = before_patch_commit or (lambda: None)
+        self._commit_observer = commit_observer or _NoopCommitObserver()
 
     def dispatch(
         self, action: Action, decision: PolicyDecision, current_snapshot_digest: str
@@ -227,34 +242,36 @@ class ToolDispatcher:
         if error is not None:
             return _result("apply_patch", error)
         assert prepared is not None
-        self._before_patch_commit()
-        if not all(_target_state_matches(item) for item in prepared):
-            return _result("apply_patch", "patch_target_changed")
-        temporary_paths: list[Path] = []
+        records: list[_CommitRecord] = []
         try:
             for item in prepared:
-                if item.new_content is None:
-                    continue
-                descriptor, temporary_name = tempfile.mkstemp(dir=item.target.parent, prefix=".pyquality-")
-                temporary = Path(temporary_name)
-                temporary_paths.append(temporary)
-                with os.fdopen(descriptor, "wb") as stream:
-                    stream.write(item.new_content)
-            for item, temporary in zip(
-                (item for item in prepared if item.new_content is not None), temporary_paths, strict=True
-            ):
-                if not _target_state_matches(item):
-                    return _result("apply_patch", "patch_target_changed")
-                os.replace(temporary, item.target)
-            for item in prepared:
-                if item.new_content is None and item.target.exists():
-                    item.target.unlink()
+                records.append(_CommitRecord(item, _write_patch_temp(item)))
         except OSError:
+            _cleanup_temps(records)
             return _result("apply_patch", "patch_write_error")
-        finally:
-            for temporary in temporary_paths:
-                if temporary.exists():
-                    temporary.unlink(missing_ok=True)
+
+        committed: list[_CommitRecord] = []
+        for record in records:
+            code = self._commit_record(record)
+            if code is None:
+                committed.append(record)
+                continue
+            rollback_paths = _rollback(committed)
+            _cleanup_temps(records)
+            if rollback_paths:
+                return _result("apply_patch", "patch_rollback_incomplete", affected_paths=rollback_paths)
+            return _result("apply_patch", code)
+
+        try:
+            for record in records:
+                _finalize_backup(record)
+        except OSError:
+            rollback_paths = _rollback(committed)
+            _cleanup_temps(records)
+            if rollback_paths:
+                return _result("apply_patch", "patch_rollback_incomplete", affected_paths=rollback_paths)
+            return _result("apply_patch", "patch_write_error")
+        _cleanup_temps(records)
 
         changed = tuple(item.patch.path for item in prepared)
         before = {item.patch.path: _digest(item.old_content) for item in prepared if item.old_content is not None}
@@ -267,6 +284,32 @@ class ToolDispatcher:
             after_digests=after,
             normalized_metadata={"code": "ok"},
         )
+
+    def _commit_record(self, record: _CommitRecord) -> str | None:
+        item = record.item
+        operation = "delete" if item.new_content is None else "modify" if item.old_content is not None else "create"
+        if item.old_content is not None:
+            code = _capture_target(record)
+            if code is not None:
+                return code
+            self._commit_observer.after_capture(item.target)
+        self._commit_observer.before_install_or_delete(item.target, operation)
+
+        if operation == "delete":
+            if _path_exists(item.target):
+                assert record.backup is not None
+                record.backup.unlink()
+                record.backup = None
+                return "patch_target_changed"
+            return None
+        if _path_exists(item.target) or record.temporary is None:
+            return "patch_target_changed"
+        if not _install_exclusive(record.temporary, item.target):
+            return "patch_target_changed"
+        record.temporary = None
+        record.installed_identity = _identity(item.target.lstat())
+        record.installed_digest = _digest(item.target.read_bytes())
+        return None
 
     @property
     def output_limit(self) -> int:
@@ -372,6 +415,15 @@ class _PreparedPatch:
     target_state: _TargetState
 
 
+@dataclass
+class _CommitRecord:
+    item: _PreparedPatch
+    temporary: Path | None
+    backup: Path | None = None
+    installed_identity: tuple[int, int] | None = None
+    installed_digest: str | None = None
+
+
 @dataclass(frozen=True)
 class _TargetState:
     canonical_parent: Path
@@ -405,12 +457,22 @@ def _line_text(line: str) -> str:
     return line.removesuffix("\n").removesuffix("\r")
 
 
-def _result(effect_kind: str, code: str, *, output: str = "", truncated: bool = False) -> ToolResult:
+def _result(
+    effect_kind: str,
+    code: str,
+    *,
+    output: str = "",
+    truncated: bool = False,
+    affected_paths: list[str] | None = None,
+) -> ToolResult:
+    metadata: dict[str, object] = {"code": code}
+    if affected_paths:
+        metadata["affected_paths"] = affected_paths
     return ToolResult(
         effect_kind=effect_kind,
         code_changed=False,
         truncated=truncated,
-        normalized_metadata={"code": code},
+        normalized_metadata=metadata,
         evidence=output or None,
     )
 
@@ -459,6 +521,112 @@ def _target_state_matches(item: _PreparedPatch) -> bool:
         )
     except OSError:
         return False
+
+
+def _write_patch_temp(item: _PreparedPatch) -> Path | None:
+    if item.new_content is None:
+        return None
+    descriptor, temporary_name = tempfile.mkstemp(dir=item.target.parent, prefix=".pyquality-")
+    temporary = Path(temporary_name)
+    with os.fdopen(descriptor, "wb") as stream:
+        stream.write(item.new_content)
+    return temporary
+
+
+def _capture_target(record: _CommitRecord) -> str | None:
+    item = record.item
+    if not _target_state_matches(item):
+        return "patch_target_changed"
+    descriptor, backup_name = tempfile.mkstemp(dir=item.target.parent, prefix=".pyquality-backup-")
+    os.close(descriptor)
+    backup = Path(backup_name)
+    try:
+        os.replace(item.target, backup)
+    except OSError:
+        backup.unlink(missing_ok=True)
+        return "patch_target_changed"
+    record.backup = backup
+    if _backup_matches(record):
+        return None
+    if not _restore_exclusive(backup, item.target):
+        record.backup = backup
+    else:
+        record.backup = None
+    return "patch_target_changed"
+
+
+def _backup_matches(record: _CommitRecord) -> bool:
+    assert record.backup is not None
+    expected = record.item.target_state
+    try:
+        return (
+            _identity(record.backup.lstat()) == expected.target_identity
+            and _digest(record.backup.read_bytes()) == expected.target_digest
+        )
+    except OSError:
+        return False
+
+
+def _install_exclusive(temporary: Path, target: Path) -> bool:
+    try:
+        os.link(temporary, target)
+    except FileExistsError:
+        return False
+    except OSError:
+        return False
+    temporary.unlink()
+    return True
+
+
+def _restore_exclusive(backup: Path, target: Path) -> bool:
+    if _path_exists(target):
+        return False
+    return _install_exclusive(backup, target)
+
+
+def _rollback(records: list[_CommitRecord]) -> list[str]:
+    incomplete: list[str] = []
+    for record in reversed(records):
+        item = record.item
+        if record.installed_identity is not None:
+            if not _file_matches(item.target, record.installed_identity, record.installed_digest):
+                incomplete.append(item.patch.path)
+                continue
+            try:
+                item.target.unlink()
+            except OSError:
+                incomplete.append(item.patch.path)
+                continue
+        if record.backup is not None:
+            if not _restore_exclusive(record.backup, item.target):
+                incomplete.append(item.patch.path)
+                continue
+            record.backup = None
+    return sorted(set(incomplete))
+
+
+def _finalize_backup(record: _CommitRecord) -> None:
+    if record.backup is not None:
+        record.backup.unlink()
+        record.backup = None
+
+
+def _cleanup_temps(records: list[_CommitRecord]) -> None:
+    for record in records:
+        if record.temporary is not None:
+            record.temporary.unlink(missing_ok=True)
+            record.temporary = None
+
+
+def _file_matches(target: Path, identity: tuple[int, int], digest: str | None) -> bool:
+    try:
+        return _identity(target.lstat()) == identity and _digest(target.read_bytes()) == digest
+    except OSError:
+        return False
+
+
+def _path_exists(path: Path) -> bool:
+    return path.exists() or path.is_symlink()
 
 
 def _identity(details: os.stat_result) -> tuple[int, int]:
