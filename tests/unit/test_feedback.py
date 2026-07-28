@@ -1,0 +1,86 @@
+from __future__ import annotations
+
+from pyquality.domain.models import Finding
+from pyquality.feedback import FeedbackComposer
+
+
+def finding(
+    category: str,
+    group_key: str,
+    *,
+    path: str | None = "tests/test_math.py",
+    line: int | None = 4,
+    summary: str = "summary",
+    evidence: str = "evidence",
+) -> Finding:
+    return Finding(
+        source="ruff" if category == "ruff" else "pytest",
+        category=category,
+        severity="warning" if category == "ruff" else "error",
+        path=path,
+        line=line,
+        summary=summary,
+        evidence=evidence,
+        group_key=group_key,
+    )
+
+
+def test_feedback_orders_root_causes_and_reports_truncation() -> None:
+    findings = (
+        finding("ruff", "ruff", path="z.py", evidence="x" * 70),
+        finding("assertion", "assert", path="b.py", evidence="x" * 70),
+        finding("syntax", "syntax", path="a.py", evidence="x" * 70),
+    )
+
+    packet = FeedbackComposer().compose(findings, total_bytes=300, per_item_bytes=120)
+
+    assert [item.category for item in packet.findings[:2]] == ["syntax", "assertion"]
+    assert packet.omitted_count > 0
+    assert packet.truncated is True
+    assert packet.byte_budget == 300
+    assert 0 < len(packet.text.encode("utf-8")) <= 300
+
+
+def test_duplicate_root_causes_are_grouped() -> None:
+    duplicates = tuple(finding("import_collection", "same", line=line) for line in (1, 2, 3))
+
+    packet = FeedbackComposer().compose(duplicates, 2_000, 500)
+
+    assert len(packet.findings) == 1
+    assert packet.findings[0].occurrences == 3
+
+
+def test_ties_sort_by_normalized_path_line_and_summary() -> None:
+    findings = (
+        finding("runtime", "c", path="b.py", line=1, summary="a"),
+        finding("runtime", "b", path="a.py", line=2, summary="a"),
+        finding("runtime", "a", path="a.py", line=1, summary="z"),
+    )
+
+    packet = FeedbackComposer().compose(findings, 4_000, 1_000)
+
+    assert [(item.path, item.line) for item in packet.findings] == [
+        ("a.py", 1),
+        ("a.py", 2),
+        ("b.py", 1),
+    ]
+
+
+def test_utf8_truncation_is_safe_nonempty_and_bounded_at_minimum_budget() -> None:
+    item = finding("assertion", "emoji", summary="🚀", evidence="🚀" * 20)
+
+    packet = FeedbackComposer().compose((item,), total_bytes=1, per_item_bytes=1)
+
+    assert packet.text == "~"
+    assert len(packet.text.encode("utf-8")) == 1
+    assert packet.truncated is True
+    assert packet.omitted_count == 1
+
+
+def test_invalid_budgets_are_rejected() -> None:
+    import pytest
+
+    with pytest.raises(ValueError, match="positive"):
+        FeedbackComposer().compose((), 0, 1)
+    with pytest.raises(ValueError, match="positive"):
+        FeedbackComposer().compose((), 1, 0)
