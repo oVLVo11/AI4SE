@@ -132,6 +132,19 @@ def test_provider_result_rejects_canonical_scalar_secret_echoes(memory_keyring: 
     assert raised.value.__context__ is None
 
 
+@pytest.mark.parametrize(
+    ("secret", "result"),
+    [("True", True), ("+123", 123), ("01", {"nested": 1}), ("1.50", {"1.5": "value"})],
+)
+def test_provider_result_compares_stored_and_returned_scalars_with_one_grammar(memory_keyring: MemoryKeyring, secret: str, result: object) -> None:
+    """Catches equivalent scalar spellings that evade direct textual credential comparison."""
+    service = CredentialService(memory_keyring, service_name="pyquality")
+    service.set("provider", secret)
+
+    with pytest.raises(CredentialProviderError):
+        service.get("provider", lambda _, result=result: result)
+
+
 def test_backend_exception_does_not_preserve_secret_in_exception_chain() -> None:
     """Catches chaining a backend exception whose message contains the credential."""
 

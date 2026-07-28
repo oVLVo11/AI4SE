@@ -12,17 +12,36 @@ from pyquality.domain.models import AuditEvent
 from pyquality.security import AuditLogger, AuditWriteError, redact
 
 
-def _emit_in_process(path: str, start: int, count: int) -> None:
-    logger = AuditLogger(Path(path))
+@pytest.fixture(autouse=True)
+def isolated_lock_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep deterministic tests in their tmp directory while production defaults to application data."""
+    real_logger = AuditLogger
+    monkeypatch.setitem(
+        globals(),
+        "AuditLogger",
+        lambda path, **kwargs: real_logger(path, lock_root=tmp_path / ".audit-locks", **kwargs),
+    )
+
+
+def _emit_in_process(path: str, start: int, count: int, lock_root: str) -> None:
+    logger = AuditLogger(Path(path), lock_root=Path(lock_root))
     for index in range(start, start + count):
         logger.emit(AuditEvent(event_type="transition", metadata={"intent_id": f"intent-{index}"}))
 
 
-def _emit_aliases(first: str, second: str, start: int) -> None:
+def _emit_aliases(first: str, second: str, start: int, lock_root: str) -> None:
     for index in range(start, start + 30):
-        AuditLogger(Path(first if index % 2 else second)).emit(
+        AuditLogger(Path(first if index % 2 else second), lock_root=Path(lock_root)).emit(
             AuditEvent(event_type="transition", metadata={"intent_id": f"alias-{index}"})
         )
+
+
+def _lock_root_from_custom_temp(temp: str, root: str, queue: multiprocessing.Queue[str]) -> None:
+    os.environ["TEMP"] = temp
+    os.environ["TMP"] = temp
+    from pyquality import security
+
+    queue.put(str(security._prepare_lock_root(Path(root))))
 
 
 def test_redacts_nested_headers_urls_and_exception_text(tmp_path: Path) -> None:
@@ -48,6 +67,18 @@ def test_redacts_percent_encoded_registered_secret_in_url_query_and_path() -> No
     )
     assert "secret" not in clean
     assert "%2Fsafe%2Fpath" in clean
+
+
+def test_redacts_decoded_url_keys_and_preserves_percent_literals_and_unicode() -> None:
+    """Catches decoded query-key leakage or double-decoding literal percent and Unicode components."""
+    clean = redact(
+        "https://x.test/%E9%9B%AA%25?sk%2Dsecret=value&note=%2525%E9%9B%AA",
+        secrets={"sk-secret"},
+        sensitive_keys=set(),
+    )
+    assert "secret" not in clean
+    assert "%2525" in clean
+    assert "%E9%9B%AA" in clean
 
 
 def test_redact_handles_cycles_bytes_and_dangerous_objects_without_mutating_input() -> None:
@@ -88,17 +119,22 @@ def test_redact_sanitizes_registered_secret_mapping_keys_and_resolves_collisions
 def test_redact_limits_lazy_generator_work_and_aggregate_output() -> None:
     """Catches eager list materialization and unbounded aggregate traversal."""
 
+    pulls = 0
+
     def guarded_generator():
+        nonlocal pulls
         for index in range(10_000):
+            pulls += 1
             if index == 130:
                 raise AssertionError("redaction consumed an unbounded generator")
             yield {"value": "x" * 2_000, "index": index}
 
     clean = redact(guarded_generator(), secrets=set(), sensitive_keys=set())
 
-    assert isinstance(clean, list | str)
+    assert isinstance(clean, list)
     assert len(json.dumps(clean).encode("utf-8")) <= 8_192
-    assert len(clean) <= 129
+    assert clean[-1] == "[TRUNCATED]"
+    assert pulls == 5
 
 
 def test_audit_log_omits_source_and_prompt_by_default(tmp_path: Path) -> None:
@@ -144,6 +180,24 @@ def test_audit_allowlisted_fields_drop_nested_and_wrong_scalar_types(tmp_path: P
     record = json.loads((tmp_path / "audit.jsonl").read_text(encoding="utf-8"))
     assert record["metadata"] == {}
     assert record["duration"] is None
+
+
+@pytest.mark.parametrize("value", [True, 10**1000, float("nan"), float("inf"), -1, 86_401])
+def test_audit_drops_invalid_duration_without_dropping_event(tmp_path: Path, value: object) -> None:
+    """Catches unbounded, non-finite, boolean, or semantically invalid durations entering audit JSON."""
+    path = tmp_path / "audit.jsonl"
+    AuditLogger(path).emit(AuditEvent(event_type="transition", metadata={"duration": value, "intent_id": "ok"}))
+    record = json.loads(path.read_text(encoding="utf-8"))
+    assert record["duration"] is None
+    assert record["metadata"] == {"intent_id": "ok"}
+
+
+@pytest.mark.parametrize("value", [0, 86_400, 1.5])
+def test_audit_accepts_bounded_finite_duration(tmp_path: Path, value: float) -> None:
+    """Catches rejecting the documented finite duration boundary values."""
+    path = tmp_path / "audit.jsonl"
+    AuditLogger(path).emit(AuditEvent(event_type="transition", metadata={"duration": value}))
+    assert json.loads(path.read_text(encoding="utf-8"))["duration"] == value
 
 
 def test_audit_record_cap_applies_after_duration_and_outcome_fallback(tmp_path: Path) -> None:
@@ -200,7 +254,8 @@ def test_audit_multi_process_hardlink_aliases_share_one_complete_record_stream(t
     except OSError as error:
         pytest.skip(f"hardlink creation unavailable: {error.__class__.__name__}")
     context = multiprocessing.get_context("spawn")
-    processes = [context.Process(target=_emit_aliases, args=(str(path), str(alias), index * 30)) for index in range(2)]
+    lock_root = tmp_path / ".audit-locks"
+    processes = [context.Process(target=_emit_aliases, args=(str(path), str(alias), index * 30, str(lock_root))) for index in range(2)]
     for process in processes:
         process.start()
     for process in processes:
@@ -208,6 +263,22 @@ def test_audit_multi_process_hardlink_aliases_share_one_complete_record_stream(t
         assert process.exitcode == 0
     records = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
     assert {record["metadata"]["intent_id"] for record in records} == {f"alias-{index}" for index in range(60)}
+
+
+def test_lock_root_is_stable_across_subprocess_temp_environment_changes(tmp_path: Path) -> None:
+    """Catches lock authority that follows process-local TEMP/TMP instead of per-user application data."""
+    context = multiprocessing.get_context("spawn")
+    queue: multiprocessing.Queue[str] = context.Queue()
+    root = tmp_path / ".audit-locks"
+    first = context.Process(target=_lock_root_from_custom_temp, args=(str(tmp_path / "one"), str(root), queue))
+    second = context.Process(target=_lock_root_from_custom_temp, args=(str(tmp_path / "two"), str(root), queue))
+    first.start()
+    second.start()
+    roots = {queue.get(timeout=20), queue.get(timeout=20)}
+    first.join(20)
+    second.join(20)
+    assert (first.exitcode, second.exitcode) == (0, 0)
+    assert len(roots) == 1
 
 
 def test_audit_normalizes_lone_surrogates_to_valid_utf8(tmp_path: Path) -> None:
@@ -247,7 +318,8 @@ def test_audit_recovers_partial_tail_and_serializes_multi_process_emits(tmp_path
     path = tmp_path / "audit.jsonl"
     path.write_bytes(b'{"event_type":"partial"')
     context = multiprocessing.get_context("spawn")
-    processes = [context.Process(target=_emit_in_process, args=(str(path), index * 20, 20)) for index in range(3)]
+    lock_root = tmp_path / ".audit-locks"
+    processes = [context.Process(target=_emit_in_process, args=(str(path), index * 20, 20, str(lock_root))) for index in range(3)]
     for process in processes:
         process.start()
     for process in processes:
