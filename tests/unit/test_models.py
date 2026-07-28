@@ -247,3 +247,49 @@ def test_policy_digest_normalizes_uppercase_hex_and_rejects_non_hex() -> None:
             impact_summary="Read-only inspection.",
             action_digest="g" * 64,
         )
+
+
+def test_action_schema_contains_real_union_mapping() -> None:
+    """A marker-only discriminator would still leave generated clients without variant schemas."""
+    schema = Action.model_json_schema()
+
+    assert len(schema.get("oneOf", [])) == 6
+    assert set(schema["discriminator"]["mapping"]) == {
+        "read_file", "search_text", "list_files", "apply_patch", "run_quality", "finish"
+    }
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"kind": "read_file", "arguments": {"path": "src/a.py"}, "rationale": "Read it."},
+        {"kind": "search_text", "arguments": {"pattern": "TODO"}, "rationale": "Search it."},
+        {"kind": "list_files", "arguments": {}, "rationale": "List it."},
+        {"kind": "apply_patch", "arguments": {"patch": "*** Begin Patch"}, "rationale": "Patch it."},
+        {"kind": "run_quality", "arguments": {}, "rationale": "Verify it."},
+        {"kind": "finish", "arguments": {}, "rationale": "Finish it."},
+    ],
+)
+def test_action_union_validates_every_kind(payload: dict[str, object]) -> None:
+    """Removing a union variant would make its legal action unavailable to dispatch."""
+    assert Action.model_validate(payload).kind == payload["kind"]
+
+
+def test_action_union_rejects_cross_kind_arguments_at_envelope_validation() -> None:
+    """A patch argument on a read-file envelope must not validate as a generic action."""
+    with pytest.raises(ValueError):
+        Action.model_validate(
+            {"kind": "read_file", "arguments": {"patch": "*** Begin Patch"}, "rationale": "Read it."}
+        )
+
+
+def test_action_constructor_properties_and_dump_remain_compatible() -> None:
+    """Changing the union representation must not break existing action consumers."""
+    action = Action(kind="read_file", arguments={"path": "src/a.py"}, rationale="Read it.")
+
+    assert (action.kind, action.arguments, action.rationale) == (
+        "read_file", {"path": "src/a.py"}, "Read it."
+    )
+    assert action.model_dump() == {
+        "kind": "read_file", "arguments": {"path": "src/a.py"}, "rationale": "Read it."
+    }

@@ -7,9 +7,9 @@ import re
 from datetime import datetime
 from enum import StrEnum
 from pathlib import PurePosixPath
-from typing import ClassVar, Literal
+from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, RootModel, model_validator
 
 MAX_RATIONALE_BYTES = 4_096
 MAX_FINDING_SUMMARY_BYTES = 1_024
@@ -74,32 +74,72 @@ class FinishArguments(PublicModel):
     pass
 
 
-class Action(PublicModel):
-    """A normalized action with a closed, kind-specific argument shape."""
-
-    kind: Literal["read_file", "search_text", "list_files", "apply_patch", "run_quality", "finish"]
-    arguments: dict[str, JsonValue] = Field(default_factory=dict)
+class ActionEnvelope(PublicModel):
     rationale: str = Field(min_length=1)
-    model_config = ConfigDict(
-        extra="forbid", json_schema_extra={"discriminator": {"propertyName": "kind"}}
-    )
-
-    _argument_models: ClassVar[dict[str, type[PublicModel]]] = {
-        "read_file": ReadFileArguments,
-        "search_text": SearchTextArguments,
-        "list_files": ListFilesArguments,
-        "apply_patch": ApplyPatchArguments,
-        "run_quality": RunQualityArguments,
-        "finish": FinishArguments,
-    }
 
     @model_validator(mode="after")
-    def validate_arguments(self) -> Action:
-        model = self._argument_models[self.kind]
-        self.arguments = model.model_validate(self.arguments).model_dump(exclude_none=True)
+    def validate_envelope(self) -> ActionEnvelope:
         _bounded(self.rationale, MAX_RATIONALE_BYTES, "rationale")
-        _bounded(json.dumps(self.arguments, ensure_ascii=False, separators=(",", ":")), MAX_ACTION_ARGUMENTS_BYTES, "arguments")
+        arguments = self.arguments.model_dump(exclude_none=True)
+        _bounded(json.dumps(arguments, ensure_ascii=False, separators=(",", ":")), MAX_ACTION_ARGUMENTS_BYTES, "arguments")
         return self
+
+
+class ReadFileAction(ActionEnvelope):
+    kind: Literal["read_file"]
+    arguments: ReadFileArguments
+
+
+class SearchTextAction(ActionEnvelope):
+    kind: Literal["search_text"]
+    arguments: SearchTextArguments
+
+
+class ListFilesAction(ActionEnvelope):
+    kind: Literal["list_files"]
+    arguments: ListFilesArguments
+
+
+class ApplyPatchAction(ActionEnvelope):
+    kind: Literal["apply_patch"]
+    arguments: ApplyPatchArguments
+
+
+class RunQualityAction(ActionEnvelope):
+    kind: Literal["run_quality"]
+    arguments: RunQualityArguments
+
+
+class FinishAction(ActionEnvelope):
+    kind: Literal["finish"]
+    arguments: FinishArguments
+
+
+ActionVariant = Annotated[
+    ReadFileAction | SearchTextAction | ListFilesAction | ApplyPatchAction | RunQualityAction | FinishAction,
+    Field(discriminator="kind"),
+]
+
+
+class Action(RootModel[ActionVariant]):
+    """Discriminated action envelope with the original consumer-facing accessors."""
+
+    def __init__(self, root: ActionVariant | None = None, **data: JsonValue) -> None:
+        if root is not None and data:
+            raise ValueError("provide either root or action fields")
+        super().__init__(root=root if root is not None else data)
+
+    @property
+    def kind(self) -> str:
+        return self.root.kind
+
+    @property
+    def arguments(self) -> dict[str, JsonValue]:
+        return self.root.arguments.model_dump(exclude_none=True)
+
+    @property
+    def rationale(self) -> str:
+        return self.root.rationale
 
 
 class Finding(PublicModel):
