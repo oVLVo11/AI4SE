@@ -36,6 +36,7 @@ from pyquality.llm import ActionFormatError, ActionParser, LLMClient, Message, P
 from pyquality.memory import MemoryContext
 from pyquality.storage.sqlite import (
     ApprovalRecord,
+    LeaseRecoveryBlocked,
     RecoverySnapshot,
     SQLiteTaskRepository,
     StorageStateError,
@@ -174,6 +175,8 @@ class AgentLoop:
                 if recovered is not None:
                     return recovered
             return self._drive(task_id)
+        except LeaseRecoveryBlocked as error:
+            return self._make_result(task_id, TaskStatus.BLOCKED, str(error))
         except (OSError, PermissionError) as error:
             return self._blocked_if_possible(task_id, error) if acquired else self._make_result(
                 task_id, TaskStatus.BLOCKED, f"Execution blocked: {type(error).__name__}."
@@ -493,7 +496,17 @@ class AgentLoop:
                 task_id, TaskStatus.FAILED, "Approval iteration is missing."
             )
         if approval.execution_state == "completed":
+            completed_dispatch = self._recover_transition(
+                task_id, "dispatch", saved.action_digest
+            )
             if iteration.quality_outcome is not None:
+                if completed_dispatch is not None:
+                    self._repository.consume_intents_for_completed_iteration(
+                        task_id,
+                        iteration.id,
+                        source_intent_ids=(completed_dispatch.id,),
+                        owner_token=self._owner(),
+                    )
                 return None
             if not self._dispatcher.matches_expected_after_digests(
                 approval.expected_after_digests
@@ -504,6 +517,8 @@ class AgentLoop:
                     "Completed approval does not match its effect evidence.",
                 )
             recovered = _recovered_tool_result(action, approval.expected_after_digests)
+            if completed_dispatch is not None:
+                self._remember_intent(completed_dispatch.id)
             self._changed(task_id).update(recovered.changed_paths)
             return self._verify_approved_effect(
                 task_id, approval, recovered, already_completed=True
@@ -512,9 +527,15 @@ class AgentLoop:
             approval.execution_state == "intent_recorded"
             and iteration.quality_outcome in {"passed", "failed", "blocked"}
         ):
+            completed_dispatch = self._recover_transition(
+                task_id, "dispatch", saved.action_digest
+            )
             self._repository.mark_execution_completed(
                 approval.id,
                 result_digest=iteration.tool_result_digest,
+                source_intent_ids=(completed_dispatch.id,)
+                if completed_dispatch is not None
+                else (),
                 owner_token=self._owner(),
             )
             if iteration.quality_outcome == "blocked":
@@ -542,9 +563,15 @@ class AgentLoop:
             approval.execution_state == "intent_recorded"
             and iteration.quality_outcome == "not_run"
         ):
+            completed_dispatch = self._recover_transition(
+                task_id, "dispatch", saved.action_digest
+            )
             self._repository.mark_execution_completed(
                 approval.id,
                 result_digest=iteration.tool_result_digest,
+                source_intent_ids=(completed_dispatch.id,)
+                if completed_dispatch is not None
+                else (),
                 owner_token=self._owner(),
             )
             if any(item.iteration_id == iteration.id for item in snapshot.findings):
@@ -562,6 +589,11 @@ class AgentLoop:
             )
         ):
             recovered = _recovered_tool_result(action, approval.expected_after_digests)
+            completed_dispatch = self._recover_transition(
+                task_id, "dispatch", saved.action_digest
+            )
+            if completed_dispatch is not None:
+                self._remember_intent(completed_dispatch.id)
             self._changed(task_id).update(recovered.changed_paths)
             return self._verify_approved_effect(
                 task_id, approval, recovered, already_completed=False

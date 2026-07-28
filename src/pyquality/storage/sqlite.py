@@ -25,10 +25,15 @@ from pyquality.domain.models import (
     TaskResult,
     TaskStatus,
 )
+from pyquality.storage.local_lock import LocalProjectLock
 
 
 class StorageStateError(RuntimeError):
     """Raised when persisted state cannot make the requested transition."""
+
+
+class LeaseRecoveryBlocked(StorageStateError):
+    """Raised when durable lease evidence predates the safe lock protocol."""
 
 
 class _StorageRecord(PublicModel):
@@ -134,12 +139,15 @@ _ALLOWED_TRANSITIONS = {
     TaskStatus.RUNNING: frozenset({TaskStatus.WAITING_APPROVAL, *_TERMINAL_STATUSES}),
     TaskStatus.WAITING_APPROVAL: frozenset({TaskStatus.RUNNING}),
 }
+_LEASE_PROTOCOL = "os-file-v1"
 
 
 class SQLiteTaskRepository:
     """Owns atomic persistence of task state and recovery records."""
 
     def __init__(self, db_path: Path) -> None:
+        self._lock_root = db_path.parent / f".{db_path.name}.lease-locks"
+        self._held_leases: dict[str, tuple[str, str, LocalProjectLock]] = {}
         self._connection = sqlite3.connect(db_path, isolation_level=None)
         self._connection.row_factory = sqlite3.Row
         self._connection.execute("PRAGMA foreign_keys = ON")
@@ -275,6 +283,7 @@ class SQLiteTaskRepository:
         *,
         owner_token: str | None = None,
     ) -> bool:
+        release_local = False
         with self._transaction() as connection:
             current = connection.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
             if current is None or current["status"] != expected.value:
@@ -301,6 +310,9 @@ class SQLiteTaskRepository:
                     "DELETE FROM project_leases WHERE task_id = ? AND owner_token = ?",
                     (task_id, owner_token),
                 )
+                release_local = owner_token is not None
+        if release_local:
+            self._release_local_lease(owner_token)
         return True
 
     def complete_iteration_outcome(
@@ -376,6 +388,28 @@ class SQLiteTaskRepository:
                 connection, task_id, source_intent_ids
             )
         return self._iteration_by_id(iteration_id)
+
+    def consume_intents_for_completed_iteration(
+        self,
+        task_id: str,
+        iteration_id: str,
+        *,
+        source_intent_ids: tuple[str, ...],
+        owner_token: str,
+    ) -> None:
+        """Atomically reconcile leftover intents into an already-saved outcome."""
+        if not source_intent_ids:
+            return
+        with self._transaction() as connection:
+            row = self._require_iteration(connection, task_id, iteration_id)
+            self._require_running_lease(connection, task_id, owner_token)
+            if row["tool_result_digest"] is None or row["quality_outcome"] is None:
+                raise StorageStateError(
+                    "transition intents require a completed iteration outcome"
+                )
+            self._consume_transition_intents(
+                connection, task_id, source_intent_ids
+            )
 
     def record_approval(
         self,
@@ -487,6 +521,7 @@ class SQLiteTaskRepository:
                 )
         except sqlite3.Error as error:
             raise StorageStateError("approval transition failed") from error
+        self._release_local_lease(owner_token)
         return self._approval_by_id(approval_id)
 
     def request_approval_round_and_wait(
@@ -580,6 +615,7 @@ class SQLiteTaskRepository:
                 )
         except sqlite3.Error as error:
             raise StorageStateError("approval round transition failed") from error
+        self._release_local_lease(owner_token)
         return self._approval_by_id(approval_id)
 
     def replace_approval_and_wait(
@@ -651,6 +687,7 @@ class SQLiteTaskRepository:
                 )
         except sqlite3.Error as error:
             raise StorageStateError("replacement approval transition failed") from error
+        self._release_local_lease(owner_token)
         return self._approval_by_id(replacement_id)
 
     def pending_approval(self, task_id: str) -> ApprovalRecord | None:
@@ -733,6 +770,7 @@ class SQLiteTaskRepository:
         approval_id: str,
         *,
         result_digest: str | None = None,
+        source_intent_ids: tuple[str, ...] = (),
         owner_token: str | None = None,
     ) -> ApprovalRecord:
         if result_digest is not None:
@@ -751,6 +789,9 @@ class SQLiteTaskRepository:
                    SET execution_state = 'completed', result_digest = ?, executed_at = ?
                    WHERE id = ?""",
                 (result_digest, _dump_datetime(executed_at), approval_id),
+            )
+            self._consume_transition_intents(
+                connection, row["task_id"], source_intent_ids
             )
         return self._approval_by_id(approval_id)
 
@@ -854,6 +895,8 @@ class SQLiteTaskRepository:
         return self._transition_intent_by_id(intent_id)
 
     def close(self) -> None:
+        for owner_token in tuple(self._held_leases):
+            self._release_local_lease(owner_token)
         self._connection.close()
 
     def fail_inconsistent_task(self, task_id: str, summary: str) -> TaskResult:
@@ -884,39 +927,99 @@ class SQLiteTaskRepository:
                 ),
             )
             connection.execute("DELETE FROM project_leases WHERE task_id = ?", (task_id,))
+        self._release_local_leases_for_task(task_id)
         return result
 
     def acquire_project_lease(self, task_id: str, *, owner_token: str) -> bool:
         _require_owner_token(owner_token)
-        with self._transaction() as connection:
-            task = self._require_task(connection, task_id)
-            if task["status"] != TaskStatus.RUNNING.value:
-                raise StorageStateError("only running tasks can acquire a project lease")
-            try:
-                connection.execute(
-                    """INSERT INTO project_leases
-                       (project_id, task_id, owner_token, acquired_at) VALUES (?, ?, ?, ?)""",
-                    (task["project_id"], task_id, owner_token, _dump_datetime(_utc_now())),
-                )
-            except sqlite3.IntegrityError:
+        held = self._held_leases.get(owner_token)
+        if held is not None:
+            return held[1] == task_id
+
+        task = self._require_task(self._connection, task_id)
+        if task["status"] != TaskStatus.RUNNING.value:
+            raise StorageStateError("only running tasks can acquire a project lease")
+        project_id = task["project_id"]
+        local_lock = LocalProjectLock.try_acquire(self._lock_root, project_id)
+        if local_lock is None:
+            return False
+        try:
+            with self._transaction() as connection:
+                task = self._require_task(connection, task_id)
+                if task["status"] != TaskStatus.RUNNING.value:
+                    raise StorageStateError(
+                        "only running tasks can acquire a project lease"
+                    )
                 row = connection.execute(
-                    "SELECT task_id, owner_token FROM project_leases WHERE project_id = ?",
-                    (task["project_id"],),
+                    """SELECT project_leases.*, tasks.status AS leased_task_status
+                       FROM project_leases
+                       JOIN tasks ON tasks.id = project_leases.task_id
+                       WHERE project_leases.project_id = ?""",
+                    (project_id,),
                 ).fetchone()
-                return (
-                    row is not None
-                    and row["task_id"] == task_id
-                    and row["owner_token"] == owner_token
-                )
-        return True
+                if row is not None and row["protocol"] != _LEASE_PROTOCOL:
+                    if row["leased_task_status"] == TaskStatus.RUNNING.value:
+                        raise LeaseRecoveryBlocked(
+                            "legacy project lease blocks safe takeover; manual recovery "
+                            "is required after confirming no runner is live"
+                        )
+                    connection.execute(
+                        "DELETE FROM project_leases WHERE project_id = ?", (project_id,)
+                    )
+                    row = None
+                if row is not None and row["task_id"] != task_id:
+                    if row["leased_task_status"] == TaskStatus.RUNNING.value:
+                        raise LeaseRecoveryBlocked(
+                            "another RUNNING task has durable lease evidence; manual "
+                            "recovery is required after confirming it is abandoned"
+                        )
+                    connection.execute(
+                        "DELETE FROM project_leases WHERE project_id = ?", (project_id,)
+                    )
+                    row = None
+                if row is None:
+                    connection.execute(
+                        """INSERT INTO project_leases
+                           (project_id, task_id, owner_token, acquired_at, protocol)
+                           VALUES (?, ?, ?, ?, ?)""",
+                        (
+                            project_id,
+                            task_id,
+                            owner_token,
+                            _dump_datetime(_utc_now()),
+                            _LEASE_PROTOCOL,
+                        ),
+                    )
+                else:
+                    connection.execute(
+                        """UPDATE project_leases
+                           SET owner_token = ?, acquired_at = ?, protocol = ?
+                           WHERE project_id = ? AND task_id = ?""",
+                        (
+                            owner_token,
+                            _dump_datetime(_utc_now()),
+                            _LEASE_PROTOCOL,
+                            project_id,
+                            task_id,
+                        ),
+                    )
+            self._held_leases[owner_token] = (project_id, task_id, local_lock)
+            return True
+        except Exception:
+            local_lock.release()
+            raise
 
     def release_project_lease(self, task_id: str, *, owner_token: str) -> None:
         _require_owner_token(owner_token)
-        with self._transaction() as connection:
-            connection.execute(
-                "DELETE FROM project_leases WHERE task_id = ? AND owner_token = ?",
-                (task_id, owner_token),
-            )
+        try:
+            with self._transaction() as connection:
+                connection.execute(
+                    """DELETE FROM project_leases
+                       WHERE task_id = ? AND owner_token = ? AND protocol = ?""",
+                    (task_id, owner_token, _LEASE_PROTOCOL),
+                )
+        finally:
+            self._release_local_lease(owner_token)
 
     def mark_findings_resolved(
         self, finding_ids: tuple[str, ...], resolved_at: datetime | None = None
@@ -1021,7 +1124,8 @@ class SQLiteTaskRepository:
                 )
             )
             lease_row = connection.execute(
-                "SELECT task_id, owner_token FROM project_leases WHERE project_id = ?",
+                """SELECT task_id, owner_token, protocol FROM project_leases
+                   WHERE project_id = ?""",
                 (task_row["project_id"],),
             ).fetchone()
             executable_row = None
@@ -1029,8 +1133,11 @@ class SQLiteTaskRepository:
                 task_row["status"] == TaskStatus.RUNNING.value
                 and lease_row is not None
                 and lease_row["task_id"] == task_id
+                and lease_row["protocol"] == _LEASE_PROTOCOL
                 and owner_token is not None
                 and lease_row["owner_token"] == owner_token
+                and owner_token in self._held_leases
+                and self._held_leases[owner_token][1] == task_id
             ):
                 executable_row = connection.execute(
                     """SELECT * FROM approvals
@@ -1148,8 +1255,9 @@ class SQLiteTaskRepository:
             CREATE TABLE IF NOT EXISTS project_leases (
                 project_id TEXT PRIMARY KEY REFERENCES projects(id),
                 task_id TEXT NOT NULL UNIQUE REFERENCES tasks(id),
-                owner_token TEXT NOT NULL,
-                acquired_at TEXT NOT NULL
+                owner_token TEXT,
+                acquired_at TEXT NOT NULL,
+                protocol TEXT
             );
             CREATE TABLE IF NOT EXISTS transition_intents (
                 id TEXT PRIMARY KEY,
@@ -1174,6 +1282,7 @@ class SQLiteTaskRepository:
         self._ensure_column("approvals", "result_digest", "TEXT")
         self._ensure_column("iterations", "quality_outcome", "TEXT")
         self._ensure_column("project_leases", "owner_token", "TEXT")
+        self._ensure_column("project_leases", "protocol", "TEXT")
         self._ensure_column("transition_intents", "result_payload_json", "TEXT")
         self._ensure_column("transition_intents", "consumed_at", "TEXT")
 
@@ -1220,9 +1329,8 @@ class SQLiteTaskRepository:
             raise StorageStateError("transition intent does not exist")
         return row
 
-    @classmethod
     def _require_running_lease(
-        cls,
+        self,
         connection: sqlite3.Connection,
         task_id: str,
         owner_token: str | None,
@@ -1230,9 +1338,15 @@ class SQLiteTaskRepository:
         if owner_token is None:
             raise StorageStateError("running mutation requires a lease owner token")
         _require_owner_token(owner_token)
-        task = cls._require_task(connection, task_id)
+        held = self._held_leases.get(owner_token)
+        if held is None or held[1] != task_id:
+            raise StorageStateError(
+                "running mutation requires ownership of the local kernel lock"
+            )
+        task = self._require_task(connection, task_id)
         lease = connection.execute(
-            "SELECT task_id, owner_token FROM project_leases WHERE project_id = ?",
+            """SELECT task_id, owner_token, protocol FROM project_leases
+               WHERE project_id = ?""",
             (task["project_id"],),
         ).fetchone()
         if (
@@ -1240,8 +1354,19 @@ class SQLiteTaskRepository:
             or lease is None
             or lease["task_id"] != task_id
             or lease["owner_token"] != owner_token
+            or lease["protocol"] != _LEASE_PROTOCOL
         ):
             raise StorageStateError("running task does not own the project lease owner token")
+
+    def _release_local_lease(self, owner_token: str) -> None:
+        held = self._held_leases.pop(owner_token, None)
+        if held is not None:
+            held[2].release()
+
+    def _release_local_leases_for_task(self, task_id: str) -> None:
+        for owner_token, held in tuple(self._held_leases.items()):
+            if held[1] == task_id:
+                self._release_local_lease(owner_token)
 
     def _approval_by_id(self, approval_id: str) -> ApprovalRecord:
         row = self._connection.execute("SELECT * FROM approvals WHERE id = ?", (approval_id,)).fetchone()

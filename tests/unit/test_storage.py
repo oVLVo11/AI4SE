@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -12,7 +13,11 @@ from pyquality.domain.models import (
     TaskResult,
     TaskStatus,
 )
-from pyquality.storage.sqlite import SQLiteTaskRepository, StorageStateError
+from pyquality.storage.sqlite import (
+    LeaseRecoveryBlocked,
+    SQLiteTaskRepository,
+    StorageStateError,
+)
 
 
 @pytest.fixture
@@ -311,6 +316,67 @@ def test_same_task_cannot_be_leased_by_two_independent_runner_tokens(tmp_path: P
             summary="context prepared",
             owner_token=OWNER_B,
         )
+    with pytest.raises(StorageStateError, match="local kernel lock"):
+        second_repo.record_transition_intent(
+            task.id,
+            kind="model_call",
+            evidence_digest="b" * 64,
+            summary="stolen durable token",
+            owner_token=OWNER_A,
+        )
+
+
+def test_running_legacy_lease_fails_closed_with_actionable_recovery(
+    repo: SQLiteTaskRepository,
+) -> None:
+    task = repo.create_task("C:/work/demo", "fix sum", round_limit=8)
+    _start(repo, task.id)
+    repo._connection.execute(
+        """INSERT INTO project_leases
+           (project_id, task_id, owner_token, acquired_at, protocol)
+           VALUES (?, ?, NULL, ?, NULL)""",
+        (task.project_id, task.id, "2026-07-29T00:00:00+00:00"),
+    )
+
+    with pytest.raises(LeaseRecoveryBlocked, match="legacy.*manual recovery"):
+        repo.acquire_project_lease(task.id, owner_token=OWNER_A)
+
+
+def test_non_running_legacy_lease_is_cleaned_before_new_task_acquires(
+    repo: SQLiteTaskRepository,
+) -> None:
+    stale = repo.create_task("C:/work/demo", "old task", round_limit=8)
+    active = repo.create_task("C:/work/demo", "new task", round_limit=8)
+    repo._connection.execute(
+        """INSERT INTO project_leases
+           (project_id, task_id, owner_token, acquired_at, protocol)
+           VALUES (?, ?, NULL, ?, NULL)""",
+        (stale.project_id, stale.id, "2026-07-29T00:00:00+00:00"),
+    )
+    _start(repo, active.id)
+
+    assert repo.acquire_project_lease(active.id, owner_token=OWNER_A) is True
+
+
+def test_failed_durable_release_still_closes_local_kernel_lock(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "state.sqlite"
+    first = SQLiteTaskRepository(db_path)
+    task = first.create_task("C:/work/demo", "fix sum", round_limit=8)
+    _start(first, task.id)
+    assert first.acquire_project_lease(task.id, owner_token=OWNER_A) is True
+    first._connection.execute(
+        """CREATE TRIGGER abort_lease_release BEFORE DELETE ON project_leases
+           BEGIN SELECT RAISE(ABORT, 'simulated release failure'); END"""
+    )
+
+    with pytest.raises(sqlite3.Error, match="simulated release failure"):
+        first.release_project_lease(task.id, owner_token=OWNER_A)
+    first._connection.execute("DROP TRIGGER abort_lease_release")
+
+    second = SQLiteTaskRepository(db_path)
+    assert second.acquire_project_lease(task.id, owner_token=OWNER_B) is True
 
 
 def test_approval_insert_and_waiting_transition_are_one_transaction(
@@ -515,9 +581,12 @@ def test_reopen_recovers_expected_after_digests_before_dispatch_completion(
         expected_after_digests={"pyproject.toml": "d" * 64, "requirements.txt": None},
         owner_token=OWNER_A,
     )
+    repo.close()
 
-    recovered = SQLiteTaskRepository(db_path).resume_snapshot(
-        task.id, owner_token=OWNER_A
+    reopened = SQLiteTaskRepository(db_path)
+    assert reopened.acquire_project_lease(task.id, owner_token=OWNER_B) is True
+    recovered = reopened.resume_snapshot(
+        task.id, owner_token=OWNER_B
     ).executable_approval
 
     assert recovered is not None
@@ -526,8 +595,8 @@ def test_reopen_recovers_expected_after_digests_before_dispatch_completion(
         "pyproject.toml": "d" * 64,
         "requirements.txt": None,
     }
-    completed = repo.mark_execution_completed(
-        approval.id, result_digest="e" * 64, owner_token=OWNER_A
+    completed = reopened.mark_execution_completed(
+        approval.id, result_digest="e" * 64, owner_token=OWNER_B
     )
     assert completed.result_digest == "e" * 64
 
@@ -546,8 +615,10 @@ def test_transition_intent_evidence_survives_reopen_and_completion(tmp_path: Pat
         summary="context prepared",
         owner_token=OWNER_A,
     )
+    repo.close()
 
     reopened = SQLiteTaskRepository(db_path)
+    assert reopened.acquire_project_lease(task.id, owner_token=OWNER_B) is True
     pending = reopened.resume_snapshot(task.id).transition_intents
     assert len(pending) == 1
     assert pending[0].id == intent.id
@@ -556,7 +627,7 @@ def test_transition_intent_evidence_survives_reopen_and_completion(tmp_path: Pat
         intent.id,
         result_digest="b" * 64,
         summary="response persisted",
-        owner_token=OWNER_A,
+        owner_token=OWNER_B,
     )
     assert completed.state == "completed"
     assert completed.result_digest == "b" * 64
@@ -592,6 +663,7 @@ def test_completed_transition_payload_is_bounded_and_consumed_with_iteration(
     repo.close()
 
     reopened = SQLiteTaskRepository(db_path)
+    assert reopened.acquire_project_lease(task.id, owner_token=OWNER_B) is True
     recovered = reopened.resume_snapshot(task.id).transition_intents[0]
     assert recovered.result_payload == completed.result_payload
     assert recovered.consumed_at is None
@@ -601,7 +673,7 @@ def test_completed_transition_payload_is_bounded_and_consumed_with_iteration(
         context_digest="a" * 64,
         action_json='{"arguments":{},"kind":"finish","rationale":"verify"}',
         source_intent_ids=(intent.id,),
-        owner_token=OWNER_A,
+        owner_token=OWNER_B,
     )
     assert reopened.resume_snapshot(task.id).transition_intents[0].consumed_at is not None
 

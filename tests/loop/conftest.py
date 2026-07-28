@@ -190,14 +190,20 @@ class Harness:
     repo_root: Path
     db_path: Path
 
-    def restart(self, llm: LLMClient, pipeline: ScriptedPipeline) -> None:
+    def restart(
+        self,
+        llm: LLMClient,
+        pipeline: ScriptedPipeline,
+        *,
+        policy: Policy | None = None,
+    ) -> None:
         self.repository.close()
         self.repository = SQLiteTaskRepository(self.db_path)
         self.llm = llm
         self.pipeline = pipeline
         self.loop = AgentLoop(
             repository=self.repository,
-            policy=PolicyEngine(self.repo_root),
+            policy=policy or PolicyEngine(self.repo_root),
             dispatcher=self.dispatcher,
             pipeline=pipeline,
             parser=ActionParser(),

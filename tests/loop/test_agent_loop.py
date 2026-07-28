@@ -55,6 +55,23 @@ def test_unrecoverable_model_client_consistency_error_maps_to_failed(loop_fixtur
     assert result.iterations == 0
 
 
+def test_legacy_running_lease_returns_actionable_blocked_result(loop_fixture) -> None:
+    harness = loop_fixture(responses=[])
+    task = harness.repository.resume_snapshot(harness.task_id).task
+    harness.repository._connection.execute(
+        """INSERT INTO project_leases
+           (project_id, task_id, owner_token, acquired_at, protocol)
+           VALUES (?, ?, NULL, ?, NULL)""",
+        (task.project_id, task.id, "2026-07-29T00:00:00+00:00"),
+    )
+
+    result = harness.loop.run(harness.task_id)
+
+    assert result.status is TaskStatus.BLOCKED
+    assert "manual recovery" in result.verification_summary
+    assert harness.repository.resume_snapshot(harness.task_id).task.status is TaskStatus.RUNNING
+
+
 def test_round_limit_stops_before_another_model_call(loop_fixture) -> None:
     denied = action_json("read_file", {"path": ".env"}, "inspect credential")
     harness = loop_fixture(responses=[denied, finish_json()], round_limit=1)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from datetime import timedelta
 from threading import Event, Thread
 
@@ -19,7 +20,14 @@ from conftest import (
 )
 
 from pyquality.context import ContextBuilder
-from pyquality.domain.models import ApprovalDecision, TaskStatus, ToolResult
+from pyquality.domain.models import (
+    Action,
+    ApprovalDecision,
+    PolicyDecision,
+    PolicyOutcome,
+    TaskStatus,
+    ToolResult,
+)
 from pyquality.feedback import ProgressTracker
 from pyquality.llm import ActionParser, Message, ScriptedLLM
 from pyquality.loop import AgentLoop
@@ -29,6 +37,33 @@ from pyquality.storage.sqlite import SQLiteTaskRepository
 
 class SimulatedCrash(BaseException):
     pass
+
+
+class SnapshotSwitchPolicy:
+    def __init__(self, root) -> None:
+        self._delegate = PolicyEngine(root)
+        self.allow_same_action = False
+
+    def evaluate(self, action: Action) -> PolicyDecision:
+        decision = self._delegate.evaluate(action)
+        if self.allow_same_action and action.kind == "apply_patch":
+            return decision.model_copy(
+                update={
+                    "outcome": PolicyOutcome.ALLOW,
+                    "matched_rule": "test_snapshot_allow",
+                    "impact_summary": "same action allowed in a later snapshot",
+                    "repository_snapshot_digest": "e" * 64,
+                }
+            )
+        return decision
+
+    def revalidate(
+        self,
+        previous: PolicyDecision,
+        action: Action,
+        current_snapshot_digest: str,
+    ) -> PolicyDecision:
+        return self._delegate.revalidate(previous, action, current_snapshot_digest)
 
 
 def crash_after_completed_transition(harness, monkeypatch, kind: str) -> None:
@@ -176,6 +211,188 @@ def test_approved_failed_report_persisted_before_completion_recovers_as_feedback
     assert len(harness.dispatcher.actions) == 1
     assert len(restarted_pipeline.calls) == 1
     assert "assertion" in restarted_llm.calls[0][-1].content
+
+
+def test_already_applied_recovery_atomically_consumes_dispatch_with_verifier(
+    loop_fixture,
+) -> None:
+    policy: SnapshotSwitchPolicy | None = None
+
+    def policy_factory(root):
+        nonlocal policy
+        policy = SnapshotSwitchPolicy(root)
+        return policy
+
+    action_json = dependency_patch_json()
+    harness = loop_fixture(
+        responses=[action_json], reports=[], policy_factory=policy_factory
+    )
+    assert harness.loop.run(harness.task_id).status is TaskStatus.WAITING_APPROVAL
+    approval = harness.loop.pending_approval(harness.task_id)
+    harness.loop.decide_approval(approval.id, ApprovalDecision.APPROVE)
+
+    assert harness.repository.acquire_project_lease(
+        harness.task_id, owner_token="seed-owner"
+    ) is True
+    harness.repository.mark_execution_intent(
+        approval.id,
+        expected_after_digests=harness.dispatcher.expected,
+        owner_token="seed-owner",
+    )
+    applied = ToolResult(
+        effect_kind="apply_patch",
+        code_changed=True,
+        changed_paths=("pyproject.toml",),
+        before_digests={"pyproject.toml": "c" * 64},
+        after_digests=harness.dispatcher.expected,
+        normalized_metadata={"code": "ok"},
+    )
+    dispatch_intent = harness.repository.record_transition_intent(
+        harness.task_id,
+        kind="dispatch",
+        evidence_digest=approval.action_digest,
+        summary="dispatch authorized",
+        owner_token="seed-owner",
+    )
+    harness.repository.complete_transition_intent(
+        dispatch_intent.id,
+        result_digest=hashlib.sha256(applied.model_dump_json().encode()).hexdigest(),
+        summary="tool result persisted",
+        result_payload={"tool_result": applied.model_dump(mode="json")},
+        owner_token="seed-owner",
+    )
+    harness.repository.release_project_lease(
+        harness.task_id, owner_token="seed-owner"
+    )
+
+    assert policy is not None
+    policy.allow_same_action = True
+    harness.dispatcher.effect_already_matches = True
+    harness.restart(
+        ScriptedLLM([action_json]),
+        ScriptedPipeline([failed_report(), successful_report()]),
+        policy=policy,
+    )
+
+    result = harness.loop.resume(harness.task_id)
+
+    assert result.status is TaskStatus.SUCCEEDED
+    assert harness.dispatcher.dispatch_count(action_json) == 1
+    transitions = harness.repository.resume_snapshot(
+        harness.task_id
+    ).transition_intents
+    seeded = next(item for item in transitions if item.id == dispatch_intent.id)
+    verifiers = [item for item in transitions if item.kind == "verifier"]
+    assert seeded.consumed_at is not None
+    assert len(verifiers) == 2
+    assert seeded.consumed_at == verifiers[0].consumed_at
+
+
+def test_intent_recorded_approval_reconciles_pre_correction_unconsumed_dispatch(
+    loop_fixture,
+) -> None:
+    policy: SnapshotSwitchPolicy | None = None
+
+    def policy_factory(root):
+        nonlocal policy
+        policy = SnapshotSwitchPolicy(root)
+        return policy
+
+    raw_action = dependency_patch_json()
+    harness = loop_fixture(
+        responses=[raw_action], reports=[], policy_factory=policy_factory
+    )
+    assert harness.loop.run(harness.task_id).status is TaskStatus.WAITING_APPROVAL
+    approval = harness.loop.pending_approval(harness.task_id)
+    harness.loop.decide_approval(approval.id, ApprovalDecision.APPROVE)
+    assert harness.repository.acquire_project_lease(
+        harness.task_id, owner_token="seed-owner"
+    ) is True
+    harness.repository.mark_execution_intent(
+        approval.id,
+        expected_after_digests=harness.dispatcher.expected,
+        owner_token="seed-owner",
+    )
+    applied = ToolResult(
+        effect_kind="apply_patch",
+        code_changed=True,
+        changed_paths=("pyproject.toml",),
+        before_digests={"pyproject.toml": "c" * 64},
+        after_digests=harness.dispatcher.expected,
+        normalized_metadata={"code": "ok"},
+    )
+    dispatch_intent = harness.repository.record_transition_intent(
+        harness.task_id,
+        kind="dispatch",
+        evidence_digest=approval.action_digest,
+        summary="dispatch authorized",
+        owner_token="seed-owner",
+    )
+    harness.repository.complete_transition_intent(
+        dispatch_intent.id,
+        result_digest=hashlib.sha256(applied.model_dump_json().encode()).hexdigest(),
+        summary="tool result persisted",
+        result_payload={"tool_result": applied.model_dump(mode="json")},
+        owner_token="seed-owner",
+    )
+    report = failed_report()
+    verifier_intent = harness.repository.record_transition_intent(
+        harness.task_id,
+        kind="verifier",
+        evidence_digest="f" * 64,
+        summary="quality requested",
+        owner_token="seed-owner",
+    )
+    harness.repository.complete_transition_intent(
+        verifier_intent.id,
+        result_digest="a" * 64,
+        summary="quality report persisted",
+        result_payload={"quality_report": report.model_dump(mode="json")},
+        owner_token="seed-owner",
+    )
+    harness.repository.complete_iteration_outcome(
+        harness.task_id,
+        approval.iteration_id,
+        tool_result_digest="b" * 64,
+        fingerprint="c" * 64,
+        relevant_digest="d" * 64,
+        quality_outcome="failed",
+        findings=report.findings,
+        source_intent_ids=(verifier_intent.id,),
+        owner_token="seed-owner",
+    )
+    harness.repository.release_project_lease(
+        harness.task_id, owner_token="seed-owner"
+    )
+    seeded_before = next(
+        item
+        for item in harness.repository.resume_snapshot(
+            harness.task_id
+        ).transition_intents
+        if item.id == dispatch_intent.id
+    )
+    assert seeded_before.consumed_at is None
+
+    assert policy is not None
+    policy.allow_same_action = True
+    harness.restart(
+        ScriptedLLM([raw_action]),
+        ScriptedPipeline([successful_report()]),
+        policy=policy,
+    )
+
+    result = harness.loop.resume(harness.task_id)
+
+    assert result.status is TaskStatus.SUCCEEDED
+    assert harness.dispatcher.dispatch_count(raw_action) == 1
+    seeded_after = next(
+        item
+        for item in harness.repository.resume_snapshot(
+            harness.task_id
+        ).transition_intents
+        if item.id == dispatch_intent.id
+    )
+    assert seeded_after.consumed_at is not None
 
 
 def test_schema_repair_cap_survives_cold_reopen(loop_fixture) -> None:

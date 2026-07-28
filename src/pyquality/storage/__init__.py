@@ -1,5 +1,5 @@
 """Durable task-state storage."""
 
-from .sqlite import SQLiteTaskRepository, StorageStateError
+from .sqlite import LeaseRecoveryBlocked, SQLiteTaskRepository, StorageStateError
 
-__all__ = ["SQLiteTaskRepository", "StorageStateError"]
+__all__ = ["LeaseRecoveryBlocked", "SQLiteTaskRepository", "StorageStateError"]

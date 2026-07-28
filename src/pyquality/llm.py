@@ -52,8 +52,8 @@ class ProviderError(RuntimeError):
 class OpenAICompatibleLLM:
     """One OpenAI-compatible chat-completions request per ``complete`` call.
 
-    Transport retries, if desired, belong to the injected ``httpx.Client`` policy.  They
-    therefore remain within this single model round and do not create agent-loop rounds.
+    Transient transport failures are retried here within this single logical model call,
+    so they do not create duplicate agent-loop rounds.
     """
 
     def __init__(
