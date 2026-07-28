@@ -457,10 +457,6 @@ class AuditLogger:
         _reject_links(self._path, include_final=True)
         self._path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         _reject_links(self._path, include_final=True)
-        try:
-            os.chmod(self._path.parent, 0o700)
-        except OSError:
-            pass
 
 
 def _approved_metadata(metadata: Mapping[str, object], secrets: set[str]) -> tuple[dict[str, object], float | int | None, str | None]:
@@ -513,7 +509,14 @@ def _open_audit(path: Path) -> int:
     flags = os.O_APPEND | os.O_CREAT | os.O_RDWR
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
-    descriptor = os.open(path, flags, 0o600)
+    if os.name == "nt":
+        descriptor = os.open(path, flags, 0o600)
+    else:
+        parent_descriptor = _open_parent_no_follow(path.parent)
+        try:
+            descriptor = os.open(path.name, flags, 0o600, dir_fd=parent_descriptor)
+        finally:
+            os.close(parent_descriptor)
     try:
         if not stat.S_ISREG(os.fstat(descriptor).st_mode):
             raise OSError("audit target is not a regular file")
@@ -521,6 +524,25 @@ def _open_audit(path: Path) -> int:
             os.fchmod(descriptor, 0o600)
         except (AttributeError, OSError):
             pass
+        return descriptor
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def _open_parent_no_follow(parent: Path) -> int:
+    """Traverse existing POSIX parents by descriptor; Windows keeps reparse-point validation."""
+    if os.name == "nt":
+        raise OSError("Windows parent traversal uses reparse-safe validation")
+    absolute = parent.absolute()
+    root = Path(absolute.anchor)
+    descriptor = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for part in absolute.relative_to(root).parts:
+            next_descriptor = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = next_descriptor
+        os.fchmod(descriptor, 0o700)
         return descriptor
     except Exception:
         os.close(descriptor)
