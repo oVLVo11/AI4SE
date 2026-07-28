@@ -19,7 +19,6 @@ Created self-contained root `SPEC.md`, `PLAN.md`, `SPEC_PROCESS.md`, and `AGENT_
 ## 2026-07-28 — Pre-implementation cold-start validation
 
 Fresh validator `/root/task0_docs_coldstart/coldstart_validator` (`gpt-5.6-sol`) received only the root `SPEC.md` and `PLAN.md` paths plus the dry-run/stop-at-uncertainty instruction. It dry-ran Task 1 and Task 8 without implementation edits. It reported public-model/configuration ambiguity and Task 8 state, approval, recovery, and protocol gaps. Its exact output is tracked in `docs/superpowers/reviews/2026-07-28-cold-start-validation.md`; finding categories, mismatches, and corrections are indexed in `SPEC_PROCESS.md`. Specification section 14 and the plan cold-start amendments were added to resolve them.
-+
 
 ## 2026-07-28 — Task 0 clean re-review
 
