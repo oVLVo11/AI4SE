@@ -119,6 +119,19 @@ def test_provider_result_rejects_secret_in_mapping_key_and_arbitrary_object(memo
         assert raised.value.__context__ is None
 
 
+@pytest.mark.parametrize(("secret", "result"), [("123", 123), ("true", True), ("1.5", 1.5), ("123", {"nested": [123]})])
+def test_provider_result_rejects_canonical_scalar_secret_echoes(memory_keyring: MemoryKeyring, secret: str, result: object) -> None:
+    """Catches numeric, boolean, float, and nested forms that canonically spell a credential."""
+    service = CredentialService(memory_keyring, service_name="pyquality")
+    service.set("provider", secret)
+
+    with pytest.raises(CredentialProviderError) as raised:
+        service.get("provider", lambda _, result=result: result)
+
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+
+
 def test_backend_exception_does_not_preserve_secret_in_exception_chain() -> None:
     """Catches chaining a backend exception whose message contains the credential."""
 

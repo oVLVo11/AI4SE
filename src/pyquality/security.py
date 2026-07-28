@@ -7,13 +7,14 @@ import math
 import os
 import re
 import stat
+import tempfile
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from collections.abc import Set as AbstractSet
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO, Literal
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, quote, unquote, urlencode, urlsplit, urlunsplit
 
 from pydantic import Field
 
@@ -149,7 +150,7 @@ class CredentialService:
         if provider_failed:
             raise CredentialProviderError("credential provider operation failed")
         try:
-            safe_value = _safe_provider_value(value, secret, set(), 0)
+            safe_value = _safe_provider_value(value, (secret,), set(), 0)
         except ValueError:
             safe_value = None
             provider_failed = True
@@ -196,22 +197,28 @@ def _environment_warning() -> CredentialWarning:
     return CredentialWarning(code="environment_plaintext", message="Environment credentials are plaintext and visible to processes with access to this process environment.")
 
 
-def _safe_provider_value(value: object, secret: str, active: set[int], depth: int) -> object:
+def _safe_provider_value(value: object, secrets: tuple[str, ...], active: set[int], depth: int) -> object:
     """Copy only JSON-like provider results, rejecting unknown objects and secret-bearing keys/values."""
     if depth > _MAX_DEPTH:
         raise ValueError
-    if value is None or type(value) in {bool, int}:
+    if value is None:
+        return value
+    if type(value) in {bool, int}:
+        if _canonical_scalar(value) in secrets:
+            raise ValueError
         return value
     if type(value) is float:
         if not math.isfinite(value):
             raise ValueError
+        if _canonical_scalar(value) in secrets:
+            raise ValueError
         return value
     if type(value) is str:
-        if secret in value:
+        if any(secret in value for secret in secrets):
             raise ValueError
         return _valid_utf8(value)
     if type(value) in {bytes, bytearray}:
-        if secret.encode("utf-8") in bytes(value):
+        if any(secret.encode("utf-8") in bytes(value) for secret in secrets):
             raise ValueError
         return bytes(value)
     if type(value) not in {dict, list, tuple}:
@@ -224,14 +231,18 @@ def _safe_provider_value(value: object, secret: str, active: set[int], depth: in
         if type(value) is dict:
             result: dict[str, object] = {}
             for key, item in value.items():
-                if type(key) is not str or secret in key:
+                if type(key) is not str or any(secret in key for secret in secrets):
                     raise ValueError
-                result[_valid_utf8(key)] = _safe_provider_value(item, secret, active, depth + 1)
+                result[_valid_utf8(key)] = _safe_provider_value(item, secrets, active, depth + 1)
             return result
-        items = [_safe_provider_value(item, secret, active, depth + 1) for item in value]
+        items = [_safe_provider_value(item, secrets, active, depth + 1) for item in value]
         return tuple(items) if type(value) is tuple else items
     finally:
         active.discard(identity)
+
+
+def _canonical_scalar(value: bool | float) -> str:
+    return str(value).casefold()
 
 
 @dataclass
@@ -349,8 +360,16 @@ def _redact_text(value: str, secrets: tuple[str, ...], keys: frozenset[str], bud
     clean = _BEARER.sub(r"\1" + _REDACTED, clean)
     try:
         parsed = urlsplit(clean)
-        if parsed.scheme and parsed.netloc and parsed.query:
-            clean = urlunsplit((parsed.scheme, parsed.netloc, parsed.path, urlencode([(key, _REDACTED if _is_sensitive_key(key, keys) else item) for key, item in parse_qsl(parsed.query, keep_blank_values=True)]), parsed.fragment))
+        if parsed.scheme and parsed.netloc:
+            decoded_path = unquote(parsed.path)
+            for secret in secrets:
+                decoded_path = decoded_path.replace(secret, _REDACTED)
+            query = []
+            for key, item in parse_qsl(parsed.query, keep_blank_values=True):
+                for secret in secrets:
+                    item = item.replace(secret, _REDACTED)
+                query.append((key, _REDACTED if _is_sensitive_key(key, keys) else item))
+            clean = urlunsplit((parsed.scheme, parsed.netloc, quote(decoded_path, safe="/%[]"), urlencode(query), parsed.fragment))
     except Exception:  # noqa: BLE001
         clean = _truncate_text(clean, budget.text_limit(_MAX_TEXT_BYTES))
         budget.used_text(clean)
@@ -424,15 +443,15 @@ class AuditLogger:
 
     def _append(self, encoded: bytes) -> None:
         self._prepare_path()
-        with _audit_lock(self._path):
-            self._prepare_path()
-            descriptor = _open_audit(self._path)
-            try:
+        descriptor = _open_audit(self._path)
+        try:
+            with _identity_lock(self._path, descriptor):
+                self._prepare_path()
                 _recover_tail(descriptor)
-                os.write(descriptor, encoded)
+                _write_all(descriptor, encoded)
                 os.fsync(descriptor)
-            finally:
-                os.close(descriptor)
+        finally:
+            os.close(descriptor)
 
     def _prepare_path(self) -> None:
         _reject_links(self._path, include_final=True)
@@ -460,7 +479,8 @@ def _approved_metadata(metadata: Mapping[str, object], secrets: set[str]) -> tup
             if isinstance(value, str):
                 outcome = _audit_scalar(value, secrets, 256)
             continue
-        output[canonical] = _audit_scalar(value, secrets, 1_024)
+        if isinstance(value, str):
+            output[canonical] = _audit_scalar(value, secrets, 4_096)
     return dict(sorted(output.items())), duration, outcome
 
 
@@ -508,8 +528,10 @@ def _open_audit(path: Path) -> int:
 
 
 @contextmanager
-def _audit_lock(path: Path) -> Iterator[None]:
-    lock_path = path.with_name(path.name + ".lock")
+def _identity_lock(path: Path, descriptor: int) -> Iterator[None]:
+    identity = os.fstat(descriptor)
+    lock_root = _lock_root()
+    lock_path = lock_root / f"{identity.st_dev}-{identity.st_ino}.lock"
     _reject_links(lock_path, include_final=True)
     handle = lock_path.open("a+b")
     try:
@@ -525,6 +547,29 @@ def _audit_lock(path: Path) -> Iterator[None]:
             _unlock(handle)
         finally:
             handle.close()
+
+
+def _lock_root() -> Path:
+    root = Path(tempfile.gettempdir()).absolute() / "pyquality-audit-locks"
+    if _is_link(root):
+        raise OSError("audit lock root is a link")
+    root.mkdir(mode=0o700, exist_ok=True)
+    if _is_link(root) or not root.is_dir():
+        raise OSError("audit lock root is unsafe")
+    try:
+        os.chmod(root, 0o700)
+    except OSError:
+        pass
+    return root
+
+
+def _write_all(descriptor: int, data: bytes) -> None:
+    offset = 0
+    while offset < len(data):
+        written = os.write(descriptor, data[offset:])
+        if written <= 0:
+            raise OSError("short audit write")
+        offset += written
 
 
 def _recover_tail(descriptor: int) -> None:

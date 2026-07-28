@@ -18,6 +18,13 @@ def _emit_in_process(path: str, start: int, count: int) -> None:
         logger.emit(AuditEvent(event_type="transition", metadata={"intent_id": f"intent-{index}"}))
 
 
+def _emit_aliases(first: str, second: str, start: int) -> None:
+    for index in range(start, start + 30):
+        AuditLogger(Path(first if index % 2 else second)).emit(
+            AuditEvent(event_type="transition", metadata={"intent_id": f"alias-{index}"})
+        )
+
+
 def test_redacts_nested_headers_urls_and_exception_text(tmp_path: Path) -> None:
     """Catches a recursive branch that preserves a credential in nested request data."""
     del tmp_path
@@ -30,6 +37,17 @@ def test_redacts_nested_headers_urls_and_exception_text(tmp_path: Path) -> None:
     clean = redact(value, secrets={"sk-secret"}, sensitive_keys={"authorization", "api_key"})
 
     assert "sk-secret" not in json.dumps(clean)
+
+
+def test_redacts_percent_encoded_registered_secret_in_url_query_and_path() -> None:
+    """Catches a registered secret that only appears after percent-decoding URL components."""
+    clean = redact(
+        "https://x.test/sk%2Dsecret?note=sk%2Dsecret&other=%2Fsafe%2Fpath",
+        secrets={"sk-secret"},
+        sensitive_keys=set(),
+    )
+    assert "secret" not in clean
+    assert "%2Fsafe%2Fpath" in clean
 
 
 def test_redact_handles_cycles_bytes_and_dangerous_objects_without_mutating_input() -> None:
@@ -114,17 +132,82 @@ def test_audit_log_accepts_only_allowlisted_metadata_and_normalizes_aliases(tmp_
     assert record["metadata"] == {"action_digest": "a" * 64, "intent_id": "intent-1"}
 
 
+def test_audit_allowlisted_fields_drop_nested_and_wrong_scalar_types(tmp_path: Path) -> None:
+    """Catches recursive body persistence under an otherwise approved metadata key."""
+    logger = AuditLogger(tmp_path / "audit.jsonl")
+    logger.emit(
+        AuditEvent(
+            event_type="transition",
+            metadata={"intent_id": {"prompt": "body"}, "digest": ["body"], "status": True, "duration": True},
+        )
+    )
+    record = json.loads((tmp_path / "audit.jsonl").read_text(encoding="utf-8"))
+    assert record["metadata"] == {}
+    assert record["duration"] is None
+
+
 def test_audit_record_cap_applies_after_duration_and_outcome_fallback(tmp_path: Path) -> None:
     """Catches a fallback that omits metadata but persists unbounded envelope outcome fields."""
     logger = AuditLogger(tmp_path / "audit.jsonl")
     logger.emit(
         AuditEvent(
             event_type="model",
-            metadata={"duration": "x" * 200_000, "outcome": "y" * 200_000, "intent_id": "ok"},
+            metadata={
+                "duration": 1.5,
+                "outcome": "ok",
+                "intent_id": "x" * 10_000,
+                "approval_id": "x" * 10_000,
+                "action_digest": "x" * 10_000,
+                "digest": "x" * 10_000,
+                "status": "x" * 10_000,
+                "decision": "x" * 10_000,
+            },
         )
     )
 
+    record = json.loads((tmp_path / "audit.jsonl").read_text(encoding="utf-8"))
     assert len((tmp_path / "audit.jsonl").read_bytes().rstrip(b"\n")) <= 16_384
+    assert record["metadata"] == {"truncated": "[TRUNCATED]"}
+    assert (record["duration"], record["outcome"]) == (1.5, "ok")
+
+
+def test_audit_retries_short_os_write_until_the_jsonl_record_is_complete(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Catches a partial kernel write that would otherwise leave a truncated JSONL record."""
+    from pyquality import security
+
+    real_write = security.os.write
+
+    def short_write(descriptor: int, data: bytes) -> int:
+        return real_write(descriptor, data[: max(1, len(data) // 3)])
+
+    monkeypatch.setattr(security.os, "write", short_write)
+    path = tmp_path / "audit.jsonl"
+    AuditLogger(path).emit(AuditEvent(event_type="model", metadata={"intent_id": "ok"}))
+    assert json.loads(path.read_text(encoding="utf-8"))["metadata"] == {"intent_id": "ok"}
+
+
+def test_audit_multi_process_hardlink_aliases_share_one_complete_record_stream(tmp_path: Path) -> None:
+    """Catches lexical sidecar locks that do not converge when two names share one audit inode."""
+    left = tmp_path / "left"
+    right = tmp_path / "right"
+    left.mkdir()
+    right.mkdir()
+    path = left / "audit.jsonl"
+    path.touch()
+    alias = right / "audit-alias.jsonl"
+    try:
+        os.link(path, alias)
+    except OSError as error:
+        pytest.skip(f"hardlink creation unavailable: {error.__class__.__name__}")
+    context = multiprocessing.get_context("spawn")
+    processes = [context.Process(target=_emit_aliases, args=(str(path), str(alias), index * 30)) for index in range(2)]
+    for process in processes:
+        process.start()
+    for process in processes:
+        process.join(20)
+        assert process.exitcode == 0
+    records = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    assert {record["metadata"]["intent_id"] for record in records} == {f"alias-{index}" for index in range(60)}
 
 
 def test_audit_normalizes_lone_surrogates_to_valid_utf8(tmp_path: Path) -> None:
