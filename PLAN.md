@@ -8,7 +8,8 @@
 | 3 | Complete | `/root/task3_policy` | Human ruling: SPEC §14.2 is binding for revalidation; clean after fix round 1 | 88 passed; 3 WinError-1314 symlink skips; Ruff clean; deferred Minor: threshold-boundary coverage | `7b570c2`, `422382f` |
 | 4 | Complete | `/root/task4_tools`, `/root/task4_fix_round4` | Clean after fix round 4 | 113 passed; 5 skipped; Ruff clean; portable POSIX syscall contract passed locally, while the POSIX rename/symlink end-to-end test was unavailable on the Windows host | `b7a5d6c`, `ae7785d`, `c20a668`, `14becd2`, `6eea0e9` |
 | 5 | Complete | Initial implementer identity unavailable after context compaction; `/root/task5_fix1` (fix rounds) | `/root/task5_review`: clean after fix round 2 | 140 passed; 5 skipped; Ruff and diff-check clean | `411f7ae`, `ba45a82`, `f5e8145` |
-| 6–13 | Not started | — | — | — | — |
+| 6 | Complete | `/root/task6_feedback` | `/root/task5_review`: clean after fix round 3 | Primary implementation verification: 164 passed; 5 skipped; focused 24 passed; Ruff and diff-check clean. Final reviewer full runs encountered unrelated pre-existing Task 4 one-second timeout flakes that passed in isolation; no Task 6 regression found | `7a55808`, `c45d2da`, `4831d09`, `b8b54d6` |
+| 7–13 | Not started | — | — | — | — |
 
 # PyQuality Harness Implementation Plan
 
