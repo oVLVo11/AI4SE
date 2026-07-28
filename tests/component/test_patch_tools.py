@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 from pathlib import Path
 
 import pytest
@@ -8,7 +9,7 @@ import pytest
 from pyquality.config import Settings
 from pyquality.domain.models import Action, PolicyDecision, PolicyOutcome
 from pyquality.policy import PolicyEngine, parse_validated_patch
-from pyquality.tools import CommitObserver, SubprocessRunner, ToolDispatcher
+from pyquality.tools import CommitObserver, PosixDirOps, SubprocessRunner, ToolDispatcher
 
 
 @pytest.fixture
@@ -64,6 +65,80 @@ class _ConcurrentObserver:
     def before_cleanup(self, path: Path, backup: Path) -> None:
         if self._before_cleanup is not None:
             self._before_cleanup(path, backup)
+
+
+def test_posix_directory_operations_are_relative_to_the_retained_descriptor() -> None:
+    """Passing an absolute parent path to any syscall would follow a swapped directory entry."""
+
+    class RecordingSyscalls:
+        O_RDONLY = 1
+        O_WRONLY = 2
+        O_CREAT = 4
+        O_EXCL = 8
+        O_NOFOLLOW = 16
+
+        def __init__(self) -> None:
+            self.calls: list[tuple[object, ...]] = []
+            self.reads = iter((b"old", b""))
+            self.stat_result = object()
+
+        def open(self, name: str, flags: int, mode: int = 0o777, *, dir_fd: int) -> int:
+            self.calls.append(("open", name, flags, mode, dir_fd))
+            return 73
+
+        def stat(self, name: str, *, dir_fd: int, follow_symlinks: bool) -> object:
+            self.calls.append(("stat", name, dir_fd, follow_symlinks))
+            return self.stat_result
+
+        def replace(
+            self, source: str, target: str, *, src_dir_fd: int, dst_dir_fd: int
+        ) -> None:
+            self.calls.append(("replace", source, target, src_dir_fd, dst_dir_fd))
+
+        def link(
+            self,
+            source: str,
+            target: str,
+            *,
+            src_dir_fd: int,
+            dst_dir_fd: int,
+            follow_symlinks: bool,
+        ) -> None:
+            self.calls.append(
+                ("link", source, target, src_dir_fd, dst_dir_fd, follow_symlinks)
+            )
+
+        def unlink(self, name: str, *, dir_fd: int) -> None:
+            self.calls.append(("unlink", name, dir_fd))
+
+        def read(self, descriptor: int, size: int) -> bytes:
+            self.calls.append(("read", descriptor, size))
+            return next(self.reads)
+
+        def close(self, descriptor: int) -> None:
+            self.calls.append(("close", descriptor))
+
+    syscalls = RecordingSyscalls()
+    operations = PosixDirOps(41, syscalls=syscalls)
+
+    assert operations.open_exclusive(".pyquality-temp") == 73
+    assert operations.stat("target.py") is syscalls.stat_result
+    operations.replace("target.py", ".pyquality-backup")
+    operations.link(".pyquality-temp", "target.py")
+    operations.unlink(".pyquality-backup")
+    assert operations.read_bytes("target.py") == b"old"
+
+    assert syscalls.calls == [
+        ("open", ".pyquality-temp", 30, 0o600, 41),
+        ("stat", "target.py", 41, False),
+        ("replace", "target.py", ".pyquality-backup", 41, 41),
+        ("link", ".pyquality-temp", "target.py", 41, 41, False),
+        ("unlink", ".pyquality-backup", 41),
+        ("open", "target.py", 17, 0o777, 41),
+        ("read", 73, 65_536),
+        ("read", 73, 65_536),
+        ("close", 73),
+    ]
 
 
 def test_patch_rejects_missing_context(repo: Path) -> None:
@@ -295,10 +370,11 @@ def test_cleanup_failure_never_rolls_back_already_valid_installs(repo: Path) -> 
     assert (repo / "b.py").read_text(encoding="utf-8") == "context\nnew-b\n"
 
 
-def test_parent_pin_keeps_patch_inside_original_directory_after_swap_attempt(
+@pytest.mark.skipif(os.name == "nt", reason="POSIX directory descriptors are required")
+def test_parent_pin_keeps_all_patch_effects_inside_renamed_original_directory(
     repo: Path, tmp_path_factory: pytest.TempPathFactory
 ) -> None:
-    """Resolving a renamed parent again would redirect a committed patch through a hostile replacement."""
+    """Using parent pathnames after pinning would redirect patch effects through a hostile replacement."""
     nested = repo / "nested"
     nested.mkdir()
     original = nested / "a.py"
@@ -307,16 +383,11 @@ def test_parent_pin_keeps_patch_inside_original_directory_after_swap_attempt(
     sentinel = outside / "a.py"
     sentinel.write_text("outside\n", encoding="utf-8")
     moved = repo / "moved"
-    swapped: dict[str, Path | None] = {"parent": None}
 
     def swap_parent(parents: tuple[Path, ...]) -> None:
         parent = parents[0]
-        try:
-            parent.rename(moved)
-            nested.symlink_to(outside, target_is_directory=True)
-            swapped["parent"] = moved
-        except PermissionError:
-            swapped["parent"] = parent
+        parent.rename(moved)
+        nested.symlink_to(outside, target_is_directory=True)
 
     patch = "--- a/nested/a.py\n+++ b/nested/a.py\n@@ -1,2 +1,2 @@\n context\n-old\n+new\n"
     action = _action(patch)
@@ -326,9 +397,10 @@ def test_parent_pin_keeps_patch_inside_original_directory_after_swap_attempt(
     )
 
     assert result.ok is True
-    assert swapped["parent"] is not None
-    assert (swapped["parent"] / "a.py").read_text(encoding="utf-8") == "context\nnew\n"
+    assert (moved / "a.py").read_text(encoding="utf-8") == "context\nnew\n"
     assert sentinel.read_text(encoding="utf-8") == "outside\n"
+    assert not list(moved.glob(".pyquality-*"))
+    assert not list(outside.glob(".pyquality-*"))
 
 
 def test_patch_aborts_when_target_parent_becomes_an_outside_symlink(

@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import os
+import secrets
 import signal
+import stat
 import subprocess
 import tempfile
 import threading
@@ -73,6 +75,104 @@ class _NoopCommitObserver:
         del path, backup
 
 
+class _PosixSyscalls(Protocol):
+    O_RDONLY: int
+    O_WRONLY: int
+    O_CREAT: int
+    O_EXCL: int
+    O_NOFOLLOW: int
+
+    def open(self, path: str, flags: int, mode: int = ..., *, dir_fd: int) -> int: ...
+
+    def stat(
+        self, path: str, *, dir_fd: int, follow_symlinks: bool
+    ) -> os.stat_result: ...
+
+    def replace(
+        self, source: str, target: str, *, src_dir_fd: int, dst_dir_fd: int
+    ) -> None: ...
+
+    def link(
+        self,
+        source: str,
+        target: str,
+        *,
+        src_dir_fd: int,
+        dst_dir_fd: int,
+        follow_symlinks: bool,
+    ) -> None: ...
+
+    def unlink(self, path: str, *, dir_fd: int) -> None: ...
+
+    def read(self, descriptor: int, size: int) -> bytes: ...
+
+    def close(self, descriptor: int) -> None: ...
+
+
+class PosixDirOps:
+    """POSIX syscalls constrained to relative names beneath one retained directory fd."""
+
+    def __init__(self, dir_fd: int, *, syscalls: _PosixSyscalls = os) -> None:
+        self._dir_fd = dir_fd
+        self._syscalls = syscalls
+
+    def open_exclusive(self, name: str) -> int:
+        self._validate_name(name)
+        flags = (
+            self._syscalls.O_WRONLY
+            | self._syscalls.O_CREAT
+            | self._syscalls.O_EXCL
+            | self._syscalls.O_NOFOLLOW
+        )
+        return self._syscalls.open(name, flags, 0o600, dir_fd=self._dir_fd)
+
+    def stat(self, name: str) -> os.stat_result:
+        self._validate_name(name)
+        return self._syscalls.stat(name, dir_fd=self._dir_fd, follow_symlinks=False)
+
+    def replace(self, source: str, target: str) -> None:
+        self._validate_name(source)
+        self._validate_name(target)
+        self._syscalls.replace(
+            source,
+            target,
+            src_dir_fd=self._dir_fd,
+            dst_dir_fd=self._dir_fd,
+        )
+
+    def link(self, source: str, target: str) -> None:
+        self._validate_name(source)
+        self._validate_name(target)
+        self._syscalls.link(
+            source,
+            target,
+            src_dir_fd=self._dir_fd,
+            dst_dir_fd=self._dir_fd,
+            follow_symlinks=False,
+        )
+
+    def unlink(self, name: str) -> None:
+        self._validate_name(name)
+        self._syscalls.unlink(name, dir_fd=self._dir_fd)
+
+    def read_bytes(self, name: str) -> bytes:
+        self._validate_name(name)
+        flags = self._syscalls.O_RDONLY | self._syscalls.O_NOFOLLOW
+        descriptor = self._syscalls.open(name, flags, dir_fd=self._dir_fd)
+        content = bytearray()
+        try:
+            while block := self._syscalls.read(descriptor, 65_536):
+                content.extend(block)
+        finally:
+            self._syscalls.close(descriptor)
+        return bytes(content)
+
+    @staticmethod
+    def _validate_name(name: str) -> None:
+        if not name or name in {".", ".."} or "/" in name or "\\" in name:
+            raise ValueError("directory operations require one relative entry name")
+
+
 @dataclass
 class PinnedDirectory:
     """A retained parent directory identity for one patch commit transaction."""
@@ -81,6 +181,7 @@ class PinnedDirectory:
     identity: tuple[int, int]
     fd: int | None = None
     handle: int | None = None
+    operations: PosixDirOps | None = None
 
     @classmethod
     def acquire(cls, path: Path) -> PinnedDirectory | None:
@@ -93,7 +194,7 @@ class PinnedDirectory:
                 if _identity(os.fstat(fd)) != identity:
                     os.close(fd)
                     return None
-                return cls(canonical, identity, fd=fd)
+                return cls(canonical, identity, fd=fd, operations=PosixDirOps(fd))
             import ctypes
             from ctypes import wintypes
 
@@ -304,11 +405,12 @@ class ToolDispatcher:
         patch = parse_validated_patch(source)
         if patch is None:
             return _result("apply_patch", "malformed_patch")
-        pins = self._acquire_parent_pins(patch)
-        if pins is None:
+        pinned = self._acquire_parent_pins(patch)
+        if pinned is None:
             return _result("apply_patch", "patch_parent_unpinned")
+        pins, targets = pinned
         try:
-            prepared, error = self._prepare_patch(patch)
+            prepared, error = self._prepare_patch(patch, targets)
             if error is not None:
                 return _result("apply_patch", error)
             assert prepared is not None
@@ -355,14 +457,18 @@ class ToolDispatcher:
             normalized_metadata={"code": "ok"},
         )
 
-    def _acquire_parent_pins(self, patch: ValidatedPatch) -> list[PinnedDirectory] | None:
-        parents: set[Path] = set()
+    def _acquire_parent_pins(
+        self, patch: ValidatedPatch
+    ) -> tuple[list[PinnedDirectory], dict[str, _PinnedTarget]] | None:
+        targets: list[tuple[str, Path, Path]] = []
         for file_patch in patch.files:
             target = self._patch_target(file_patch.path)
             if target is None:
                 return None
-            parents.add(target.parent.resolve(strict=True))
+            targets.append((file_patch.path, target, target.parent.resolve(strict=True)))
         pins: list[PinnedDirectory] = []
+        by_parent: dict[Path, PinnedDirectory] = {}
+        parents = {parent for _, _, parent in targets}
         for parent in sorted(parents, key=lambda path: str(path).casefold()):
             pin = PinnedDirectory.acquire(parent)
             if pin is None:
@@ -370,7 +476,12 @@ class ToolDispatcher:
                     acquired.close()
                 return None
             pins.append(pin)
-        return pins
+            by_parent[parent] = pin
+        pinned_targets = {
+            patch_path: _PinnedTarget(target, target.name, by_parent[parent])
+            for patch_path, target, parent in targets
+        }
+        return pins, pinned_targets
 
     def _commit_record(self, record: _CommitRecord) -> str | None:
         item = record.item
@@ -383,36 +494,41 @@ class ToolDispatcher:
         self._commit_observer.before_install_or_delete(item.target, operation)
 
         if operation == "delete":
-            if _path_exists(item.target):
+            if _path_exists(item):
                 assert record.backup is not None
-                record.backup.unlink()
+                _unlink_name(item, record.backup)
                 record.backup = None
                 return "patch_target_changed"
             return None
-        if _path_exists(item.target) or record.temporary is None:
+        if _path_exists(item) or record.temporary is None:
             return "patch_target_changed"
-        if not _install_exclusive(record.temporary, item.target):
+        if not _install_exclusive(record, record.temporary, item.name):
             return "patch_target_changed"
         record.temporary = None
-        record.installed_identity = _identity(item.target.lstat())
-        record.installed_digest = _digest(item.target.read_bytes())
+        record.installed_identity = _identity(_stat_name(item, item.name))
+        record.installed_digest = _digest(_read_name(item, item.name))
         return None
 
     @property
     def output_limit(self) -> int:
         return min(self._settings.read_search_result_bytes, self._settings.max_tool_output_bytes)
 
-    def _prepare_patch(self, patch: ValidatedPatch) -> tuple[list[_PreparedPatch] | None, str | None]:
+    def _prepare_patch(
+        self, patch: ValidatedPatch, targets: dict[str, _PinnedTarget]
+    ) -> tuple[list[_PreparedPatch] | None, str | None]:
         prepared: list[_PreparedPatch] = []
         for file_patch in patch.files:
-            target = self._patch_target(file_patch.path)
-            if target is None:
-                return None, "patch_path_error"
-            exists = target.exists()
-            if exists and (target.is_symlink() or not target.is_file()):
+            pinned = targets[file_patch.path]
+            try:
+                details = _stat_pinned_target(pinned)
+            except FileNotFoundError:
+                details = None
+            except OSError:
+                return None, "patch_read_error"
+            if details is not None and not stat.S_ISREG(details.st_mode):
                 return None, "patch_path_error"
             try:
-                old_content = target.read_bytes() if exists else None
+                old_content = _read_pinned_target(pinned) if details is not None else None
             except OSError:
                 return None, "patch_read_error"
             if file_patch.old_path is not None and old_content is None:
@@ -432,10 +548,20 @@ class ToolDispatcher:
             if updated is None:
                 return None, "patch_context_mismatch"
             new_content = None if file_patch.new_path is None else updated.encode("utf-8")
-            state = _capture_target_state(target, old_content, self._root)
+            state = _capture_target_state(pinned, old_content, self._root)
             if state is None:
                 return None, "patch_target_changed"
-            prepared.append(_PreparedPatch(file_patch, target, old_content, new_content, state))
+            prepared.append(
+                _PreparedPatch(
+                    file_patch,
+                    pinned.path,
+                    pinned.name,
+                    pinned.parent,
+                    old_content,
+                    new_content,
+                    state,
+                )
+            )
         return prepared, None
 
     def _existing_file(self, raw_path: str) -> Path | None:
@@ -494,9 +620,18 @@ class ToolDispatcher:
 
 
 @dataclass(frozen=True)
+class _PinnedTarget:
+    path: Path
+    name: str
+    parent: PinnedDirectory
+
+
+@dataclass(frozen=True)
 class _PreparedPatch:
     patch: PatchFile
     target: Path
+    name: str
+    parent: PinnedDirectory
     old_content: bytes | None
     new_content: bytes | None
     target_state: _TargetState
@@ -505,8 +640,8 @@ class _PreparedPatch:
 @dataclass
 class _CommitRecord:
     item: _PreparedPatch
-    temporary: Path | None
-    backup: Path | None = None
+    temporary: str | None
+    backup: str | None = None
     installed_identity: tuple[int, int] | None = None
     installed_digest: str | None = None
 
@@ -579,23 +714,70 @@ def _digest(content: bytes) -> str:
     return hashlib.sha256(content).hexdigest()
 
 
-def _capture_target_state(target: Path, content: bytes | None, root: Path) -> _TargetState | None:
+def _capture_target_state(
+    target: _PinnedTarget, content: bytes | None, root: Path
+) -> _TargetState | None:
+    if target.parent.operations is not None:
+        if not target.parent.verify():
+            return None
+        try:
+            target_stat = target.parent.operations.stat(target.name)
+        except FileNotFoundError:
+            if content is None:
+                return _TargetState(
+                    target.parent.path,
+                    target.parent.identity,
+                    None,
+                    None,
+                )
+            return None
+        except OSError:
+            return None
+        if content is None:
+            return None
+        return _TargetState(
+            target.parent.path,
+            target.parent.identity,
+            _identity(target_stat),
+            _digest(content),
+        )
+
     try:
-        parent = target.parent.resolve(strict=True)
-        if not parent.is_relative_to(root):
+        parent = target.path.parent.resolve(strict=True)
+        if parent != target.parent.path or not parent.is_relative_to(root):
             return None
         parent_stat = parent.lstat()
         if content is None:
-            if target.exists() or target.is_symlink():
+            if target.path.exists() or target.path.is_symlink():
                 return None
             return _TargetState(parent, _identity(parent_stat), None, None)
-        target_stat = target.lstat()
+        target_stat = target.path.lstat()
     except OSError:
         return None
     return _TargetState(parent, _identity(parent_stat), _identity(target_stat), _digest(content))
 
 
 def _target_state_matches(item: _PreparedPatch) -> bool:
+    if item.parent.operations is not None:
+        if not item.parent.verify():
+            return False
+        try:
+            target_stat = item.parent.operations.stat(item.name)
+        except FileNotFoundError:
+            return item.target_state.target_identity is None
+        except OSError:
+            return False
+        if item.target_state.target_identity is None:
+            return False
+        try:
+            content = item.parent.operations.read_bytes(item.name)
+        except OSError:
+            return False
+        return (
+            _identity(target_stat) == item.target_state.target_identity
+            and _digest(content) == item.target_state.target_digest
+        )
+
     try:
         parent = item.target.parent.resolve(strict=True)
         if parent != item.target_state.canonical_parent or _identity(parent.lstat()) != item.target_state.parent_identity:
@@ -610,13 +792,16 @@ def _target_state_matches(item: _PreparedPatch) -> bool:
         return False
 
 
-def _write_patch_temp(item: _PreparedPatch) -> Path | None:
+def _write_patch_temp(item: _PreparedPatch) -> str | None:
     if item.new_content is None:
         return None
-    descriptor, temporary_name = tempfile.mkstemp(dir=item.target.parent, prefix=".pyquality-")
-    temporary = Path(temporary_name)
-    with os.fdopen(descriptor, "wb") as stream:
-        stream.write(item.new_content)
+    temporary, descriptor = _create_artifact(item, ".pyquality-")
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(item.new_content)
+    except OSError:
+        _unlink_name(item, temporary, missing_ok=True)
+        raise
     return temporary
 
 
@@ -624,18 +809,17 @@ def _capture_target(record: _CommitRecord) -> str | None:
     item = record.item
     if not _target_state_matches(item):
         return "patch_target_changed"
-    descriptor, backup_name = tempfile.mkstemp(dir=item.target.parent, prefix=".pyquality-backup-")
+    backup, descriptor = _create_artifact(item, ".pyquality-backup-")
     os.close(descriptor)
-    backup = Path(backup_name)
     try:
-        os.replace(item.target, backup)
+        _replace_name(item, item.name, backup)
     except OSError:
-        backup.unlink(missing_ok=True)
+        _unlink_name(item, backup, missing_ok=True)
         return "patch_target_changed"
     record.backup = backup
     if _backup_matches(record):
         return None
-    if not _restore_exclusive(backup, item.target):
+    if not _restore_exclusive(record):
         record.backup = backup
     else:
         record.backup = None
@@ -647,28 +831,31 @@ def _backup_matches(record: _CommitRecord) -> bool:
     expected = record.item.target_state
     try:
         return (
-            _identity(record.backup.lstat()) == expected.target_identity
-            and _digest(record.backup.read_bytes()) == expected.target_digest
+            _identity(_stat_name(record.item, record.backup)) == expected.target_identity
+            and _digest(_read_name(record.item, record.backup)) == expected.target_digest
         )
     except OSError:
         return False
 
 
-def _install_exclusive(temporary: Path, target: Path) -> bool:
+def _install_exclusive(
+    record: _CommitRecord, source: str, target: str
+) -> bool:
     try:
-        os.link(temporary, target)
+        _link_name(record.item, source, target)
     except FileExistsError:
         return False
     except OSError:
         return False
-    temporary.unlink()
+    _unlink_name(record.item, source)
     return True
 
 
-def _restore_exclusive(backup: Path, target: Path) -> bool:
-    if _path_exists(target):
+def _restore_exclusive(record: _CommitRecord) -> bool:
+    assert record.backup is not None
+    if _path_exists(record.item):
         return False
-    return _install_exclusive(backup, target)
+    return _install_exclusive(record, record.backup, record.item.name)
 
 
 def _rollback(records: list[_CommitRecord]) -> list[str]:
@@ -676,18 +863,19 @@ def _rollback(records: list[_CommitRecord]) -> list[str]:
     for record in reversed(records):
         item = record.item
         if record.installed_identity is not None:
-            if not _file_matches(item.target, record.installed_identity, record.installed_digest):
+            if not _file_matches(item, record.installed_identity, record.installed_digest):
                 incomplete.append(item.patch.path)
                 continue
             try:
-                item.target.unlink()
+                _unlink_name(item, item.name)
             except OSError:
                 incomplete.append(item.patch.path)
                 continue
         if record.backup is not None:
-            if not _restore_exclusive(record.backup, item.target):
+            backup = record.backup
+            if not _restore_exclusive(record):
                 incomplete.append(item.patch.path)
-                incomplete.append(record.backup.name)
+                incomplete.append(backup)
                 continue
             record.backup = None
     return sorted(set(incomplete))
@@ -699,30 +887,102 @@ def _cleanup_backups(records: list[_CommitRecord], observer: CommitObserver) -> 
         if record.backup is None:
             continue
         try:
-            observer.before_cleanup(record.item.target, record.backup)
-            record.backup.unlink()
+            backup = record.backup
+            observer.before_cleanup(record.item.target, record.item.target.parent / backup)
+            _unlink_name(record.item, backup)
             record.backup = None
         except OSError:
-            incomplete.append(record.backup.name)
+            incomplete.append(record.backup)
     return incomplete
 
 
 def _cleanup_temps(records: list[_CommitRecord]) -> None:
     for record in records:
         if record.temporary is not None:
-            record.temporary.unlink(missing_ok=True)
+            _unlink_name(record.item, record.temporary, missing_ok=True)
             record.temporary = None
 
 
-def _file_matches(target: Path, identity: tuple[int, int], digest: str | None) -> bool:
+def _create_artifact(item: _PreparedPatch, prefix: str) -> tuple[str, int]:
+    if item.parent.operations is not None:
+        for _ in range(128):
+            name = f"{prefix}{secrets.token_hex(8)}"
+            try:
+                return name, item.parent.operations.open_exclusive(name)
+            except FileExistsError:
+                continue
+        raise FileExistsError("could not reserve a unique patch artifact")
+    descriptor, path = tempfile.mkstemp(dir=item.target.parent, prefix=prefix)
+    return Path(path).name, descriptor
+
+
+def _stat_pinned_target(target: _PinnedTarget) -> os.stat_result:
+    if target.parent.operations is not None:
+        return target.parent.operations.stat(target.name)
+    return target.path.lstat()
+
+
+def _read_pinned_target(target: _PinnedTarget) -> bytes:
+    if target.parent.operations is not None:
+        return target.parent.operations.read_bytes(target.name)
+    return target.path.read_bytes()
+
+
+def _stat_name(item: _PreparedPatch, name: str) -> os.stat_result:
+    if item.parent.operations is not None:
+        return item.parent.operations.stat(name)
+    return (item.target.parent / name).lstat()
+
+
+def _read_name(item: _PreparedPatch, name: str) -> bytes:
+    if item.parent.operations is not None:
+        return item.parent.operations.read_bytes(name)
+    return (item.target.parent / name).read_bytes()
+
+
+def _replace_name(item: _PreparedPatch, source: str, target: str) -> None:
+    if item.parent.operations is not None:
+        item.parent.operations.replace(source, target)
+        return
+    os.replace(item.target.parent / source, item.target.parent / target)
+
+
+def _link_name(item: _PreparedPatch, source: str, target: str) -> None:
+    if item.parent.operations is not None:
+        item.parent.operations.link(source, target)
+        return
+    os.link(item.target.parent / source, item.target.parent / target)
+
+
+def _unlink_name(item: _PreparedPatch, name: str, *, missing_ok: bool = False) -> None:
     try:
-        return _identity(target.lstat()) == identity and _digest(target.read_bytes()) == digest
+        if item.parent.operations is not None:
+            item.parent.operations.unlink(name)
+        else:
+            (item.target.parent / name).unlink()
+    except FileNotFoundError:
+        if not missing_ok:
+            raise
+
+
+def _file_matches(item: _PreparedPatch, identity: tuple[int, int], digest: str | None) -> bool:
+    try:
+        return (
+            _identity(_stat_name(item, item.name)) == identity
+            and _digest(_read_name(item, item.name)) == digest
+        )
     except OSError:
         return False
 
 
-def _path_exists(path: Path) -> bool:
-    return path.exists() or path.is_symlink()
+def _path_exists(item: _PreparedPatch) -> bool:
+    try:
+        _stat_name(item, item.name)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    return True
 
 
 def _identity(details: os.stat_result) -> tuple[int, int]:
