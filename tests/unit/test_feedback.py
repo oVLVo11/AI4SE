@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pyquality.domain.models import Finding
-from pyquality.feedback import FeedbackComposer
+from pyquality.feedback import FeedbackComposer, FeedbackFinding, FeedbackPacket
 
 
 def finding(
@@ -84,3 +84,63 @@ def test_invalid_budgets_are_rejected() -> None:
         FeedbackComposer().compose((), 0, 1)
     with pytest.raises(ValueError, match="positive"):
         FeedbackComposer().compose((), 1, 0)
+
+
+def test_group_representative_is_deterministic_when_normalized_keys_tie() -> None:
+    upper = finding("assertion", "same", summary="Alpha", evidence="z evidence")
+    lower = finding("assertion", "same", summary="alpha", evidence="a evidence")
+
+    forward = FeedbackComposer().compose((upper, lower), 2_000, 500)
+    reversed_packet = FeedbackComposer().compose((lower, upper), 2_000, 500)
+
+    assert forward == reversed_packet
+    assert forward.findings[0].summary == "Alpha"
+
+
+def test_group_representative_breaks_equal_priority_category_ties() -> None:
+    infrastructure = finding("infrastructure", "same", summary="same", evidence="same")
+    timeout = finding("timeout", "same", summary="same", evidence="same")
+
+    forward = FeedbackComposer().compose((timeout, infrastructure), 2_000, 500)
+    reverse = FeedbackComposer().compose((infrastructure, timeout), 2_000, 500)
+
+    assert forward == reverse
+
+
+def test_empty_packet_at_one_byte_reports_that_rendering_was_truncated() -> None:
+    packet = FeedbackComposer().compose((), 1, 1)
+
+    assert packet.text == "~"
+    assert packet.omitted_count == 0
+    assert packet.truncated is True
+
+
+def test_feedback_public_models_reject_invalid_category_location_and_budget() -> None:
+    import pytest
+    from pydantic import ValidationError
+
+    base = {
+        "category": "assertion",
+        "summary": "summary",
+        "evidence": "evidence",
+        "group_key": "group",
+        "occurrences": 1,
+    }
+    with pytest.raises(ValidationError):
+        FeedbackFinding(**(base | {"category": "unknown"}))
+    with pytest.raises(ValidationError):
+        FeedbackFinding(**base, path=None, line=1)
+    with pytest.raises(ValidationError):
+        FeedbackFinding(**base, path="../escape.py")
+    with pytest.raises(ValidationError):
+        FeedbackFinding(**base, path="a" * 1_025)
+
+    valid = FeedbackFinding(**base)
+    with pytest.raises(ValidationError, match="byte budget"):
+        FeedbackPacket(
+            findings=(valid,), omitted_count=0, truncated=False, byte_budget=1, text="🚀"
+        )
+    with pytest.raises(ValidationError, match="truncated"):
+        FeedbackPacket(
+            findings=(), omitted_count=1, truncated=False, byte_budget=100, text="omitted"
+        )

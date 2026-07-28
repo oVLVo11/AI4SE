@@ -68,6 +68,32 @@ def test_fingerprint_is_sha256_and_changes_for_normalized_tuple() -> None:
     assert digest != failure_fingerprint((changed,))
 
 
+def test_fingerprint_preserves_relative_path_case_and_repository_tmp_components() -> None:
+    def item(path: str):
+        return SimpleNamespace(
+            category="assertion", path=path, line=1, group_key="assertion", evidence="x"
+        )
+
+    assert failure_fingerprint((item("src/A.py"),)) != failure_fingerprint((item("src/a.py"),))
+    assert failure_fingerprint((item("src/tmp/a.py"),)) != failure_fingerprint(
+        (item("src/tmp/b.py"),)
+    )
+
+
+def test_fingerprint_only_collapses_drive_qualified_volatile_temp_paths() -> None:
+    def item(path: str, group_key: str):
+        return SimpleNamespace(
+            category="assertion", path=path, line=1, group_key=group_key, evidence="x"
+        )
+
+    windows = item("C:/Temp/a.py", "failed C:/Temp/a.py in 0.21s")
+    other_windows = item("D:/tmp/b.py", "failed D:/tmp/b.py in 1.90s")
+    relative = item("Temp/a.py", "failed Temp/a.py in 0.21s")
+
+    assert failure_fingerprint((windows,)) == failure_fingerprint((other_windows,))
+    assert failure_fingerprint((windows,)) != failure_fingerprint((relative,))
+
+
 def test_success_has_highest_precedence() -> None:
     history = [entry("abc", success=True, blocked=True, failed=True)]
     assert ProgressTracker().decide(history, 1, NOW - timedelta(seconds=1), NOW) is TaskStatus.SUCCEEDED

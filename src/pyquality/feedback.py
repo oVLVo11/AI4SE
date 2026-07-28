@@ -8,11 +8,20 @@ import re
 from collections.abc import Iterable, Sequence
 from datetime import datetime
 from pathlib import PurePosixPath
-from typing import Any
+from typing import Any, Literal
 
-from pydantic import Field
+from pydantic import Field, model_validator
 
-from .domain.models import Finding, PublicModel, QualityReport, TaskStatus
+from .domain.models import (
+    MAX_CONFIG_PATTERN_BYTES,
+    MAX_FINDING_EVIDENCE_BYTES,
+    MAX_FINDING_SUMMARY_BYTES,
+    MAX_GROUP_KEY_BYTES,
+    Finding,
+    PublicModel,
+    QualityReport,
+    TaskStatus,
+)
 
 _PRIORITY = {
     "infrastructure": 0,
@@ -24,8 +33,8 @@ _PRIORITY = {
     "runtime": 2,
     "ruff": 3,
 }
-_ABSOLUTE_TEMP = re.compile(
-    r"(?i)(?:[a-z]:)?[/\\](?:[^\s:/\\]+[/\\])*(?:temp|tmp)[/\\][^\s:]+"
+_DRIVE_TEMP_PATH = re.compile(
+    r"(?i)[a-z]:/(?:[^\s:/]+/)*(?:temp|tmp)/[^\s:]+"
 )
 _TIMING = re.compile(r"(?i)\b\d+(?:\.\d+)?\s*(?:ms|s|sec|secs|seconds)\b")
 
@@ -33,13 +42,41 @@ _TIMING = re.compile(r"(?i)\b\d+(?:\.\d+)?\s*(?:ms|s|sec|secs|seconds)\b")
 class FeedbackFinding(PublicModel):
     """One grouped root cause selected for model feedback."""
 
-    category: str = Field(min_length=1)
+    category: Literal[
+        "syntax",
+        "import_collection",
+        "assertion",
+        "runtime",
+        "ruff",
+        "timeout",
+        "missing_tool_dependency",
+        "infrastructure",
+    ]
     path: str | None = None
     line: int | None = Field(default=None, ge=1)
     summary: str = Field(min_length=1)
     evidence: str = Field(min_length=1)
     group_key: str = Field(min_length=1)
     occurrences: int = Field(ge=1)
+
+    @model_validator(mode="after")
+    def validate_finding(self) -> FeedbackFinding:
+        if self.path is None and self.line is not None:
+            raise ValueError("line requires path")
+        if self.path is not None:
+            normalized = PurePosixPath(self.path)
+            if (
+                not self.path
+                or "\\" in self.path
+                or normalized.is_absolute()
+                or ".." in normalized.parts
+            ):
+                raise ValueError("path must be repository-relative POSIX text")
+            _require_bytes(self.path, MAX_CONFIG_PATTERN_BYTES, "path")
+        _require_bytes(self.summary, MAX_FINDING_SUMMARY_BYTES, "summary")
+        _require_bytes(self.evidence, MAX_FINDING_EVIDENCE_BYTES, "evidence")
+        _require_bytes(self.group_key, MAX_GROUP_KEY_BYTES, "group_key")
+        return self
 
 
 class FeedbackPacket(PublicModel):
@@ -50,6 +87,14 @@ class FeedbackPacket(PublicModel):
     truncated: bool
     byte_budget: int = Field(ge=1)
     text: str = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_packet(self) -> FeedbackPacket:
+        if len(self.text.encode("utf-8")) > self.byte_budget:
+            raise ValueError("text exceeds byte budget")
+        if self.omitted_count and not self.truncated:
+            raise ValueError("omitted findings require truncated=true")
+        return self
 
 
 class ProgressEntry(PublicModel):
@@ -112,12 +157,13 @@ class FeedbackComposer:
 
         omitted_count = len(candidates) - len(selected)
         raw_text = _render(tuple(selected), omitted_count, total_bytes)
+        render_truncated = len(raw_text.encode("utf-8")) > total_bytes
         text = (
             "~"
-            if not selected and len(raw_text.encode("utf-8")) > total_bytes
+            if not selected and render_truncated
             else _truncate_utf8(raw_text, total_bytes)
         )
-        truncated = omitted_count > 0 or item_truncated
+        truncated = omitted_count > 0 or item_truncated or render_truncated
         return FeedbackPacket(
             findings=tuple(selected),
             omitted_count=omitted_count,
@@ -179,13 +225,19 @@ def _same_relevant_failure(previous: ProgressEntry, current: ProgressEntry) -> b
     )
 
 
-def _finding_key(finding: Finding) -> tuple[int, str, int, str, str]:
+def _finding_key(
+    finding: Finding,
+) -> tuple[int, str, int, str, str, str, str, str, str]:
     return (
         _PRIORITY[finding.category],
         _normalized_relative_path(finding.path) or "",
         finding.line or 0,
         finding.summary.casefold(),
         finding.group_key,
+        finding.summary,
+        finding.evidence,
+        finding.category,
+        finding.source,
     )
 
 
@@ -225,6 +277,11 @@ def _truncate_utf8(value: str, limit: int) -> str:
 
 def _fingerprint_text(value: object) -> str:
     text = "" if value is None else str(value).replace("\\", "/")
-    text = _ABSOLUTE_TEMP.sub("<temp>", text)
+    text = _DRIVE_TEMP_PATH.sub("<temp>", text)
     text = _TIMING.sub("<time>", text)
-    return text.casefold()
+    return text
+
+
+def _require_bytes(value: str, limit: int, field: str) -> None:
+    if len(value.encode("utf-8")) > limit:
+        raise ValueError(f"{field} exceeds {limit} UTF-8 bytes")
