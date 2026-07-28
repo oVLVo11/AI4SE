@@ -54,6 +54,10 @@ class CommitObserver(Protocol):
 
     def before_install_or_delete(self, path: Path, operation: str) -> None: ...
 
+    def after_pins_acquired(self, parents: tuple[Path, ...]) -> None: ...
+
+    def before_cleanup(self, path: Path, backup: Path) -> None: ...
+
 
 class _NoopCommitObserver:
     def after_capture(self, path: Path) -> None:
@@ -61,6 +65,68 @@ class _NoopCommitObserver:
 
     def before_install_or_delete(self, path: Path, operation: str) -> None:
         del path, operation
+
+    def after_pins_acquired(self, parents: tuple[Path, ...]) -> None:
+        del parents
+
+    def before_cleanup(self, path: Path, backup: Path) -> None:
+        del path, backup
+
+
+@dataclass
+class PinnedDirectory:
+    """A retained parent directory identity for one patch commit transaction."""
+
+    path: Path
+    identity: tuple[int, int]
+    fd: int | None = None
+    handle: int | None = None
+
+    @classmethod
+    def acquire(cls, path: Path) -> PinnedDirectory | None:
+        try:
+            canonical = path.resolve(strict=True)
+            identity = _identity(canonical.lstat())
+            if os.name != "nt":
+                flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+                fd = os.open(canonical, flags)
+                if _identity(os.fstat(fd)) != identity:
+                    os.close(fd)
+                    return None
+                return cls(canonical, identity, fd=fd)
+            import ctypes
+            from ctypes import wintypes
+
+            create_file = ctypes.windll.kernel32.CreateFileW
+            create_file.argtypes = [
+                wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+                wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+            ]
+            create_file.restype = wintypes.HANDLE
+            handle = create_file(
+                str(canonical), 0x0001, 0x00000001 | 0x00000002, None, 3,
+                0x02000000 | 0x00200000, None,
+            )
+            if handle == wintypes.HANDLE(-1).value:
+                return None
+            return cls(canonical, identity, handle=int(handle))
+        except OSError:
+            return None
+
+    def verify(self) -> bool:
+        if self.fd is not None:
+            return _identity(os.fstat(self.fd)) == self.identity
+        return self.handle is not None
+
+    def close(self) -> None:
+        if self.fd is not None:
+            os.close(self.fd)
+            self.fd = None
+        if self.handle is not None:
+            import ctypes
+
+            ctypes.windll.kernel32.CloseHandle(self.handle)
+            self.handle = None
 
 
 class SubprocessRunner:
@@ -238,40 +304,44 @@ class ToolDispatcher:
         patch = parse_validated_patch(source)
         if patch is None:
             return _result("apply_patch", "malformed_patch")
-        prepared, error = self._prepare_patch(patch)
-        if error is not None:
-            return _result("apply_patch", error)
-        assert prepared is not None
-        records: list[_CommitRecord] = []
+        pins = self._acquire_parent_pins(patch)
+        if pins is None:
+            return _result("apply_patch", "patch_parent_unpinned")
         try:
-            for item in prepared:
-                records.append(_CommitRecord(item, _write_patch_temp(item)))
-        except OSError:
-            _cleanup_temps(records)
-            return _result("apply_patch", "patch_write_error")
+            prepared, error = self._prepare_patch(patch)
+            if error is not None:
+                return _result("apply_patch", error)
+            assert prepared is not None
+            self._commit_observer.after_pins_acquired(tuple(pin.path for pin in pins))
+            if not all(pin.verify() for pin in pins):
+                return _result("apply_patch", "patch_parent_unpinned")
+            records: list[_CommitRecord] = []
+            try:
+                for item in prepared:
+                    records.append(_CommitRecord(item, _write_patch_temp(item)))
+            except OSError:
+                _cleanup_temps(records)
+                return _result("apply_patch", "patch_write_error")
 
-        committed: list[_CommitRecord] = []
-        for record in records:
-            code = self._commit_record(record)
-            if code is None:
-                committed.append(record)
-                continue
-            rollback_paths = _rollback(committed)
-            _cleanup_temps(records)
-            if rollback_paths:
-                return _result("apply_patch", "patch_rollback_incomplete", affected_paths=rollback_paths)
-            return _result("apply_patch", code)
-
-        try:
+            committed: list[_CommitRecord] = []
             for record in records:
-                _finalize_backup(record)
-        except OSError:
-            rollback_paths = _rollback(committed)
+                code = self._commit_record(record)
+                if code is None:
+                    committed.append(record)
+                    continue
+                rollback_paths = _rollback([*committed, record])
+                _cleanup_temps(records)
+                if rollback_paths:
+                    return _result("apply_patch", "patch_rollback_incomplete", affected_paths=rollback_paths)
+                return _result("apply_patch", code)
+
+            cleanup_paths = _cleanup_backups(records, self._commit_observer)
             _cleanup_temps(records)
-            if rollback_paths:
-                return _result("apply_patch", "patch_rollback_incomplete", affected_paths=rollback_paths)
-            return _result("apply_patch", "patch_write_error")
-        _cleanup_temps(records)
+            if cleanup_paths:
+                return _result("apply_patch", "patch_cleanup_incomplete", affected_paths=cleanup_paths)
+        finally:
+            for pin in reversed(pins):
+                pin.close()
 
         changed = tuple(item.patch.path for item in prepared)
         before = {item.patch.path: _digest(item.old_content) for item in prepared if item.old_content is not None}
@@ -284,6 +354,23 @@ class ToolDispatcher:
             after_digests=after,
             normalized_metadata={"code": "ok"},
         )
+
+    def _acquire_parent_pins(self, patch: ValidatedPatch) -> list[PinnedDirectory] | None:
+        parents: set[Path] = set()
+        for file_patch in patch.files:
+            target = self._patch_target(file_patch.path)
+            if target is None:
+                return None
+            parents.add(target.parent.resolve(strict=True))
+        pins: list[PinnedDirectory] = []
+        for parent in sorted(parents, key=lambda path: str(path).casefold()):
+            pin = PinnedDirectory.acquire(parent)
+            if pin is None:
+                for acquired in reversed(pins):
+                    acquired.close()
+                return None
+            pins.append(pin)
+        return pins
 
     def _commit_record(self, record: _CommitRecord) -> str | None:
         item = record.item
@@ -600,15 +687,24 @@ def _rollback(records: list[_CommitRecord]) -> list[str]:
         if record.backup is not None:
             if not _restore_exclusive(record.backup, item.target):
                 incomplete.append(item.patch.path)
+                incomplete.append(record.backup.name)
                 continue
             record.backup = None
     return sorted(set(incomplete))
 
 
-def _finalize_backup(record: _CommitRecord) -> None:
-    if record.backup is not None:
-        record.backup.unlink()
-        record.backup = None
+def _cleanup_backups(records: list[_CommitRecord], observer: CommitObserver) -> list[str]:
+    incomplete: list[str] = []
+    for record in records:
+        if record.backup is None:
+            continue
+        try:
+            observer.before_cleanup(record.item.target, record.backup)
+            record.backup.unlink()
+            record.backup = None
+        except OSError:
+            incomplete.append(record.backup.name)
+    return incomplete
 
 
 def _cleanup_temps(records: list[_CommitRecord]) -> None:

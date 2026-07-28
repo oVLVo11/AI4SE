@@ -43,9 +43,15 @@ class _AllowPolicy:
 
 
 class _ConcurrentObserver:
-    def __init__(self, *, after_capture=None, before_install=None) -> None:
+    def __init__(self, *, after_pins=None, after_capture=None, before_install=None, before_cleanup=None) -> None:
+        self._after_pins = after_pins
         self._after_capture = after_capture
         self._before_install = before_install
+        self._before_cleanup = before_cleanup
+
+    def after_pins_acquired(self, parents: tuple[Path, ...]) -> None:
+        if self._after_pins is not None:
+            self._after_pins(parents)
 
     def after_capture(self, path: Path) -> None:
         if self._after_capture is not None:
@@ -54,6 +60,10 @@ class _ConcurrentObserver:
     def before_install_or_delete(self, path: Path, operation: str) -> None:
         if self._before_install is not None:
             self._before_install(path, operation)
+
+    def before_cleanup(self, path: Path, backup: Path) -> None:
+        if self._before_cleanup is not None:
+            self._before_cleanup(path, backup)
 
 
 def test_patch_rejects_missing_context(repo: Path) -> None:
@@ -155,7 +165,9 @@ def test_modify_never_overwrites_a_target_created_after_atomic_capture(repo: Pat
 
     result = _dispatcher(repo, observer).dispatch(action, decision, decision.repository_snapshot_digest)
 
-    assert (result.ok, result.code) == (False, "patch_target_changed")
+    assert (result.ok, result.code) == (False, "patch_rollback_incomplete")
+    assert "a.py" in result.normalized_metadata["affected_paths"]
+    assert any(path.startswith(".pyquality-backup-") for path in result.normalized_metadata["affected_paths"])
     assert (repo / "a.py").read_text(encoding="utf-8") == "concurrent\n"
 
 
@@ -229,7 +241,8 @@ def test_multi_file_failure_rolls_back_an_earlier_install(repo: Path) -> None:
 
     result = _dispatcher(repo, observer).dispatch(action, decision, decision.repository_snapshot_digest)
 
-    assert (result.ok, result.code) == (False, "patch_target_changed")
+    assert (result.ok, result.code) == (False, "patch_rollback_incomplete")
+    assert "b.py" in result.normalized_metadata["affected_paths"]
     assert (repo / "a.py").read_text(encoding="utf-8") == "context\nold\n"
     assert (repo / "b.py").read_text(encoding="utf-8") == "concurrent\n"
 
@@ -253,9 +266,69 @@ def test_incomplete_rollback_reports_affected_paths_without_overwriting_concurre
     )
 
     assert (result.ok, result.code) == (False, "patch_rollback_incomplete")
-    assert result.normalized_metadata["affected_paths"] == ["a.py"]
+    assert "a.py" in result.normalized_metadata["affected_paths"]
+    assert "b.py" in result.normalized_metadata["affected_paths"]
+    assert any(path.startswith(".pyquality-backup-") for path in result.normalized_metadata["affected_paths"])
     assert (repo / "a.py").read_text(encoding="utf-8") == "concurrent-a\n"
     assert (repo / "b.py").read_text(encoding="utf-8") == "concurrent-b\n"
+
+
+def test_cleanup_failure_never_rolls_back_already_valid_installs(repo: Path) -> None:
+    """A backup-cleanup error must not erase a later valid target through an attempted rollback."""
+    patch = (
+        "--- a/a.py\n+++ b/a.py\n@@ -1,2 +1,2 @@\n context\n-old\n+new-a\n"
+        "--- a/b.py\n+++ b/b.py\n@@ -1,2 +1,2 @@\n context\n-old\n+new-b\n"
+    )
+    action = _action(patch)
+    decision = PolicyEngine(repo).evaluate(action)
+    observer = _ConcurrentObserver(
+        before_cleanup=lambda path, backup: (_ for _ in ()).throw(OSError("cleanup unavailable"))
+        if path.name == "a.py" and backup.name.startswith(".pyquality-backup-")
+        else None
+    )
+
+    result = _dispatcher(repo, observer).dispatch(action, decision, decision.repository_snapshot_digest)
+
+    assert (result.ok, result.code) == (False, "patch_cleanup_incomplete")
+    assert result.normalized_metadata["affected_paths"]
+    assert (repo / "a.py").read_text(encoding="utf-8") == "context\nnew-a\n"
+    assert (repo / "b.py").read_text(encoding="utf-8") == "context\nnew-b\n"
+
+
+def test_parent_pin_keeps_patch_inside_original_directory_after_swap_attempt(
+    repo: Path, tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    """Resolving a renamed parent again would redirect a committed patch through a hostile replacement."""
+    nested = repo / "nested"
+    nested.mkdir()
+    original = nested / "a.py"
+    original.write_text("context\nold\n", encoding="utf-8")
+    outside = tmp_path_factory.mktemp("outside")
+    sentinel = outside / "a.py"
+    sentinel.write_text("outside\n", encoding="utf-8")
+    moved = repo / "moved"
+    swapped: dict[str, Path | None] = {"parent": None}
+
+    def swap_parent(parents: tuple[Path, ...]) -> None:
+        parent = parents[0]
+        try:
+            parent.rename(moved)
+            nested.symlink_to(outside, target_is_directory=True)
+            swapped["parent"] = moved
+        except PermissionError:
+            swapped["parent"] = parent
+
+    patch = "--- a/nested/a.py\n+++ b/nested/a.py\n@@ -1,2 +1,2 @@\n context\n-old\n+new\n"
+    action = _action(patch)
+    decision = PolicyEngine(repo).evaluate(action)
+    result = _dispatcher(repo, _ConcurrentObserver(after_pins=swap_parent)).dispatch(
+        action, decision, decision.repository_snapshot_digest
+    )
+
+    assert result.ok is True
+    assert swapped["parent"] is not None
+    assert (swapped["parent"] / "a.py").read_text(encoding="utf-8") == "context\nnew\n"
+    assert sentinel.read_text(encoding="utf-8") == "outside\n"
 
 
 def test_patch_aborts_when_target_parent_becomes_an_outside_symlink(
