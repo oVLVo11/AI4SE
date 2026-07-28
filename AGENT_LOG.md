@@ -15,4 +15,9 @@ Commit `de51d59` (`docs: add approved PyQuality Harness design`) added `docs/sup
 ## 2026-07-28 — Task 0 baseline materialization
 
 Created self-contained root `SPEC.md`, `PLAN.md`, `SPEC_PROCESS.md`, and `AGENT_LOG.md` from approved repository documents and controller-supplied process evidence. Cold-start findings and correction evidence are not recorded until the validation occurs.
++
+
+## 2026-07-28 — Pre-implementation cold-start validation
+
+Fresh validator `/root/task0_docs_coldstart/coldstart_validator` (`gpt-5.6-sol`) received only the root `SPEC.md` and `PLAN.md` paths plus the dry-run/stop-at-uncertainty instruction. It dry-ran Task 1 and Task 8 without implementation edits. It reported public-model/configuration ambiguity and Task 8 state, approval, recovery, and protocol gaps. The complete finding categories, divergent interpretations, mismatches, and corrections are recorded in `SPEC_PROCESS.md`. Specification section 15 and the plan cold-start amendments were added to resolve them.
 

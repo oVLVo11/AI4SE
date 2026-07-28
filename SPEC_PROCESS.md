@@ -46,4 +46,33 @@ Rejected: validator-plugin extensibility, an event-driven workflow, and the Visu
 ## Cold-start Validation
 
 Pending. This section will contain only the fresh agent's actual questions, divergent interpretations, expected file/interface mismatches, and the narrow corrections made in response. The validator is instructed to stop at uncertainty rather than guess.
++
+
+### Validator Identity and Scope
+
+- Agent: `/root/task0_docs_coldstart/coldstart_validator`
+- Model: `gpt-5.6-sol`
+- Context supplied: only `SPEC.md` and `PLAN.md` paths plus the instruction to dry-run Task 1 and one risk-heavy task, write no implementation code, and stop at uncertainty.
+- Chosen risk-heavy task: Task 8.
+- Result: completed without implementation edits.
+
+### Actual Task 1 Findings
+
+Questions: exact fields/invariants for `QualityReport`, `TaskResult`, `PolicyOutcome`, `ToolResult`, `ApprovalDecision`, and `AuditEvent`; enum versus structured `PolicyOutcome`; typed union versus dictionary action arguments; public-model unknown-field policy; repository-relative versus absolute `Finding.path`; limits for strings and arguments; whether line may lack a path; full-quality success fields; iteration counting; configuration tables/keys; coexistence and precedence of `pyproject.toml` and `pyquality.toml`; user-file format/optionality; secure default values and safe pytest/Ruff arguments; whether repository configuration may reduce security limits; parse/type/conflict error behavior; invalid or symlinked repository-root behavior; Python 3.12-only interpretation; and editable-install implications.
+
+Divergent interpretations: typed action envelope versus per-tool payloads; scope of unknown-field rejection; ordinary override merge versus monotonic security merge; repository configuration files as equivalent, complementary, or conflicting; and display finding categories versus stable serialized values.
+
+Expected mismatches: the Task 1 console entry point precedes `cli.py`; dictionary action arguments conflict with the no-untyped-public-boundary goal; Task 3 names `PolicyDecision` while consuming `PolicyOutcome`; Tasks 5, 6, and 8 require undefined quality/result/iteration semantics; Task 2 lacks typed persistence inputs for architecture entities; and broad dependency ranges do not make installation reproducible.
+
+### Actual Task 8 Findings
+
+Questions: complete states/transitions; iteration and round accounting; repair-attempt and provider-retry accounting; verification triggers for patch, `run_quality`, and `finish`; patch/path/content-digest supply; relevant-versus-unrelated change handling; approval revalidation, canonicalization, digest, repository drift, lease, deadline, duplicate-decision, and terminal-resume semantics; rejection feedback and LLM exhaustion; blocked-versus-failed classification; redacted pre-Task-9 audit persistence; and crash semantics for a filesystem effect plus SQLite state.
+
+Divergent interpretations: persistence as intent/outbox versus simple pre-effect state save; impossible cross-resource transaction versus chosen recovery guarantee; response-versus-action meaning of model round; lease retention versus release while awaiting approval; terminal-decision timing; whether denials/approvals occupy iterations; and whether Task 8 directly interprets quality results or delegates to `ProgressTracker`.
+
+Expected mismatches: no aggregate core-protocol constructor boundary; missing repository APIs for approval/recovery transitions; one-action iteration storage versus repair persistence; revalidation missing action/snapshot inputs; `ToolResult` lacks changed-file data; `ProgressTracker` lacks relevant-change input; parser/LLM retry ownership is not defined; audit/redaction arrives after Task 8; `pending_approval()` exists only in examples; and fixture signatures do not establish a construction contract.
+
+### Corrections Made
+
+Specification section 15 and the matching root `SPEC.md` now define the requested model/configuration contract, state-transition and round accounting, typed tool-result data, deterministic digest, approval/lease/drift/recovery rules, repository and dependency-injection interfaces, and pre-Task-9 redacted audit sink. The canonical plan and root `PLAN.md` add matching Task 1–8 consumption and production amendments. These corrections directly address the findings above; no product code was written.
 

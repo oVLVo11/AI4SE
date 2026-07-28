@@ -350,6 +350,34 @@ One command runs a bundled scenario:
 - **SQLite process concurrency:** Use a single application worker initially, transactional writes, and repository leases.
 - **Course materials mention both GitHub Actions and `.gitlab-ci.yml`:** Provide both configurations so neither delivery expectation is omitted.
 - **Broad patches are hard to classify:** Require approval when a patch touches more than 10 files or changes more than 300 total lines; count additions and deletions before applying the patch.
++
+
+## 15. Cold-start Contract Clarifications
+
+These clarifications resolve the documented cold-start review without changing product scope.
+
+### 15.1 Public Models and Configuration
+
+Task 1 defines public Pydantic models with `extra="forbid"`: `Action`, `Finding`, `QualityReport`, `TaskResult`, `PolicyOutcome`, `PolicyDecision`, `ToolResult`, `ApprovalDecision`, and `AuditEvent`. `PolicyOutcome` is the enum `ALLOW | REQUIRE_APPROVAL | DENY`; `PolicyDecision` contains that outcome, the matched rule, an impact summary, and a normalized action digest. `ApprovalDecision` is `APPROVE | REJECT`.
+
+`Action` is a discriminated union by `kind`, with per-tool argument models; action-specific keys are forbidden. Every action includes a bounded non-empty rationale. `Finding.path` is repository-relative POSIX text or null; `line` is null unless path is present. `summary`, `evidence`, `group_key`, rationale, patterns, and arguments are byte-bounded by settings. `QualityReport` records targeted-phase status, full-pytest status, Ruff status, findings, commands, timeouts, and changed paths; success requires a passing full pytest suite and Ruff. `TaskResult` records task ID, terminal or waiting status, iteration count, verification summary, changed paths, and audit location. An iteration is one persisted model-response/action cycle; an invalid response and each repair response are cycles, while provider transport retries are not.
+
+`pyquality.toml` is the only repository configuration source. `pyproject.toml` is packaging metadata and is never a second configuration source. Configuration merges built-in secure defaults, optional user file, then `pyquality.toml`; repository values may narrow limits or add exclusions but cannot weaken boundaries, redaction, denied actions, or safe argument grammar. The user file is optional and explicitly supplied. Missing or non-directory repository roots, canonical-root escape, unreadable or malformed TOML, unknown keys, wrong types, and conflicting values raise `ConfigError` during preflight. Python metadata is `>=3.12`; 3.13 and newer remain supported.
+
+Secure defaults are: round limit 8, global concurrency 2, subprocess timeout 60 seconds, provider timeout 30 seconds, provider retries 2, total feedback 32 KiB, per-finding evidence 4 KiB, tool output 64 KiB, read/search result 64 KiB, and source excerpt 8 KiB. Safe pytest arguments are only paths beneath the repository plus `-q`, `-v`, `-x`, and `-k <expression>`; safe Ruff arguments are only repository-relative paths plus `--select <codes>`, `--ignore <codes>`, and `--output-format text`. No setting may add shell syntax, command executables, or arbitrary pytest/Ruff flags.
+
+### 15.2 Loop, Approval, and Recovery Contract
+
+The legal persisted task states are `CREATED`, `RUNNING`, `WAITING_APPROVAL`, `SUCCEEDED`, `STALLED`, `BUDGET_EXHAUSTED`, `BLOCKED`, and `FAILED`. `CREATED -> RUNNING`; `RUNNING -> WAITING_APPROVAL` for an approvable action; `WAITING_APPROVAL -> RUNNING` after either decision; and only `RUNNING` reaches terminal states. Terminal `resume()` is idempotent and returns the saved `TaskResult`. A deadline checked before each model call, dispatch, and verifier transition wins over further work; a running subprocess is governed by its timeout.
+
+A model round is every provider response, including invalid-format and format-repair responses; the initial invalid response plus at most two repair responses are permitted. Provider transport retries happen within one round and use the provider retry limit. Rejected and denied actions produce structured feedback and consume the response/action cycle that created them. A code-changing `apply_patch` immediately runs the quality pipeline. `run_quality` runs it explicitly. `finish` requests the same full verification; a failed finish produces feedback and remains running. The sample three iterations therefore count denied/read-independent actions only when they are model responses, and count bad patch, corrected patch, and finish as three responses in its stated scenario.
+
+`ToolResult` contains effect kind, code_changed, repository-relative changed paths, before/after content digests for changed files, truncation, normalized result metadata, and optional bounded evidence. `ProgressTracker` receives the quality history plus those relevant-path digests; unrelated changes do not reset a repeated-fingerprint stall. A stable normalized-action digest is UTF-8 canonical JSON with sorted object keys, no insignificant whitespace, and SHA-256; the digest covers kind, validated arguments, and rationale.
+
+Approval records retain the normalized action, digest, repository snapshot digest, decision, and execution state. `pending_approval(task_id)` is a formal `AgentLoop` query. A decision is single-use; duplicate or terminal decisions raise `ApprovalStateError`. Resume reacquires the repository lease, compares the saved snapshot to the current snapshot, and blocks with drift feedback if it differs. Revalidation receives the action and current snapshot; it may allow, deny, or require a new approval. Approved dispatch uses a durable intent record before the filesystem effect and a completion record after it; recovery observes the intent and the expected after-digest, never blindly replays an already-applied patch. This is idempotent at-least-once recovery, not an impossible cross-resource transaction.
+
+`TaskRepository` provides compare-and-set state transitions, transition intents, approval lookup/decision/execution marking, lease acquire/release, and recovery snapshots. Leases release on every terminal transition and on a waiting approval after the snapshot is saved. `AgentLoop` receives repository, policy, dispatcher, pipeline, parser, LLM, context builder, progress tracker, clock, and an audit sink through explicit constructor protocols. The injected audit sink redacts metadata from Task 8 onward; Task 9 supplies the JSONL implementation. Transition records contain digests and bounded redacted summaries, never complete prompts or model responses. Storage, verifier/tool availability, configuration, and permission failures are `BLOCKED`; unrecoverable internal consistency failures are `FAILED`.
+
 
 ## 14. Design Decisions Summary
 
