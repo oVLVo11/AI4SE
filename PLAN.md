@@ -7,7 +7,8 @@
 | 2 | Complete | `/root/task2_storage_memory` | Clean after fix round 1 | 64 passed; Ruff clean; two deferred minors: repository close/context-manager support and directory-prefix/validator-scope selector tests | `73261de`, `a606267` |
 | 3 | Complete | `/root/task3_policy` | Human ruling: SPEC §14.2 is binding for revalidation; clean after fix round 1 | 88 passed; 3 WinError-1314 symlink skips; Ruff clean; deferred Minor: threshold-boundary coverage | `7b570c2`, `422382f` |
 | 4 | Complete | `/root/task4_tools`, `/root/task4_fix_round4` | Clean after fix round 4 | 113 passed; 5 skipped; Ruff clean; portable POSIX syscall contract passed locally, while the POSIX rename/symlink end-to-end test was unavailable on the Windows host | `b7a5d6c`, `ae7785d`, `c20a668`, `14becd2`, `6eea0e9` |
-| 5–13 | Not started | — | — | — | — |
+| 5 | Complete | Initial implementer identity unavailable after context compaction; `/root/task5_fix1` (fix rounds) | `/root/task5_review`: clean after fix round 2 | 140 passed; 5 skipped; Ruff and diff-check clean | `411f7ae`, `ba45a82`, `f5e8145` |
+| 6–13 | Not started | — | — | — | — |
 
 # PyQuality Harness Implementation Plan
 
