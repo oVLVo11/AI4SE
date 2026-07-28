@@ -79,10 +79,10 @@ class Settings(PublicModel):
 
     @model_validator(mode="after")
     def validate_secure_values(self) -> Settings:
-        _validate_pytest_args(self.pytest_args)
-        _validate_ruff_args(self.ruff_args)
+        _validate_pytest_args(self.pytest_args, self.max_config_pattern_bytes)
+        _validate_ruff_args(self.ruff_args, self.max_config_pattern_bytes)
         for path in self.exclusions:
-            _validate_relative_path(path)
+            _validate_relative_path(path, self.max_config_pattern_bytes)
         if not self.denied_actions or not self.redaction_patterns:
             raise ValueError("denied actions and redaction patterns must not be empty")
         if len(self.redaction_patterns) > self.max_config_patterns:
@@ -181,7 +181,7 @@ def _matches_type(value: object, annotation: object) -> bool:
     return True
 
 
-def _validate_pytest_args(arguments: tuple[str, ...]) -> None:
+def _validate_pytest_args(arguments: tuple[str, ...], max_path_bytes: int) -> None:
     index = 0
     while index < len(arguments):
         argument = arguments[index]
@@ -192,11 +192,11 @@ def _validate_pytest_args(arguments: tuple[str, ...]) -> None:
                 raise ValueError("pytest -k requires a safe expression")
             index += 2
         else:
-            _validate_relative_path(argument)
+            _validate_relative_path(argument, max_path_bytes)
             index += 1
 
 
-def _validate_ruff_args(arguments: tuple[str, ...]) -> None:
+def _validate_ruff_args(arguments: tuple[str, ...], max_path_bytes: int) -> None:
     index = 0
     while index < len(arguments):
         argument = arguments[index]
@@ -209,7 +209,7 @@ def _validate_ruff_args(arguments: tuple[str, ...]) -> None:
                 raise ValueError("Ruff output format must be text")
             index += 2
         else:
-            _validate_relative_path(argument)
+            _validate_relative_path(argument, max_path_bytes)
             index += 1
 
 
@@ -217,9 +217,11 @@ def _safe_expression(value: str) -> bool:
     return bool(value.strip()) and not any(token in value for token in _SHELL_TOKENS)
 
 
-def _validate_relative_path(value: str) -> None:
+def _validate_relative_path(value: str, max_path_bytes: int = MAX_CONFIG_PATTERN_BYTES) -> None:
     if not value or any(token in value for token in _SHELL_TOKENS) or "\\" in value:
         raise ValueError("path must be repository-relative POSIX text")
     path = PurePosixPath(value)
     if value.startswith("-") or path.is_absolute() or ".." in path.parts:
         raise ValueError("path must be repository-relative POSIX text")
+    if len(value.encode("utf-8")) > max_path_bytes:
+        raise ValueError("path exceeds configured byte limit")

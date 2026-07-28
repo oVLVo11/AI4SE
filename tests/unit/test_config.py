@@ -111,3 +111,21 @@ def test_repository_can_only_lower_a_byte_cap(tmp_path: Path) -> None:
 
     with pytest.raises(ConfigError, match="cannot widen"):
         load_settings(tmp_path, None)
+
+
+@pytest.mark.parametrize(
+    "field, value",
+    [
+        ("exclusions", '["ééééééééé"]'),
+        ("pytest_args", '["ééééééééé"]'),
+        ("ruff_args", '["ééééééééé"]'),
+    ],
+)
+def test_lowered_path_cap_rejects_config_paths(tmp_path: Path, field: str, value: str) -> None:
+    """Skipping the configured UTF-8 path cap would admit oversized path inputs."""
+    (tmp_path / "pyquality.toml").write_text("max_config_pattern_bytes = 16\n", encoding="utf-8")
+    user_file = tmp_path / "user.toml"
+    user_file.write_text(f"{field} = {value}\n", encoding="utf-8")
+
+    with pytest.raises(ConfigError, match="invalid configuration"):
+        load_settings(tmp_path, user_file)
