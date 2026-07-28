@@ -2,7 +2,7 @@
 
 | Task | Status | Implementing agent | Spec review | Quality review | Commit |
 | --- | --- | --- | --- | --- | --- |
-| 0 | Fix round 1 in progress | `/root/task0_docs_coldstart`, `/root/task0_docs_coldstart/coldstart_validator` | Cold-start feedback incorporated; re-review pending | Documentation contract checks pending | `2fdb099`, `b5cdd29`; fix-round commit pending |
+| 0 | Complete | `/root/task0_docs_coldstart`, `/root/task0_docs_coldstart/coldstart_validator` | Clean re-review | Documentation contract checks clean | `2fdb099`, `b5cdd29`, `efc73b3` |
 | 1–13 | Not started | — | — | — | — |
 
 # PyQuality Harness Implementation Plan
