@@ -3,7 +3,8 @@
 | Task | Status | Implementing agent | Spec review | Quality review | Commit |
 | --- | --- | --- | --- | --- | --- |
 | 0 | Complete | `/root/task0_docs_coldstart`, `/root/task0_docs_coldstart/coldstart_validator` | Clean re-review | Documentation contract checks clean | `2fdb099`, `b5cdd29`, `efc73b3` |
-| 1–13 | Not started | — | — | — | — |
+| 1 | Complete | `/root/task1_domain_config` | Clean after fix round 3 | 47 passed; Ruff clean | `297d277`, `6df8353`, `a3908f9`, `920983e`, `a200b8b` |
+| 2–13 | Not started | — | — | — | — |
 
 # PyQuality Harness Implementation Plan
 

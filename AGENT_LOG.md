@@ -23,3 +23,7 @@ Fresh validator `/root/task0_docs_coldstart/coldstart_validator` (`gpt-5.6-sol`)
 ## 2026-07-28 — Task 0 clean re-review
 
 The Task 0 fix-round re-review is clean. The required placeholder scan returned zero matches; root `SPEC.md` and `PLAN.md` matched their corrected canonical counterparts; and `git diff --check` returned no errors. The completed Task 0 documentation commits are `2fdb099`, `b5cdd29`, and `efc73b3`.
+
+## 2026-07-28 Task 1 implementation and review fixes
+
+Agent `/root/task1_domain_config` implemented the typed package foundation and secure configuration in `297d277`, then addressed the review rounds in `6df8353` (public bounds and strict TOML types), `a3908f9` (real discriminated action union with compatibility accessors), `920983e` (contextual lowered Settings caps), and `a200b8b` (lowered configuration path caps). Each fix used focused RED-to-GREEN tests. The final Task 1 suite reported 47 passed and Ruff clean; the Task 1 spec and quality re-review is clean after fix round 3.
