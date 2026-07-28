@@ -327,11 +327,22 @@ class ToolDispatcher:
         self._commit_observer = commit_observer or _NoopCommitObserver()
 
     def dispatch(
-        self, action: Action, decision: PolicyDecision, current_snapshot_digest: str
+        self,
+        action: Action,
+        decision: PolicyDecision,
+        current_snapshot_digest: str,
+        *,
+        approved: bool = False,
     ) -> ToolResult:
         """Revalidate *decision* immediately before performing the requested effect."""
         refreshed = self._policy.revalidate(decision, action, current_snapshot_digest)
-        if refreshed.outcome is not PolicyOutcome.ALLOW:
+        if refreshed.outcome is not PolicyOutcome.ALLOW and not (
+            approved
+            and decision.outcome is PolicyOutcome.REQUIRE_APPROVAL
+            and refreshed.outcome is PolicyOutcome.REQUIRE_APPROVAL
+            and refreshed.matched_rule == decision.matched_rule
+            and refreshed.impact_summary == decision.impact_summary
+        ):
             return _result(action.kind, "policy_denied")
         if action.kind == "read_file":
             return self._read_file(str(action.arguments["path"]))
@@ -342,6 +353,52 @@ class ToolDispatcher:
         if action.kind == "apply_patch":
             return self._apply_patch(str(action.arguments["patch"]))
         return _result(action.kind, "unsupported_action")
+
+    def expected_after_digests(self, action: Action) -> dict[str, str | None] | None:
+        """Prepare a patch without applying it and return its durable recovery evidence."""
+        if action.kind != "apply_patch":
+            return {}
+        patch = parse_validated_patch(str(action.arguments["patch"]))
+        if patch is None:
+            return None
+        pinned = self._acquire_parent_pins(patch)
+        if pinned is None:
+            return None
+        pins, targets = pinned
+        try:
+            prepared, error = self._prepare_patch(patch, targets)
+            if error is not None or prepared is None:
+                return None
+            return {
+                item.patch.path: _digest(item.new_content)
+                if item.new_content is not None
+                else None
+                for item in prepared
+            }
+        finally:
+            for pin in reversed(pins):
+                pin.close()
+
+    def matches_expected_after_digests(
+        self, expected_after_digests: dict[str, str | None]
+    ) -> bool:
+        """Return whether every expected post-effect path matches its saved evidence."""
+        for raw_path, expected_digest in expected_after_digests.items():
+            target = self._patch_target(raw_path)
+            if target is None:
+                return False
+            try:
+                if expected_digest is None:
+                    if target.exists() or target.is_symlink():
+                        return False
+                    continue
+                if target.is_symlink() or not target.is_file():
+                    return False
+                if _digest(target.read_bytes()) != expected_digest:
+                    return False
+            except OSError:
+                return False
+        return True
 
     def _read_file(self, raw_path: str) -> ToolResult:
         target = self._existing_file(raw_path)

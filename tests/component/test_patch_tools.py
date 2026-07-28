@@ -33,6 +33,59 @@ def _dispatch(repo: Path, action: Action):
     return _dispatcher(repo).dispatch(action, decision, decision.repository_snapshot_digest)
 
 
+def test_patch_recovery_evidence_distinguishes_applied_effect_from_safe_replay(
+    repo: Path,
+) -> None:
+    """Missing pre-effect evidence would force recovery to replay an already-applied patch."""
+    action = _action(
+        """--- a/a.py
++++ b/a.py
+@@ -1,2 +1,2 @@
+ context
+-old
++new
+"""
+    )
+    dispatcher = _dispatcher(repo)
+
+    expected = dispatcher.expected_after_digests(action)
+    decision = PolicyEngine(repo).evaluate(action)
+    result = dispatcher.dispatch(action, decision, decision.repository_snapshot_digest)
+
+    expected_bytes = f"context{os.linesep}new{os.linesep}".encode()
+    assert expected == {"a.py": hashlib.sha256(expected_bytes).hexdigest()}
+    assert result.ok is True
+    assert dispatcher.matches_expected_after_digests(expected) is True
+
+
+def test_patch_recovery_evidence_represents_an_expected_deletion(repo: Path) -> None:
+    """Treating deletion as an empty digest would not prove that the file is absent."""
+    action = _action(
+        """--- a/a.py
++++ /dev/null
+@@ -1,2 +0,0 @@
+-context
+-old
+"""
+    )
+    dispatcher = _dispatcher(repo)
+
+    expected = dispatcher.expected_after_digests(action)
+    decision = PolicyEngine(repo).evaluate(action)
+    denied = dispatcher.dispatch(action, decision, decision.repository_snapshot_digest)
+    result = dispatcher.dispatch(
+        action,
+        decision,
+        decision.repository_snapshot_digest,
+        approved=True,
+    )
+
+    assert expected == {"a.py": None}
+    assert denied.code == "policy_denied"
+    assert result.ok is True
+    assert dispatcher.matches_expected_after_digests(expected) is True
+
+
 class _AllowPolicy:
     """Approval-aware policy stand-in: task 8 will supply an equivalent boundary."""
 

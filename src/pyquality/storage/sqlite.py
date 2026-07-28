@@ -53,6 +53,7 @@ class IterationRecord(_StorageRecord):
     tool_result_digest: str | None
     fingerprint: str | None
     relevant_digest: str | None
+    quality_outcome: Literal["passed", "failed", "blocked", "not_run"] | None = None
     created_at: datetime
 
 
@@ -197,6 +198,7 @@ class SQLiteTaskRepository:
         tool_result_digest: str | None = None,
         fingerprint: str | None = None,
         relevant_digest: str | None = None,
+        quality_outcome: Literal["passed", "failed", "blocked", "not_run"] | None = None,
         findings: tuple[Finding, ...] = (),
     ) -> IterationRecord:
         iteration_id = _new_id()
@@ -208,8 +210,8 @@ class SQLiteTaskRepository:
                 connection.execute(
                     """INSERT INTO iterations
                        (id, task_id, sequence, context_digest, action_json, policy_outcome,
-                        tool_result_digest, fingerprint, relevant_digest, created_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        tool_result_digest, fingerprint, relevant_digest, quality_outcome, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         iteration_id,
                         task_id,
@@ -220,6 +222,7 @@ class SQLiteTaskRepository:
                         tool_result_digest,
                         fingerprint,
                         relevant_digest,
+                        quality_outcome,
                         _dump_datetime(created_at),
                     ),
                 )
@@ -248,6 +251,7 @@ class SQLiteTaskRepository:
             tool_result_digest=tool_result_digest,
             fingerprint=fingerprint,
             relevant_digest=relevant_digest,
+            quality_outcome=quality_outcome,
             created_at=created_at,
         )
 
@@ -280,6 +284,75 @@ class SQLiteTaskRepository:
             if new in _TERMINAL_STATUSES or new is TaskStatus.WAITING_APPROVAL:
                 connection.execute("DELETE FROM project_leases WHERE task_id = ?", (task_id,))
         return True
+
+    def complete_iteration_outcome(
+        self,
+        task_id: str,
+        iteration_id: str,
+        *,
+        tool_result_digest: str,
+        fingerprint: str | None,
+        relevant_digest: str | None,
+        quality_outcome: Literal["passed", "failed", "blocked", "not_run"],
+        findings: tuple[Finding, ...] = (),
+    ) -> IterationRecord:
+        _require_digest(tool_result_digest, "tool_result_digest")
+        if fingerprint is not None:
+            _require_digest(fingerprint, "fingerprint")
+        if relevant_digest is not None:
+            _require_digest(relevant_digest, "relevant_digest")
+        expected_findings = tuple(
+            _canonical_json(finding.model_dump(mode="json")) for finding in findings
+        )
+        with self._transaction() as connection:
+            row = self._require_iteration(connection, task_id, iteration_id)
+            self._require_running_lease(connection, task_id)
+            existing_findings = tuple(
+                item["payload_json"]
+                for item in connection.execute(
+                    "SELECT payload_json FROM findings WHERE iteration_id = ? ORDER BY created_at, id",
+                    (iteration_id,),
+                )
+            )
+            existing = (
+                row["tool_result_digest"],
+                row["fingerprint"],
+                row["relevant_digest"],
+                row["quality_outcome"],
+                existing_findings,
+            )
+            proposed = (
+                tool_result_digest,
+                fingerprint,
+                relevant_digest,
+                quality_outcome,
+                expected_findings,
+            )
+            if any(value is not None for value in existing[:4]) or existing_findings:
+                if existing != proposed:
+                    raise StorageStateError("iteration outcome is already completed")
+                return _iteration_from_row(row)
+            connection.execute(
+                """UPDATE iterations
+                   SET tool_result_digest = ?, fingerprint = ?, relevant_digest = ?,
+                       quality_outcome = ? WHERE id = ? AND task_id = ?""",
+                (
+                    tool_result_digest,
+                    fingerprint,
+                    relevant_digest,
+                    quality_outcome,
+                    iteration_id,
+                    task_id,
+                ),
+            )
+            for payload in expected_findings:
+                connection.execute(
+                    """INSERT INTO findings
+                       (id, iteration_id, payload_json, created_at, resolved_at)
+                       VALUES (?, ?, ?, ?, NULL)""",
+                    (_new_id(), iteration_id, payload, _dump_datetime(_utc_now())),
+                )
+        return self._iteration_by_id(iteration_id)
 
     def record_approval(
         self,
@@ -342,6 +415,31 @@ class SQLiteTaskRepository:
             connection.execute(
                 "UPDATE approvals SET decision = ?, decided_at = ? WHERE id = ?",
                 (decision.value, _dump_datetime(decided_at), approval_id),
+            )
+        return self._approval_by_id(approval_id)
+
+    def decide_approval_and_resume(
+        self, approval_id: str, decision: ApprovalDecision
+    ) -> ApprovalRecord:
+        """Atomically consume one waiting approval and return its task to RUNNING."""
+        decided_at = _utc_now()
+        with self._transaction() as connection:
+            row = self._require_approval(connection, approval_id)
+            task = self._require_task(connection, row["task_id"])
+            if row["decision"] is not None or task["status"] != TaskStatus.WAITING_APPROVAL.value:
+                raise StorageStateError("approval cannot be decided")
+            connection.execute(
+                "UPDATE approvals SET decision = ?, decided_at = ? WHERE id = ?",
+                (decision.value, _dump_datetime(decided_at), approval_id),
+            )
+            connection.execute(
+                """UPDATE tasks SET status = ?, result_json = NULL
+                   WHERE id = ? AND status = ?""",
+                (
+                    TaskStatus.RUNNING.value,
+                    row["task_id"],
+                    TaskStatus.WAITING_APPROVAL.value,
+                ),
             )
         return self._approval_by_id(approval_id)
 
@@ -656,6 +754,7 @@ class SQLiteTaskRepository:
                 tool_result_digest TEXT,
                 fingerprint TEXT,
                 relevant_digest TEXT,
+                quality_outcome TEXT,
                 created_at TEXT NOT NULL,
                 UNIQUE(task_id, sequence)
             );
@@ -723,6 +822,7 @@ class SQLiteTaskRepository:
             "approvals", "expected_after_digests_json", "TEXT NOT NULL DEFAULT '{}'"
         )
         self._ensure_column("approvals", "result_digest", "TEXT")
+        self._ensure_column("iterations", "quality_outcome", "TEXT")
 
     def _ensure_column(self, table: str, column: str, declaration: str) -> None:
         columns = {
@@ -782,6 +882,14 @@ class SQLiteTaskRepository:
             raise StorageStateError("approval does not exist")
         return _approval_from_row(row)
 
+    def _iteration_by_id(self, iteration_id: str) -> IterationRecord:
+        row = self._connection.execute(
+            "SELECT * FROM iterations WHERE id = ?", (iteration_id,)
+        ).fetchone()
+        if row is None:
+            raise StorageStateError("iteration does not exist")
+        return _iteration_from_row(row)
+
     def _transition_intent_by_id(self, intent_id: str) -> TransitionIntentRecord:
         row = self._connection.execute(
             "SELECT * FROM transition_intents WHERE id = ?", (intent_id,)
@@ -835,6 +943,7 @@ def _iteration_from_row(row: sqlite3.Row) -> IterationRecord:
         tool_result_digest=row["tool_result_digest"],
         fingerprint=row["fingerprint"],
         relevant_digest=row["relevant_digest"],
+        quality_outcome=row["quality_outcome"],
         created_at=_load_datetime(row["created_at"]),
     )
 

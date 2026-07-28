@@ -349,3 +349,50 @@ def test_transition_intent_evidence_survives_reopen_and_completion(tmp_path: Pat
     assert completed.state == "completed"
     assert completed.result_digest == "b" * 64
     assert completed.completion_summary == "response persisted"
+
+
+def test_deferred_approval_outcome_completes_original_iteration_idempotently(
+    tmp_path: Path,
+) -> None:
+    """Appending a second round or duplicating findings would corrupt approval recovery."""
+    db_path = tmp_path / "state.sqlite"
+    repo = SQLiteTaskRepository(db_path)
+    task = repo.create_task("C:/work/demo", "fix sum", round_limit=8)
+    _start(repo, task.id)
+    assert repo.acquire_project_lease(task.id) is True
+    iteration = repo.append_iteration(task.id, sequence=1, context_digest="a" * 64)
+    finding = Finding(
+        source="pytest",
+        category="assertion",
+        severity="error",
+        path="tests/test_demo.py",
+        line=3,
+        summary="still failing",
+        evidence="assert 0 == 1",
+        group_key="pytest:assertion:demo:3",
+    )
+
+    completed = repo.complete_iteration_outcome(
+        task.id,
+        iteration.id,
+        tool_result_digest="b" * 64,
+        fingerprint="c" * 64,
+        relevant_digest="d" * 64,
+        quality_outcome="failed",
+        findings=(finding,),
+    )
+    repeated = repo.complete_iteration_outcome(
+        task.id,
+        iteration.id,
+        tool_result_digest="b" * 64,
+        fingerprint="c" * 64,
+        relevant_digest="d" * 64,
+        quality_outcome="failed",
+        findings=(finding,),
+    )
+    reopened = SQLiteTaskRepository(db_path).resume_snapshot(task.id)
+
+    assert completed == repeated
+    assert len(reopened.iterations) == 1
+    assert reopened.iterations[0].quality_outcome == "failed"
+    assert tuple(record.finding for record in reopened.findings) == (finding,)
