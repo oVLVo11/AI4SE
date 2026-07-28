@@ -5,9 +5,11 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Sequence
+from contextvars import ContextVar
 from datetime import datetime
 from pathlib import Path
 from typing import Protocol
+from uuid import uuid4
 
 from pyquality.context import ContextBuilder, ContextInput
 from pyquality.domain.models import (
@@ -129,41 +131,65 @@ class AgentLoop:
         self._feedback_composer = FeedbackComposer()
         self._feedback: dict[str, FeedbackPacket] = {}
         self._changed_paths: dict[str, set[str]] = {}
+        self._owner_context: ContextVar[str | None] = ContextVar(
+            "pyquality_loop_owner", default=None
+        )
+        self._cycle_intents: ContextVar[tuple[str, ...]] = ContextVar(
+            "pyquality_cycle_intents", default=()
+        )
 
     def run(self, task_id: str) -> TaskResult:
-        try:
-            snapshot = self._repository.resume_snapshot(task_id)
-            if snapshot.task.status in _TERMINAL:
-                return self._saved_result(snapshot)
-            if snapshot.task.status is TaskStatus.WAITING_APPROVAL:
-                return self._waiting_result(snapshot)
-            if snapshot.task.status is TaskStatus.CREATED and not self._repository.set_status(
-                task_id, TaskStatus.CREATED, TaskStatus.RUNNING
-            ):
-                return self.resume(task_id)
-            if not self._repository.acquire_project_lease(task_id):
-                return self._terminal(task_id, TaskStatus.BLOCKED, "Repository is busy.")
-            return self._drive(task_id)
-        except (OSError, PermissionError, StorageStateError) as error:
-            return self._blocked_if_possible(task_id, error)
+        return self._owned_call(task_id, resume=False)
 
     def resume(self, task_id: str) -> TaskResult:
+        return self._owned_call(task_id, resume=True)
+
+    def _owned_call(self, task_id: str, *, resume: bool) -> TaskResult:
+        owner_token = uuid4().hex
+        context_token = self._owner_context.set(owner_token)
+        cycle_token = self._cycle_intents.set(())
+        acquired = False
         try:
             snapshot = self._repository.resume_snapshot(task_id)
             if snapshot.task.status in _TERMINAL:
                 return self._saved_result(snapshot)
-            if snapshot.task.status is TaskStatus.CREATED:
-                return self.run(task_id)
             if snapshot.task.status is TaskStatus.WAITING_APPROVAL:
                 return self._waiting_result(snapshot)
-            if not self._repository.acquire_project_lease(task_id):
-                return self._terminal(task_id, TaskStatus.BLOCKED, "Repository is busy.")
-            recovered = self._recover_decided_approval(task_id)
-            if recovered is not None:
-                return recovered
+            if snapshot.task.status is TaskStatus.CREATED:
+                if resume:
+                    resume = False
+                if not self._repository.set_status(
+                    task_id, TaskStatus.CREATED, TaskStatus.RUNNING
+                ):
+                    return self._owned_call(task_id, resume=True)
+            acquired = self._repository.acquire_project_lease(
+                task_id, owner_token=owner_token
+            )
+            if not acquired:
+                return self._make_result(
+                    task_id, TaskStatus.BLOCKED, "Repository is busy."
+                )
+            if resume:
+                recovered = self._recover_decided_approval(task_id)
+                if recovered is not None:
+                    return recovered
             return self._drive(task_id)
-        except (OSError, PermissionError, StorageStateError) as error:
-            return self._blocked_if_possible(task_id, error)
+        except (OSError, PermissionError) as error:
+            return self._blocked_if_possible(task_id, error) if acquired else self._make_result(
+                task_id, TaskStatus.BLOCKED, f"Execution blocked: {type(error).__name__}."
+            )
+        except Exception as error:  # noqa: BLE001 - injected components share no base.
+            return self._failed_if_possible(task_id, error, acquired=acquired)
+        finally:
+            if acquired:
+                try:
+                    self._repository.release_project_lease(
+                        task_id, owner_token=owner_token
+                    )
+                except Exception as release_error:  # noqa: BLE001
+                    _ = release_error
+            self._cycle_intents.reset(cycle_token)
+            self._owner_context.reset(context_token)
 
     def pending_approval(self, task_id: str) -> Approval:
         approval = self._repository.pending_approval(task_id)
@@ -174,7 +200,7 @@ class AgentLoop:
     def decide_approval(self, approval_id: str, decision: ApprovalDecision) -> None:
         try:
             approval = self._repository.decide_approval_and_resume(approval_id, decision)
-            self._audit(
+            self._audit_after_commit(
                 "approval_decided",
                 approval.task_id,
                 {"approval_id": approval.id, "decision": decision.value},
@@ -183,8 +209,6 @@ class AgentLoop:
             raise ApprovalStateError("approval cannot be decided") from error
 
     def _drive(self, task_id: str) -> TaskResult:
-        repair_attempts = 0
-        repair_messages: tuple[Message, ...] = ()
         while True:
             snapshot = self._repository.resume_snapshot(task_id)
             if snapshot.task.status in _TERMINAL:
@@ -193,44 +217,87 @@ class AgentLoop:
             if stop is not None:
                 return stop
 
+            repair_attempts = _trailing_invalid_rounds(snapshot)
+            repair_messages: tuple[Message, ...] = (
+                (Message(role="user", content=_REPAIR_MESSAGE),)
+                if repair_attempts
+                else ()
+            )
             messages = self._build_messages(snapshot) + repair_messages
             context_digest = _digest_messages(messages)
-            intent = self._begin_transition(
-                task_id, "model_call", context_digest, "bounded context prepared"
-            )
-            try:
-                raw = self._llm.complete(messages)
-            except ProviderError as error:
-                return self._terminal(task_id, TaskStatus.BLOCKED, str(error))
-            except RuntimeError as error:
-                return self._terminal(
-                    task_id,
-                    TaskStatus.FAILED,
-                    f"Model client consistency failure: {type(error).__name__}.",
+            recovered = self._recover_transition(task_id, "model_call", context_digest)
+            intent: TransitionIntentRecord
+            if recovered is None:
+                intent = self._begin_transition(
+                    task_id, "model_call", context_digest, "bounded context prepared"
                 )
-            self._complete_transition(
-                intent, _digest_text(raw), "model response persisted", "model_call_completed"
-            )
+                try:
+                    raw = self._llm.complete(messages)
+                except ProviderError as error:
+                    return self._terminal(task_id, TaskStatus.BLOCKED, str(error))
+                except RuntimeError as error:
+                    return self._terminal(
+                        task_id,
+                        TaskStatus.FAILED,
+                        f"Model client consistency failure: {type(error).__name__}.",
+                    )
+                try:
+                    action = self._parser.parse(raw)
+                except ActionFormatError:
+                    action = None
+                payload: dict[str, object] = (
+                    {"outcome": "invalid"}
+                    if action is None
+                    else {
+                        "outcome": "action",
+                        "action": action.model_dump(mode="json"),
+                    }
+                )
+                self._complete_transition(
+                    intent,
+                    _digest_text(raw),
+                    "normalized model result persisted",
+                    "model_call_completed",
+                    payload=payload,
+                )
+            else:
+                intent = recovered
+                payload = intent.result_payload or {}
+                action = _action_from_transition_payload(payload)
 
+            self._cycle_intents.set((intent.id,))
             sequence = len(snapshot.iterations) + 1
-            try:
-                action = self._parser.parse(raw)
-            except ActionFormatError:
+            if action is None:
                 self._repository.append_iteration(
-                    task_id, sequence=sequence, context_digest=context_digest
+                    task_id,
+                    sequence=sequence,
+                    context_digest=context_digest,
+                    source_intent_ids=self._cycle_intents.get(),
+                    owner_token=self._owner(),
                 )
-                repair_attempts += 1
+                repair_attempts = _trailing_invalid_rounds(
+                    self._repository.resume_snapshot(task_id)
+                )
                 if repair_attempts > 2:
                     return self._terminal(
                         task_id,
                         TaskStatus.FAILED,
                         "Model response remained invalid after two schema repairs.",
                     )
-                repair_messages = (Message(role="user", content=_REPAIR_MESSAGE),)
                 continue
 
-            repair_attempts = 0
-            repair_messages = ()
+            if self._deadline_reached(self._repository.resume_snapshot(task_id)):
+                self._repository.append_iteration(
+                    task_id,
+                    sequence=sequence,
+                    context_digest=context_digest,
+                    action_json=_canonical(action.model_dump(mode="json")),
+                    source_intent_ids=self._cycle_intents.get(),
+                    owner_token=self._owner(),
+                )
+                return self._terminal(
+                    task_id, TaskStatus.BUDGET_EXHAUSTED, "Deadline exhausted."
+                )
             cycle = self._execute_action(task_id, snapshot, sequence, context_digest, action)
             if cycle is not None:
                 return cycle
@@ -244,16 +311,7 @@ class AgentLoop:
         action: Action,
     ) -> TaskResult | None:
         action_json = _canonical(action.model_dump(mode="json"))
-        policy_intent = self._begin_transition(
-            task_id, "policy", _digest_text(action_json), "normalized action ready"
-        )
-        decision = self._policy.evaluate(action)
-        self._complete_transition(
-            policy_intent,
-            _digest_model(decision),
-            f"policy outcome {decision.outcome.value}",
-            "policy_completed",
-        )
+        decision = self._policy_decision(task_id, action_json, action)
         if decision.outcome is PolicyOutcome.DENY:
             finding = _harness_finding(
                 "policy denied action", decision.impact_summary, f"policy:{decision.matched_rule}"
@@ -270,29 +328,26 @@ class AgentLoop:
             return self._stop_after_cycle(task_id)
 
         if decision.outcome is PolicyOutcome.REQUIRE_APPROVAL:
-            iteration = self._append_cycle(
-                task_id, sequence, context_digest, action_json, decision
-            )
-            self._repository.record_approval(
-                task_id,
-                iteration.id,
-                action_json,
-                decision.action_digest,
-                decision.repository_snapshot_digest,
-                policy_decision=decision,
-            )
             waiting = self._make_result(
                 task_id,
                 TaskStatus.WAITING_APPROVAL,
                 "Action requires explicit approval.",
+            ).model_copy(update={"iterations": sequence})
+            self._repository.request_approval_round_and_wait(
+                task_id,
+                sequence,
+                context_digest,
+                action_json,
+                decision.action_digest,
+                decision.repository_snapshot_digest,
+                policy_decision=decision,
+                waiting_result=waiting,
+                source_intent_ids=self._cycle_intents.get(),
+                owner_token=self._owner(),
             )
-            if not self._repository.set_status(
-                task_id, TaskStatus.RUNNING, TaskStatus.WAITING_APPROVAL, waiting
-            ):
-                return self._terminal(
-                    task_id, TaskStatus.FAILED, "Approval transition lost compare-and-set."
-                )
-            self._audit("approval_requested", task_id, {"action_digest": decision.action_digest})
+            self._audit_after_commit(
+                "approval_requested", task_id, {"action_digest": decision.action_digest}
+            )
             return waiting
 
         if action.kind in {"finish", "run_quality"}:
@@ -396,9 +451,28 @@ class AgentLoop:
                 "The proposed action was rejected by user.",
                 f"approval:rejected:{approval.action_digest}",
             )
+            if approval.execution_state == "completed":
+                persisted = tuple(
+                    item.finding
+                    for item in snapshot.findings
+                    if item.iteration_id == approval.iteration_id
+                    and item.finding.group_key == finding.group_key
+                )
+                if len(persisted) != 1:
+                    return self._terminal(
+                        task_id,
+                        TaskStatus.FAILED,
+                        "Completed rejection feedback is inconsistent.",
+                    )
+                self._feedback[task_id] = self._compose(persisted)
+                return None
             self._feedback[task_id] = self._compose((finding,))
-            self._repository.mark_rejection_consumed(approval.id)
-            self._audit("approval_rejection_consumed", task_id, {"approval_id": approval.id})
+            self._repository.mark_rejection_consumed(
+                approval.id, finding=finding, owner_token=self._owner()
+            )
+            self._audit_after_commit(
+                "approval_rejection_consumed", task_id, {"approval_id": approval.id}
+            )
             return None
         if approval.decision is not ApprovalDecision.APPROVE:
             return self._terminal(task_id, TaskStatus.FAILED, "Approval recovery is inconsistent.")
@@ -436,19 +510,55 @@ class AgentLoop:
             )
         if (
             approval.execution_state == "intent_recorded"
+            and iteration.quality_outcome in {"passed", "failed", "blocked"}
+        ):
+            self._repository.mark_execution_completed(
+                approval.id,
+                result_digest=iteration.tool_result_digest,
+                owner_token=self._owner(),
+            )
+            if iteration.quality_outcome == "blocked":
+                return self._terminal(
+                    task_id, TaskStatus.BLOCKED, "Persisted verifier result is blocked."
+                )
+            if iteration.quality_outcome == "passed":
+                return self._terminal(
+                    task_id, TaskStatus.SUCCEEDED, "Full verification passed."
+                )
+            findings = tuple(
+                item.finding
+                for item in snapshot.findings
+                if item.iteration_id == iteration.id
+            )
+            if not findings:
+                return self._terminal(
+                    task_id,
+                    TaskStatus.FAILED,
+                    "Persisted failed verifier result has no findings.",
+                )
+            self._feedback[task_id] = self._compose(findings)
+            return None
+        if (
+            approval.execution_state == "intent_recorded"
             and iteration.quality_outcome == "not_run"
         ):
             self._repository.mark_execution_completed(
-                approval.id, result_digest=iteration.tool_result_digest
+                approval.id,
+                result_digest=iteration.tool_result_digest,
+                owner_token=self._owner(),
             )
             if any(item.iteration_id == iteration.id for item in snapshot.findings):
                 return self._terminal(
                     task_id, TaskStatus.BLOCKED, "Approved effect failed before verification."
                 )
             return None
-        if approval.execution_state == "intent_recorded" and (
+        if (
+            approval.execution_state == "intent_recorded"
+            and bool(approval.expected_after_digests)
+            and (
             self._dispatcher.matches_expected_after_digests(
                 approval.expected_after_digests
+            )
             )
         ):
             recovered = _recovered_tool_result(action, approval.expected_after_digests)
@@ -468,31 +578,15 @@ class AgentLoop:
             refreshed.matched_rule != saved.matched_rule
             or refreshed.impact_summary != saved.impact_summary
         ):
-            self._repository.mark_execution_intent(approval.id, expected_after_digests={})
-            self._repository.mark_execution_completed(
-                approval.id, result_digest=_digest_model(refreshed)
-            )
-            iteration = snapshot.iterations[-1]
-            self._repository.record_approval(
-                task_id,
-                iteration.id,
-                approval.action_json,
-                refreshed.action_digest,
-                refreshed.repository_snapshot_digest,
-                policy_decision=refreshed,
-            )
             waiting = self._make_result(
                 task_id, TaskStatus.WAITING_APPROVAL, "Policy changed; new approval required."
             )
-            transitioned = self._repository.set_status(
-                task_id, TaskStatus.RUNNING, TaskStatus.WAITING_APPROVAL, waiting
+            self._repository.replace_approval_and_wait(
+                approval.id,
+                refreshed,
+                waiting_result=waiting,
+                owner_token=self._owner(),
             )
-            if not transitioned:
-                return self._terminal(
-                    task_id,
-                    TaskStatus.FAILED,
-                    "Replacement approval transition lost compare-and-set.",
-                )
             return waiting
 
         if approval.execution_state == "intent_recorded":
@@ -510,7 +604,9 @@ class AgentLoop:
                     task_id, TaskStatus.BLOCKED, "Approved effect could not be prepared safely."
                 )
             self._repository.mark_execution_intent(
-                approval.id, expected_after_digests=expected
+                approval.id,
+                expected_after_digests=expected,
+                owner_token=self._owner(),
             )
 
         result = self._dispatch(task_id, action, saved, approved=True)
@@ -526,7 +622,9 @@ class AgentLoop:
                 task_id, approval, result, findings=(finding,)
             )
             self._repository.mark_execution_completed(
-                approval.id, result_digest=_digest_model(result)
+                approval.id,
+                result_digest=_digest_model(result),
+                owner_token=self._owner(),
             )
             return self._terminal(task_id, TaskStatus.BLOCKED, f"Approved effect failed: {result.code}")
         self._changed(task_id).update(result.changed_paths)
@@ -536,8 +634,12 @@ class AgentLoop:
             )
         self._persist_approved_tool_only(task_id, approval, result)
         self._repository.mark_execution_completed(
-            approval.id, result_digest=_digest_model(result)
+            approval.id,
+            result_digest=_digest_model(result),
+            owner_token=self._owner(),
         )
+        if result.output:
+            self._feedback[task_id] = _text_feedback(result.output)
         return None
 
     def _verify_approved_effect(
@@ -556,7 +658,9 @@ class AgentLoop:
             self._persist_approved_tool_only(task_id, approval, tool_result)
             if not already_completed:
                 self._repository.mark_execution_completed(
-                    approval.id, result_digest=_digest_model(tool_result)
+                    approval.id,
+                    result_digest=_digest_model(tool_result),
+                    owner_token=self._owner(),
                 )
             return self._terminal(
                 task_id, TaskStatus.BUDGET_EXHAUSTED, "Deadline exhausted."
@@ -575,7 +679,9 @@ class AgentLoop:
         self._persist_approved_outcome(task_id, approval, tool_result, report)
         if not already_completed:
             self._repository.mark_execution_completed(
-                approval.id, result_digest=_digest_model(tool_result)
+                approval.id,
+                result_digest=_digest_model(tool_result),
+                owner_token=self._owner(),
             )
         snapshot = self._repository.resume_snapshot(task_id)
         status = self._progress_tracker.decide(
@@ -614,6 +720,8 @@ class AgentLoop:
             relevant_digest=_relevant_digest(tool_result, report, previous),
             quality_outcome=_quality_outcome(report) or "failed",
             findings=report.findings,
+            source_intent_ids=self._cycle_intents.get(),
+            owner_token=self._owner(),
         )
 
     def _persist_approved_tool_only(
@@ -642,6 +750,8 @@ class AgentLoop:
             relevant_digest=previous,
             quality_outcome="not_run",
             findings=findings,
+            source_intent_ids=self._cycle_intents.get(),
+            owner_token=self._owner(),
         )
 
     def _quality_for_cycle(
@@ -729,11 +839,37 @@ class AgentLoop:
             self._feedback[task_id] = _text_feedback("Verification did not pass.")
         return None
 
+    def _policy_decision(
+        self, task_id: str, action_json: str, action: Action
+    ) -> PolicyDecision:
+        evidence = _digest_text(action_json)
+        recovered = self._recover_transition(task_id, "policy", evidence)
+        if recovered is not None:
+            self._remember_intent(recovered.id)
+            return _policy_from_transition(recovered)
+        intent = self._begin_transition(
+            task_id, "policy", evidence, "normalized action ready"
+        )
+        decision = self._policy.evaluate(action)
+        self._complete_transition(
+            intent,
+            _digest_model(decision),
+            f"policy outcome {decision.outcome.value}",
+            "policy_completed",
+            payload={"policy_decision": decision.model_dump(mode="json")},
+        )
+        self._remember_intent(intent.id)
+        return decision
+
     def _run_quality(self, task_id: str, changed_paths: set[Path]) -> QualityReport:
         snapshot = self._repository.resume_snapshot(task_id)
         if self._deadline_reached(snapshot):
             raise _DeadlineReached
         evidence = _digest_text(_canonical(sorted(path.as_posix() for path in changed_paths)))
+        recovered = self._recover_transition(task_id, "verifier", evidence)
+        if recovered is not None:
+            self._remember_intent(recovered.id)
+            return _quality_from_transition(recovered)
         intent = self._begin_transition(
             task_id, "verifier", evidence, "quality inputs persisted"
         )
@@ -742,8 +878,13 @@ class AgentLoop:
         except (FileNotFoundError, PermissionError, OSError) as error:
             raise _BlockedTransition(str(error)) from error
         self._complete_transition(
-            intent, _digest_model(report), "quality report persisted", "verifier_completed"
+            intent,
+            _digest_model(report),
+            "quality report persisted",
+            "verifier_completed",
+            payload={"quality_report": report.model_dump(mode="json")},
         )
+        self._remember_intent(intent.id)
         return report
 
     def _dispatch(
@@ -752,6 +893,12 @@ class AgentLoop:
         snapshot = self._repository.resume_snapshot(task_id)
         if self._deadline_reached(snapshot):
             return None
+        recovered = self._recover_transition(
+            task_id, "dispatch", decision.action_digest
+        )
+        if recovered is not None:
+            self._remember_intent(recovered.id)
+            return _tool_from_transition(recovered)
         intent = self._begin_transition(
             task_id, "dispatch", decision.action_digest, "dispatch authorized"
         )
@@ -762,8 +909,13 @@ class AgentLoop:
             approved=approved,
         )
         self._complete_transition(
-            intent, _digest_model(result), "tool result persisted", "dispatch_completed"
+            intent,
+            _digest_model(result),
+            "tool result persisted",
+            "dispatch_completed",
+            payload={"tool_result": result.model_dump(mode="json")},
         )
+        self._remember_intent(intent.id)
         return result
 
     def _append_cycle(
@@ -794,6 +946,8 @@ class AgentLoop:
             relevant_digest=relevant_digest,
             quality_outcome=_quality_outcome(report),
             findings=persisted_findings,
+            source_intent_ids=self._cycle_intents.get(),
+            owner_token=self._owner(),
         )
 
     def _stop_after_cycle(self, task_id: str) -> TaskResult | None:
@@ -847,6 +1001,22 @@ class AgentLoop:
             )
             if findings:
                 feedback = self._compose(findings)
+            elif snapshot.iterations:
+                tool_digest = snapshot.iterations[-1].tool_result_digest
+                recovered_tool = next(
+                    (
+                        intent
+                        for intent in reversed(snapshot.transition_intents)
+                        if intent.kind == "dispatch"
+                        and intent.result_digest == tool_digest
+                        and intent.result_payload is not None
+                    ),
+                    None,
+                )
+                if recovered_tool is not None:
+                    output = _tool_from_transition(recovered_tool).output
+                    if output:
+                        feedback = _text_feedback(output)
         return self._context_builder.build(
             ContextInput(task=snapshot.task.request, memory=memory, feedback=feedback)
         )
@@ -860,10 +1030,35 @@ class AgentLoop:
         self, task_id: str, kind: str, evidence_digest: str, summary: str
     ) -> TransitionIntentRecord:
         intent = self._repository.record_transition_intent(
-            task_id, kind=kind, evidence_digest=evidence_digest, summary=summary
+            task_id,
+            kind=kind,
+            evidence_digest=evidence_digest,
+            summary=summary,
+            owner_token=self._owner(),
         )
         self._audit(f"{kind}_started", task_id, {"intent_id": intent.id, "digest": evidence_digest})
         return intent
+
+    def _recover_transition(
+        self, task_id: str, kind: str, evidence_digest: str
+    ) -> TransitionIntentRecord | None:
+        snapshot = self._repository.resume_snapshot(task_id)
+        return next(
+            (
+                intent
+                for intent in snapshot.transition_intents
+                if intent.kind == kind
+                and intent.evidence_digest == evidence_digest
+                and intent.state == "completed"
+                and intent.consumed_at is None
+            ),
+            None,
+        )
+
+    def _remember_intent(self, intent_id: str) -> None:
+        current = self._cycle_intents.get()
+        if intent_id not in current:
+            self._cycle_intents.set((*current, intent_id))
 
     def _complete_transition(
         self,
@@ -871,9 +1066,15 @@ class AgentLoop:
         result_digest: str,
         summary: str,
         event_type: str,
+        *,
+        payload: dict[str, object] | None = None,
     ) -> None:
         self._repository.complete_transition_intent(
-            intent.id, result_digest=result_digest, summary=summary
+            intent.id,
+            result_digest=result_digest,
+            summary=summary,
+            result_payload=payload,
+            owner_token=self._owner(),
         )
         self._audit(event_type, intent.task_id, {"intent_id": intent.id, "digest": result_digest})
 
@@ -888,14 +1089,31 @@ class AgentLoop:
             )
         )
 
+    def _audit_after_commit(
+        self, event_type: str, task_id: str, metadata: dict[str, str]
+    ) -> None:
+        try:
+            self._audit(event_type, task_id, metadata)
+        except Exception as audit_error:  # noqa: BLE001
+            _ = audit_error
+
     def _terminal(self, task_id: str, status: TaskStatus, summary: str) -> TaskResult:
         result = self._make_result(task_id, status, summary)
-        if not self._repository.set_status(task_id, TaskStatus.RUNNING, status, result):
+        if not self._repository.set_status(
+            task_id,
+            TaskStatus.RUNNING,
+            status,
+            result,
+            owner_token=self._owner(),
+        ):
             snapshot = self._repository.resume_snapshot(task_id)
             if snapshot.task.status in _TERMINAL:
                 return self._saved_result(snapshot)
             raise StorageStateError("terminal compare-and-set failed")
-        self._audit("task_terminal", task_id, {"status": status.value})
+        try:
+            self._audit("task_terminal", task_id, {"status": status.value})
+        except Exception as audit_error:  # noqa: BLE001
+            _ = audit_error
         return result
 
     def _make_result(self, task_id: str, status: TaskStatus, summary: str) -> TaskResult:
@@ -923,7 +1141,24 @@ class AgentLoop:
         return snapshot.task.result
 
     def _changed(self, task_id: str) -> set[str]:
-        return self._changed_paths.setdefault(task_id, set())
+        if task_id not in self._changed_paths:
+            recovered: set[str] = set()
+            snapshot = self._repository.resume_snapshot(task_id)
+            for intent in snapshot.transition_intents:
+                if intent.kind != "dispatch" or intent.result_payload is None:
+                    continue
+                try:
+                    recovered.update(_tool_from_transition(intent).changed_paths)
+                except (StorageStateError, ValueError):
+                    continue
+            self._changed_paths[task_id] = recovered
+        return self._changed_paths[task_id]
+
+    def _owner(self) -> str:
+        owner_token = self._owner_context.get()
+        if owner_token is None:
+            raise StorageStateError("agent loop has no active lease owner")
+        return owner_token
 
     def _deadline_reached(self, snapshot: RecoverySnapshot) -> bool:
         return snapshot.task.deadline is not None and self._clock.now() >= snapshot.task.deadline
@@ -938,6 +1173,28 @@ class AgentLoop:
             return self._terminal(task_id, TaskStatus.BLOCKED, f"Execution blocked: {type(error).__name__}.")
         except (OSError, PermissionError, StorageStateError):
             raise error
+
+    def _failed_if_possible(
+        self, task_id: str, error: Exception, *, acquired: bool
+    ) -> TaskResult:
+        if not acquired:
+            return self._repository.fail_inconsistent_task(
+                task_id,
+                f"Internal consistency failure: {type(error).__name__}.",
+            )
+        try:
+            snapshot = self._repository.resume_snapshot(task_id)
+            if snapshot.task.status in _TERMINAL:
+                return self._saved_result(snapshot)
+            if snapshot.task.status is TaskStatus.WAITING_APPROVAL:
+                return self._waiting_result(snapshot)
+            return self._terminal(
+                task_id,
+                TaskStatus.FAILED,
+                f"Internal consistency failure: {type(error).__name__}.",
+            )
+        except Exception as recovery_error:
+            raise error from recovery_error
 
 
 class _DeadlineReached(RuntimeError):
@@ -990,8 +1247,8 @@ def _relevant_digest(
     if tool_result is None:
         return previous
     relevant = {
-        path: digest
-        for path, digest in tool_result.after_digests.items()
+        path: tool_result.after_digests.get(path)
+        for path in tool_result.changed_paths
         if path in report.changed_paths
     }
     return _digest_text(_canonical(relevant)) if relevant else previous
@@ -1035,6 +1292,45 @@ def _recovered_tool_result(
         },
         normalized_metadata={"code": "ok", "recovered": True},
     )
+
+
+def _action_from_transition_payload(payload: dict[str, object]) -> Action | None:
+    outcome = payload.get("outcome")
+    if outcome == "invalid":
+        return None
+    if outcome != "action" or "action" not in payload:
+        raise StorageStateError("persisted model transition payload is invalid")
+    return Action.model_validate(payload["action"])
+
+
+def _tool_from_transition(intent: TransitionIntentRecord) -> ToolResult:
+    payload = intent.result_payload or {}
+    if "tool_result" not in payload:
+        raise StorageStateError("persisted dispatch transition payload is invalid")
+    return ToolResult.model_validate(payload["tool_result"])
+
+
+def _quality_from_transition(intent: TransitionIntentRecord) -> QualityReport:
+    payload = intent.result_payload or {}
+    if "quality_report" not in payload:
+        raise StorageStateError("persisted verifier transition payload is invalid")
+    return QualityReport.model_validate(payload["quality_report"])
+
+
+def _policy_from_transition(intent: TransitionIntentRecord) -> PolicyDecision:
+    payload = intent.result_payload or {}
+    if "policy_decision" not in payload:
+        raise StorageStateError("persisted policy transition payload is invalid")
+    return PolicyDecision.model_validate(payload["policy_decision"])
+
+
+def _trailing_invalid_rounds(snapshot: RecoverySnapshot) -> int:
+    count = 0
+    for iteration in reversed(snapshot.iterations):
+        if iteration.action_json is not None:
+            break
+        count += 1
+    return count
 
 
 def _summary(status: TaskStatus) -> str:

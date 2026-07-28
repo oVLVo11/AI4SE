@@ -15,6 +15,8 @@ from typing import Literal
 from pydantic import ConfigDict
 
 from pyquality.domain.models import (
+    MAX_ACTION_ARGUMENTS_BYTES,
+    MAX_CONFIG_PATTERN_BYTES,
     ApprovalDecision,
     Finding,
     PolicyDecision,
@@ -89,9 +91,11 @@ class TransitionIntentRecord(_StorageRecord):
     summary: str
     state: Literal["pending", "completed"]
     result_digest: str | None
+    result_payload: dict[str, object] | None
     completion_summary: str | None
     created_at: datetime
     completed_at: datetime | None
+    consumed_at: datetime | None
 
 
 class DecisionRecord(_StorageRecord):
@@ -200,12 +204,16 @@ class SQLiteTaskRepository:
         relevant_digest: str | None = None,
         quality_outcome: Literal["passed", "failed", "blocked", "not_run"] | None = None,
         findings: tuple[Finding, ...] = (),
+        source_intent_ids: tuple[str, ...] = (),
+        owner_token: str | None = None,
     ) -> IterationRecord:
         iteration_id = _new_id()
         created_at = _utc_now()
         normalized_action = _canonical_json(action_json) if action_json is not None else None
         with self._transaction() as connection:
             self._require_task(connection, task_id)
+            if source_intent_ids:
+                self._require_running_lease(connection, task_id, owner_token)
             try:
                 connection.execute(
                     """INSERT INTO iterations
@@ -241,6 +249,9 @@ class SQLiteTaskRepository:
                         _dump_datetime(finding_created_at),
                     ),
                 )
+            self._consume_transition_intents(
+                connection, task_id, source_intent_ids
+            )
         return IterationRecord(
             id=iteration_id,
             task_id=task_id,
@@ -261,11 +272,15 @@ class SQLiteTaskRepository:
         expected: TaskStatus,
         new: TaskStatus,
         result: TaskResult | None = None,
+        *,
+        owner_token: str | None = None,
     ) -> bool:
         with self._transaction() as connection:
             current = connection.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
             if current is None or current["status"] != expected.value:
                 return False
+            if expected is TaskStatus.RUNNING:
+                self._require_running_lease(connection, task_id, owner_token)
             if new not in _ALLOWED_TRANSITIONS.get(expected, frozenset()):
                 raise StorageStateError(f"illegal task transition: {expected.value} -> {new.value}")
             if result is not None and result.status is not new:
@@ -282,7 +297,10 @@ class SQLiteTaskRepository:
             if cursor.rowcount == 0:
                 return False
             if new in _TERMINAL_STATUSES or new is TaskStatus.WAITING_APPROVAL:
-                connection.execute("DELETE FROM project_leases WHERE task_id = ?", (task_id,))
+                connection.execute(
+                    "DELETE FROM project_leases WHERE task_id = ? AND owner_token = ?",
+                    (task_id, owner_token),
+                )
         return True
 
     def complete_iteration_outcome(
@@ -295,6 +313,8 @@ class SQLiteTaskRepository:
         relevant_digest: str | None,
         quality_outcome: Literal["passed", "failed", "blocked", "not_run"],
         findings: tuple[Finding, ...] = (),
+        source_intent_ids: tuple[str, ...] = (),
+        owner_token: str | None = None,
     ) -> IterationRecord:
         _require_digest(tool_result_digest, "tool_result_digest")
         if fingerprint is not None:
@@ -306,7 +326,7 @@ class SQLiteTaskRepository:
         )
         with self._transaction() as connection:
             row = self._require_iteration(connection, task_id, iteration_id)
-            self._require_running_lease(connection, task_id)
+            self._require_running_lease(connection, task_id, owner_token)
             existing_findings = tuple(
                 item["payload_json"]
                 for item in connection.execute(
@@ -352,6 +372,9 @@ class SQLiteTaskRepository:
                        VALUES (?, ?, ?, ?, NULL)""",
                     (_new_id(), iteration_id, payload, _dump_datetime(_utc_now())),
                 )
+            self._consume_transition_intents(
+                connection, task_id, source_intent_ids
+            )
         return self._iteration_by_id(iteration_id)
 
     def record_approval(
@@ -372,6 +395,7 @@ class SQLiteTaskRepository:
         ):
             raise StorageStateError("policy decision does not match approval digests")
         approval_id = _new_id()
+        normalized_action = _bounded_action_json(action_json)
         with self._transaction() as connection:
             self._require_iteration(connection, task_id, iteration_id)
             connection.execute(
@@ -384,7 +408,7 @@ class SQLiteTaskRepository:
                     approval_id,
                     task_id,
                     iteration_id,
-                    _canonical_json(action_json),
+                    normalized_action,
                     action_digest,
                     repository_snapshot_digest,
                     _canonical_json(policy_decision.model_dump(mode="json"))
@@ -395,11 +419,248 @@ class SQLiteTaskRepository:
             )
         return self._approval_by_id(approval_id)
 
+    def request_approval_and_wait(
+        self,
+        task_id: str,
+        iteration_id: str,
+        action_json: str,
+        action_digest: str,
+        repository_snapshot_digest: str,
+        *,
+        policy_decision: PolicyDecision,
+        waiting_result: TaskResult,
+        owner_token: str,
+    ) -> ApprovalRecord:
+        """Atomically create one approval, enter WAITING, and release its owner lease."""
+        _require_digest(action_digest, "action_digest")
+        _require_digest(repository_snapshot_digest, "repository_snapshot_digest")
+        _require_owner_token(owner_token)
+        if waiting_result.status is not TaskStatus.WAITING_APPROVAL:
+            raise StorageStateError("approval result must be waiting")
+        if waiting_result.task_id != task_id:
+            raise StorageStateError("approval result belongs to another task")
+        if (
+            policy_decision.action_digest != action_digest
+            or policy_decision.repository_snapshot_digest != repository_snapshot_digest
+        ):
+            raise StorageStateError("policy decision does not match approval digests")
+        approval_id = _new_id()
+        normalized_action = _bounded_action_json(action_json)
+        try:
+            with self._transaction() as connection:
+                self._require_iteration(connection, task_id, iteration_id)
+                self._require_running_lease(connection, task_id, owner_token)
+                connection.execute(
+                    """INSERT INTO approvals
+                       (id, task_id, iteration_id, action_json, action_digest,
+                        repository_snapshot_digest, policy_decision_json, decision,
+                        execution_state, expected_after_digests_json, result_digest,
+                        decided_at, executed_at, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, NULL, 'pending', '{}', NULL,
+                               NULL, NULL, ?)""",
+                    (
+                        approval_id,
+                        task_id,
+                        iteration_id,
+                        normalized_action,
+                        action_digest,
+                        repository_snapshot_digest,
+                        _canonical_json(policy_decision.model_dump(mode="json")),
+                        _dump_datetime(_utc_now()),
+                    ),
+                )
+                cursor = connection.execute(
+                    """UPDATE tasks SET status = ?, result_json = ?
+                       WHERE id = ? AND status = ?""",
+                    (
+                        TaskStatus.WAITING_APPROVAL.value,
+                        _canonical_json(waiting_result.model_dump(mode="json")),
+                        task_id,
+                        TaskStatus.RUNNING.value,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise StorageStateError("approval transition lost compare-and-set")
+                connection.execute(
+                    "DELETE FROM project_leases WHERE task_id = ? AND owner_token = ?",
+                    (task_id, owner_token),
+                )
+        except sqlite3.Error as error:
+            raise StorageStateError("approval transition failed") from error
+        return self._approval_by_id(approval_id)
+
+    def request_approval_round_and_wait(
+        self,
+        task_id: str,
+        sequence: int,
+        context_digest: str,
+        action_json: str,
+        action_digest: str,
+        repository_snapshot_digest: str,
+        *,
+        policy_decision: PolicyDecision,
+        waiting_result: TaskResult,
+        source_intent_ids: tuple[str, ...],
+        owner_token: str,
+    ) -> ApprovalRecord:
+        """Persist the model round, approval, wait result, and lease release atomically."""
+        _require_digest(context_digest, "context_digest")
+        _require_digest(action_digest, "action_digest")
+        _require_digest(repository_snapshot_digest, "repository_snapshot_digest")
+        _require_owner_token(owner_token)
+        if waiting_result.status is not TaskStatus.WAITING_APPROVAL:
+            raise StorageStateError("approval result must be waiting")
+        if waiting_result.task_id != task_id:
+            raise StorageStateError("approval result belongs to another task")
+        if (
+            policy_decision.action_digest != action_digest
+            or policy_decision.repository_snapshot_digest
+            != repository_snapshot_digest
+        ):
+            raise StorageStateError("policy decision does not match approval digests")
+        approval_id = _new_id()
+        iteration_id = _new_id()
+        normalized_action = _bounded_action_json(action_json)
+        try:
+            with self._transaction() as connection:
+                self._require_running_lease(connection, task_id, owner_token)
+                connection.execute(
+                    """INSERT INTO iterations
+                       (id, task_id, sequence, context_digest, action_json, policy_outcome,
+                        tool_result_digest, fingerprint, relevant_digest, quality_outcome,
+                        created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, ?)""",
+                    (
+                        iteration_id,
+                        task_id,
+                        sequence,
+                        context_digest,
+                        normalized_action,
+                        policy_decision.outcome.value,
+                        _dump_datetime(_utc_now()),
+                    ),
+                )
+                self._consume_transition_intents(
+                    connection, task_id, source_intent_ids
+                )
+                connection.execute(
+                    """INSERT INTO approvals
+                       (id, task_id, iteration_id, action_json, action_digest,
+                        repository_snapshot_digest, policy_decision_json, decision,
+                        execution_state, expected_after_digests_json, result_digest,
+                        decided_at, executed_at, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, NULL, 'pending', '{}', NULL,
+                               NULL, NULL, ?)""",
+                    (
+                        approval_id,
+                        task_id,
+                        iteration_id,
+                        normalized_action,
+                        action_digest,
+                        repository_snapshot_digest,
+                        _canonical_json(policy_decision.model_dump(mode="json")),
+                        _dump_datetime(_utc_now()),
+                    ),
+                )
+                cursor = connection.execute(
+                    """UPDATE tasks SET status = ?, result_json = ?
+                       WHERE id = ? AND status = ?""",
+                    (
+                        TaskStatus.WAITING_APPROVAL.value,
+                        _canonical_json(waiting_result.model_dump(mode="json")),
+                        task_id,
+                        TaskStatus.RUNNING.value,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise StorageStateError("approval transition lost compare-and-set")
+                connection.execute(
+                    "DELETE FROM project_leases WHERE task_id = ? AND owner_token = ?",
+                    (task_id, owner_token),
+                )
+        except sqlite3.Error as error:
+            raise StorageStateError("approval round transition failed") from error
+        return self._approval_by_id(approval_id)
+
+    def replace_approval_and_wait(
+        self,
+        approval_id: str,
+        policy_decision: PolicyDecision,
+        *,
+        waiting_result: TaskResult,
+        owner_token: str,
+    ) -> ApprovalRecord:
+        """Atomically retire an approved proposal and bind its replacement wait."""
+        _require_owner_token(owner_token)
+        if waiting_result.status is not TaskStatus.WAITING_APPROVAL:
+            raise StorageStateError("approval result must be waiting")
+        replacement_id = _new_id()
+        try:
+            with self._transaction() as connection:
+                current = self._require_approval(connection, approval_id)
+                if (
+                    current["decision"] != ApprovalDecision.APPROVE.value
+                    or current["execution_state"] != "pending"
+                ):
+                    raise StorageStateError("approval cannot be replaced")
+                task_id = current["task_id"]
+                self._require_running_lease(connection, task_id, owner_token)
+                if waiting_result.task_id != task_id:
+                    raise StorageStateError("approval result belongs to another task")
+                if policy_decision.action_digest != current["action_digest"]:
+                    raise StorageStateError("replacement action digest changed")
+                connection.execute(
+                    """UPDATE approvals SET execution_state = 'completed', executed_at = ?
+                       WHERE id = ?""",
+                    (_dump_datetime(_utc_now()), approval_id),
+                )
+                connection.execute(
+                    """INSERT INTO approvals
+                       (id, task_id, iteration_id, action_json, action_digest,
+                        repository_snapshot_digest, policy_decision_json, decision,
+                        execution_state, expected_after_digests_json, result_digest,
+                        decided_at, executed_at, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, NULL, 'pending', '{}', NULL,
+                               NULL, NULL, ?)""",
+                    (
+                        replacement_id,
+                        task_id,
+                        current["iteration_id"],
+                        current["action_json"],
+                        policy_decision.action_digest,
+                        policy_decision.repository_snapshot_digest,
+                        _canonical_json(policy_decision.model_dump(mode="json")),
+                        _dump_datetime(_utc_now()),
+                    ),
+                )
+                cursor = connection.execute(
+                    """UPDATE tasks SET status = ?, result_json = ?
+                       WHERE id = ? AND status = ?""",
+                    (
+                        TaskStatus.WAITING_APPROVAL.value,
+                        _canonical_json(waiting_result.model_dump(mode="json")),
+                        task_id,
+                        TaskStatus.RUNNING.value,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise StorageStateError("replacement transition lost compare-and-set")
+                connection.execute(
+                    "DELETE FROM project_leases WHERE task_id = ? AND owner_token = ?",
+                    (task_id, owner_token),
+                )
+        except sqlite3.Error as error:
+            raise StorageStateError("replacement approval transition failed") from error
+        return self._approval_by_id(replacement_id)
+
     def pending_approval(self, task_id: str) -> ApprovalRecord | None:
         row = self._connection.execute(
-            """SELECT * FROM approvals WHERE task_id = ? AND decision IS NULL
-               ORDER BY created_at DESC, id DESC LIMIT 1""",
-            (task_id,),
+            """SELECT approvals.* FROM approvals
+               JOIN tasks ON tasks.id = approvals.task_id
+               WHERE approvals.task_id = ? AND approvals.decision IS NULL
+                 AND tasks.status = ?
+               ORDER BY approvals.created_at DESC, approvals.id DESC LIMIT 1""",
+            (task_id, TaskStatus.WAITING_APPROVAL.value),
         ).fetchone()
         return _approval_from_row(row) if row is not None else None
 
@@ -448,13 +709,17 @@ class SQLiteTaskRepository:
         approval_id: str,
         *,
         expected_after_digests: dict[str, str | None] | None = None,
+        owner_token: str | None = None,
     ) -> ApprovalRecord:
         normalized_digests = _validated_path_digests(expected_after_digests or {})
         with self._transaction() as connection:
             row = self._require_approval(connection, approval_id)
             if row["decision"] != ApprovalDecision.APPROVE.value or row["execution_state"] != "pending":
                 raise StorageStateError("approval is not ready for execution intent")
-            self._require_running_lease(connection, row["task_id"])
+            self._require_running_lease(connection, row["task_id"], owner_token)
+            action = json.loads(row["action_json"])
+            if action.get("kind") == "apply_patch" and not normalized_digests:
+                raise StorageStateError("patch approval requires non-empty expected effect evidence")
             connection.execute(
                 """UPDATE approvals
                    SET execution_state = 'intent_recorded', expected_after_digests_json = ?
@@ -464,7 +729,11 @@ class SQLiteTaskRepository:
         return self._approval_by_id(approval_id)
 
     def mark_execution_completed(
-        self, approval_id: str, *, result_digest: str | None = None
+        self,
+        approval_id: str,
+        *,
+        result_digest: str | None = None,
+        owner_token: str | None = None,
     ) -> ApprovalRecord:
         if result_digest is not None:
             _require_digest(result_digest, "result_digest")
@@ -476,6 +745,7 @@ class SQLiteTaskRepository:
                 or row["execution_state"] != "intent_recorded"
             ):
                 raise StorageStateError("approval execution intent is not recorded")
+            self._require_running_lease(connection, row["task_id"], owner_token)
             connection.execute(
                 """UPDATE approvals
                    SET execution_state = 'completed', result_digest = ?, executed_at = ?
@@ -484,7 +754,13 @@ class SQLiteTaskRepository:
             )
         return self._approval_by_id(approval_id)
 
-    def mark_rejection_consumed(self, approval_id: str) -> ApprovalRecord:
+    def mark_rejection_consumed(
+        self,
+        approval_id: str,
+        *,
+        finding: Finding | None = None,
+        owner_token: str | None = None,
+    ) -> ApprovalRecord:
         consumed_at = _utc_now()
         with self._transaction() as connection:
             row = self._require_approval(connection, approval_id)
@@ -493,12 +769,24 @@ class SQLiteTaskRepository:
                 or row["execution_state"] != "pending"
             ):
                 raise StorageStateError("rejected approval is not ready to be consumed")
-            self._require_running_lease(connection, row["task_id"])
+            self._require_running_lease(connection, row["task_id"], owner_token)
             connection.execute(
                 """UPDATE approvals
                    SET execution_state = 'completed', executed_at = ? WHERE id = ?""",
                 (_dump_datetime(consumed_at), approval_id),
             )
+            if finding is not None:
+                connection.execute(
+                    """INSERT INTO findings
+                       (id, iteration_id, payload_json, created_at, resolved_at)
+                       VALUES (?, ?, ?, ?, NULL)""",
+                    (
+                        _new_id(),
+                        row["iteration_id"],
+                        _canonical_json(finding.model_dump(mode="json")),
+                        _dump_datetime(consumed_at),
+                    ),
+                )
         return self._approval_by_id(approval_id)
 
     def record_transition_intent(
@@ -508,6 +796,7 @@ class SQLiteTaskRepository:
         kind: str,
         evidence_digest: str,
         summary: str,
+        owner_token: str | None = None,
     ) -> TransitionIntentRecord:
         _require_transition_text(kind, 64, "kind")
         _require_transition_text(summary, 1_024, "summary")
@@ -515,7 +804,7 @@ class SQLiteTaskRepository:
         intent_id = _new_id()
         created_at = _utc_now()
         with self._transaction() as connection:
-            self._require_running_lease(connection, task_id)
+            self._require_running_lease(connection, task_id, owner_token)
             connection.execute(
                 """INSERT INTO transition_intents
                    (id, task_id, kind, evidence_digest, summary, state, result_digest,
@@ -538,43 +827,96 @@ class SQLiteTaskRepository:
         *,
         result_digest: str,
         summary: str,
+        result_payload: dict[str, object] | None = None,
+        owner_token: str | None = None,
     ) -> TransitionIntentRecord:
         _require_digest(result_digest, "result_digest")
         _require_transition_text(summary, 1_024, "summary")
+        payload_json = _bounded_payload_json(result_payload)
         completed_at = _utc_now()
         with self._transaction() as connection:
             row = self._require_transition_intent(connection, intent_id)
             if row["state"] != "pending":
                 raise StorageStateError("transition intent is already completed")
-            self._require_running_lease(connection, row["task_id"])
+            self._require_running_lease(connection, row["task_id"], owner_token)
             connection.execute(
                 """UPDATE transition_intents
-                   SET state = 'completed', result_digest = ?, completion_summary = ?,
-                       completed_at = ? WHERE id = ?""",
-                (result_digest, summary, _dump_datetime(completed_at), intent_id),
+                   SET state = 'completed', result_digest = ?, result_payload_json = ?,
+                       completion_summary = ?, completed_at = ? WHERE id = ?""",
+                (
+                    result_digest,
+                    payload_json,
+                    summary,
+                    _dump_datetime(completed_at),
+                    intent_id,
+                ),
             )
         return self._transition_intent_by_id(intent_id)
 
-    def acquire_project_lease(self, task_id: str) -> bool:
+    def close(self) -> None:
+        self._connection.close()
+
+    def fail_inconsistent_task(self, task_id: str, summary: str) -> TaskResult:
+        """Durably fail a task whose typed snapshot cannot be reconstructed."""
+        _require_transition_text(summary, 1_024, "summary")
+        with self._transaction() as connection:
+            row = connection.execute(
+                "SELECT id FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+            if row is None:
+                raise StorageStateError("task does not exist")
+            iterations = connection.execute(
+                "SELECT COUNT(*) AS count FROM iterations WHERE task_id = ?", (task_id,)
+            ).fetchone()["count"]
+            result = TaskResult(
+                task_id=task_id,
+                status=TaskStatus.FAILED,
+                iterations=iterations,
+                verification_summary=summary,
+            )
+            connection.execute(
+                """UPDATE tasks SET status = ?, result_json = ?, deadline = NULL
+                   WHERE id = ?""",
+                (
+                    TaskStatus.FAILED.value,
+                    _canonical_json(result.model_dump(mode="json")),
+                    task_id,
+                ),
+            )
+            connection.execute("DELETE FROM project_leases WHERE task_id = ?", (task_id,))
+        return result
+
+    def acquire_project_lease(self, task_id: str, *, owner_token: str) -> bool:
+        _require_owner_token(owner_token)
         with self._transaction() as connection:
             task = self._require_task(connection, task_id)
             if task["status"] != TaskStatus.RUNNING.value:
                 raise StorageStateError("only running tasks can acquire a project lease")
             try:
                 connection.execute(
-                    "INSERT INTO project_leases (project_id, task_id, acquired_at) VALUES (?, ?, ?)",
-                    (task["project_id"], task_id, _dump_datetime(_utc_now())),
+                    """INSERT INTO project_leases
+                       (project_id, task_id, owner_token, acquired_at) VALUES (?, ?, ?, ?)""",
+                    (task["project_id"], task_id, owner_token, _dump_datetime(_utc_now())),
                 )
             except sqlite3.IntegrityError:
                 row = connection.execute(
-                    "SELECT task_id FROM project_leases WHERE project_id = ?", (task["project_id"],)
+                    "SELECT task_id, owner_token FROM project_leases WHERE project_id = ?",
+                    (task["project_id"],),
                 ).fetchone()
-                return row is not None and row["task_id"] == task_id
+                return (
+                    row is not None
+                    and row["task_id"] == task_id
+                    and row["owner_token"] == owner_token
+                )
         return True
 
-    def release_project_lease(self, task_id: str) -> None:
+    def release_project_lease(self, task_id: str, *, owner_token: str) -> None:
+        _require_owner_token(owner_token)
         with self._transaction() as connection:
-            connection.execute("DELETE FROM project_leases WHERE task_id = ?", (task_id,))
+            connection.execute(
+                "DELETE FROM project_leases WHERE task_id = ? AND owner_token = ?",
+                (task_id, owner_token),
+            )
 
     def mark_findings_resolved(
         self, finding_ids: tuple[str, ...], resolved_at: datetime | None = None
@@ -631,7 +973,9 @@ class SQLiteTaskRepository:
             updated_at=created_at,
         )
 
-    def resume_snapshot(self, task_id: str) -> RecoverySnapshot:
+    def resume_snapshot(
+        self, task_id: str, *, owner_token: str | None = None
+    ) -> RecoverySnapshot:
         with self._read_transaction() as connection:
             task_row = connection.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
             if task_row is None:
@@ -677,13 +1021,16 @@ class SQLiteTaskRepository:
                 )
             )
             lease_row = connection.execute(
-                "SELECT task_id FROM project_leases WHERE project_id = ?", (task_row["project_id"],)
+                "SELECT task_id, owner_token FROM project_leases WHERE project_id = ?",
+                (task_row["project_id"],),
             ).fetchone()
             executable_row = None
             if (
                 task_row["status"] == TaskStatus.RUNNING.value
                 and lease_row is not None
                 and lease_row["task_id"] == task_id
+                and owner_token is not None
+                and lease_row["owner_token"] == owner_token
             ):
                 executable_row = connection.execute(
                     """SELECT * FROM approvals
@@ -801,6 +1148,7 @@ class SQLiteTaskRepository:
             CREATE TABLE IF NOT EXISTS project_leases (
                 project_id TEXT PRIMARY KEY REFERENCES projects(id),
                 task_id TEXT NOT NULL UNIQUE REFERENCES tasks(id),
+                owner_token TEXT NOT NULL,
                 acquired_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS transition_intents (
@@ -811,9 +1159,11 @@ class SQLiteTaskRepository:
                 summary TEXT NOT NULL,
                 state TEXT NOT NULL,
                 result_digest TEXT,
+                result_payload_json TEXT,
                 completion_summary TEXT,
                 created_at TEXT NOT NULL,
-                completed_at TEXT
+                completed_at TEXT,
+                consumed_at TEXT
             );
             """
         )
@@ -823,6 +1173,9 @@ class SQLiteTaskRepository:
         )
         self._ensure_column("approvals", "result_digest", "TEXT")
         self._ensure_column("iterations", "quality_outcome", "TEXT")
+        self._ensure_column("project_leases", "owner_token", "TEXT")
+        self._ensure_column("transition_intents", "result_payload_json", "TEXT")
+        self._ensure_column("transition_intents", "consumed_at", "TEXT")
 
     def _ensure_column(self, table: str, column: str, declaration: str) -> None:
         columns = {
@@ -868,13 +1221,27 @@ class SQLiteTaskRepository:
         return row
 
     @classmethod
-    def _require_running_lease(cls, connection: sqlite3.Connection, task_id: str) -> None:
+    def _require_running_lease(
+        cls,
+        connection: sqlite3.Connection,
+        task_id: str,
+        owner_token: str | None,
+    ) -> None:
+        if owner_token is None:
+            raise StorageStateError("running mutation requires a lease owner token")
+        _require_owner_token(owner_token)
         task = cls._require_task(connection, task_id)
         lease = connection.execute(
-            "SELECT task_id FROM project_leases WHERE project_id = ?", (task["project_id"],)
+            "SELECT task_id, owner_token FROM project_leases WHERE project_id = ?",
+            (task["project_id"],),
         ).fetchone()
-        if task["status"] != TaskStatus.RUNNING.value or lease is None or lease["task_id"] != task_id:
-            raise StorageStateError("running task does not own the project lease")
+        if (
+            task["status"] != TaskStatus.RUNNING.value
+            or lease is None
+            or lease["task_id"] != task_id
+            or lease["owner_token"] != owner_token
+        ):
+            raise StorageStateError("running task does not own the project lease owner token")
 
     def _approval_by_id(self, approval_id: str) -> ApprovalRecord:
         row = self._connection.execute("SELECT * FROM approvals WHERE id = ?", (approval_id,)).fetchone()
@@ -897,6 +1264,25 @@ class SQLiteTaskRepository:
         if row is None:
             raise StorageStateError("transition intent does not exist")
         return _transition_intent_from_row(row)
+
+    @staticmethod
+    def _consume_transition_intents(
+        connection: sqlite3.Connection,
+        task_id: str,
+        intent_ids: tuple[str, ...],
+    ) -> None:
+        consumed_at = _dump_datetime(_utc_now())
+        for intent_id in intent_ids:
+            row = connection.execute(
+                "SELECT * FROM transition_intents WHERE id = ? AND task_id = ?",
+                (intent_id, task_id),
+            ).fetchone()
+            if row is None or row["state"] != "completed" or row["consumed_at"] is not None:
+                raise StorageStateError("transition intent is not consumable")
+            connection.execute(
+                "UPDATE transition_intents SET consumed_at = ? WHERE id = ?",
+                (consumed_at, intent_id),
+            )
 
 
 def _new_id() -> str:
@@ -979,9 +1365,13 @@ def _transition_intent_from_row(row: sqlite3.Row) -> TransitionIntentRecord:
         summary=row["summary"],
         state=row["state"],
         result_digest=row["result_digest"],
+        result_payload=json.loads(row["result_payload_json"])
+        if row["result_payload_json"]
+        else None,
         completion_summary=row["completion_summary"],
         created_at=created_at,
         completed_at=_load_datetime(row["completed_at"]),
+        consumed_at=_load_datetime(row["consumed_at"]),
     )
 
 
@@ -1025,6 +1415,8 @@ def _validated_path_digests(values: dict[str, str | None]) -> dict[str, str | No
         candidate = PurePosixPath(path)
         if not path or "\\" in path or candidate.is_absolute() or ".." in candidate.parts:
             raise StorageStateError("digest path must be repository-relative POSIX text")
+        if len(path.encode("utf-8")) > MAX_CONFIG_PATTERN_BYTES:
+            raise StorageStateError("digest path exceeds UTF-8 byte limit")
         if digest is not None:
             _require_digest(digest, "expected after digest")
         normalized[candidate.as_posix()] = digest
@@ -1034,3 +1426,24 @@ def _validated_path_digests(values: dict[str, str | None]) -> dict[str, str | No
 def _require_transition_text(value: str, limit: int, field: str) -> None:
     if not value or len(value.encode("utf-8")) > limit:
         raise StorageStateError(f"{field} must contain at most {limit} UTF-8 bytes")
+
+
+def _require_owner_token(value: str) -> None:
+    if not value or len(value.encode("utf-8")) > 128:
+        raise StorageStateError("owner token must contain at most 128 UTF-8 bytes")
+
+
+def _bounded_payload_json(value: dict[str, object] | None) -> str | None:
+    if value is None:
+        return None
+    payload = _canonical_json(value)
+    if len(payload.encode("utf-8")) > 65_536:
+        raise StorageStateError("transition payload exceeds UTF-8 byte limit")
+    return payload
+
+
+def _bounded_action_json(value: str) -> str:
+    payload = _canonical_json(value)
+    if len(payload.encode("utf-8")) > MAX_ACTION_ARGUMENTS_BYTES + 8_192:
+        raise StorageStateError("action payload exceeds UTF-8 byte limit")
+    return payload

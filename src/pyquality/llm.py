@@ -116,18 +116,25 @@ class OpenAICompatibleLLM:
         if credential_failed:
             raise ProviderError("provider request failed") from None
 
-        request_failed = False
-        try:
-            response = self._client.post(
-                self.endpoint,
-                headers={"Authorization": f"Bearer {key}"},
-                json=payload,
-                timeout=self.timeout_s,
-            )
-            response.raise_for_status()
-            body = response.json()
-        except (httpx.HTTPError, ValueError, TypeError, KeyError, IndexError):
-            request_failed = True
+        request_failed = True
+        body = None
+        for attempt in range(self.retries + 1):
+            try:
+                response = self._client.post(
+                    self.endpoint,
+                    headers={"Authorization": f"Bearer {key}"},
+                    json=payload,
+                    timeout=self.timeout_s,
+                )
+                response.raise_for_status()
+                body = response.json()
+                request_failed = False
+                break
+            except httpx.TransportError:
+                if attempt == self.retries:
+                    break
+            except (httpx.HTTPError, ValueError, TypeError, KeyError, IndexError):
+                break
         if request_failed:
             raise ProviderError("provider request failed") from None
 

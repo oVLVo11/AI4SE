@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import timedelta
 
+import httpx
 from conftest import (
     NOW,
     FixedClock,
@@ -12,8 +13,8 @@ from conftest import (
     successful_report,
 )
 
-from pyquality.domain.models import TaskStatus
-from pyquality.llm import Message, ScriptedLLM
+from pyquality.domain.models import TaskStatus, ToolResult
+from pyquality.llm import Message, OpenAICompatibleLLM, ScriptedLLM
 
 
 def test_failed_patch_feedback_changes_next_action(loop_fixture) -> None:
@@ -122,12 +123,17 @@ def test_resume_recovers_persisted_passing_verifier_transition_without_model_cal
     assert harness.repository.set_status(
         harness.task_id, TaskStatus.CREATED, TaskStatus.RUNNING
     ) is True
-    assert harness.repository.acquire_project_lease(harness.task_id) is True
+    assert harness.repository.acquire_project_lease(
+        harness.task_id, owner_token="seed-owner"
+    ) is True
     harness.repository.append_iteration(
         harness.task_id,
         sequence=1,
         context_digest="a" * 64,
         quality_outcome="passed",
+    )
+    harness.repository.release_project_lease(
+        harness.task_id, owner_token="seed-owner"
     )
 
     result = harness.loop.resume(harness.task_id)
@@ -200,10 +206,24 @@ def test_deadline_after_response_wins_before_verifier_and_keeps_round_accounting
 
 
 def test_provider_internal_retries_remain_one_persisted_model_round(loop_fixture) -> None:
-    class RetryingClient(ScriptedLLM):
-        transport_attempts = 3
+    attempts: list[httpx.Request] = []
 
-    client = RetryingClient([finish_json()])
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts.append(request)
+        if len(attempts) < 3:
+            raise httpx.ConnectError("temporary failure", request=request)
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": finish_json()}}]},
+        )
+
+    client = OpenAICompatibleLLM(
+        "https://provider.invalid/v1/chat/completions",
+        "test-model",
+        lambda: "test-key",
+        retries=2,
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
     harness = loop_fixture(
         llm=client,
         reports=[successful_report()],
@@ -213,5 +233,33 @@ def test_provider_internal_retries_remain_one_persisted_model_round(loop_fixture
 
     assert result.status is TaskStatus.SUCCEEDED
     assert result.iterations == 1
-    assert client.transport_attempts == 3
-    assert len(client.calls) == 1
+    assert len(attempts) == 3
+
+
+def test_deletion_changes_relevant_digest_and_avoids_false_stall(loop_fixture) -> None:
+    changed = ToolResult(
+        effect_kind="apply_patch",
+        code_changed=True,
+        changed_paths=("src/calc.py",),
+        before_digests={"src/calc.py": "a" * 64},
+        after_digests={"src/calc.py": "b" * 64},
+        normalized_metadata={"code": "ok"},
+    )
+    deleted = ToolResult(
+        effect_kind="apply_patch",
+        code_changed=True,
+        changed_paths=("src/calc.py",),
+        before_digests={"src/calc.py": "b" * 64},
+        after_digests={},
+        normalized_metadata={"code": "ok"},
+    )
+    harness = loop_fixture(
+        responses=[ordinary_patch_json("1"), ordinary_patch_json("2"), finish_json()],
+        reports=[failed_report(), failed_report(), successful_report()],
+        dispatch_results=[changed, deleted],
+    )
+
+    result = harness.loop.run(harness.task_id)
+
+    assert result.status is TaskStatus.SUCCEEDED
+    assert result.iterations == 3

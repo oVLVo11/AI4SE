@@ -113,3 +113,37 @@ def test_openai_compatible_llm_hides_credential_callable_failures() -> None:
     assert "secret credential detail" not in str(error.value)
     assert error.value.__cause__ is None
     assert error.value.__context__ is None
+
+
+def test_openai_compatible_llm_retries_transport_inside_one_complete_call() -> None:
+    attempts: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts.append(request)
+        if len(attempts) < 3:
+            raise httpx.ConnectError("temporary transport failure", request=request)
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": '{"kind":"finish","arguments":{},"rationale":"done"}'
+                        }
+                    }
+                ]
+            },
+        )
+
+    llm = OpenAICompatibleLLM(
+        "https://provider.invalid/v1/chat/completions",
+        "test-model",
+        lambda: "test-key",
+        retries=2,
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    result = llm.complete((Message(role="user", content="choose an action"),))
+
+    assert "finish" in result
+    assert len(attempts) == 3

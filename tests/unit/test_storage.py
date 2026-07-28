@@ -34,6 +34,10 @@ def _approval_decision() -> PolicyDecision:
     )
 
 
+OWNER_A = "runner-a"
+OWNER_B = "runner-b"
+
+
 def test_second_active_task_cannot_lease_same_project(repo: SQLiteTaskRepository) -> None:
     """Dropping the unique active-path constraint would allow conflicting repository mutations."""
     first = repo.create_task("C:/work/demo", "fix sum", round_limit=8)
@@ -41,8 +45,8 @@ def test_second_active_task_cannot_lease_same_project(repo: SQLiteTaskRepository
     _start(repo, first.id)
     _start(repo, second.id)
 
-    assert repo.acquire_project_lease(first.id) is True
-    assert repo.acquire_project_lease(second.id) is False
+    assert repo.acquire_project_lease(first.id, owner_token=OWNER_A) is True
+    assert repo.acquire_project_lease(second.id, owner_token=OWNER_B) is False
 
 
 def test_resume_does_not_return_unapproved_action_as_executable(repo: SQLiteTaskRepository) -> None:
@@ -67,7 +71,7 @@ def test_approved_intent_becomes_executable_until_completion(repo: SQLiteTaskRep
     """Marking an approval completed before dispatch recovery would hide a durable pending effect."""
     task = repo.create_task("C:/work/demo", "fix sum", round_limit=8)
     _start(repo, task.id)
-    assert repo.acquire_project_lease(task.id) is True
+    assert repo.acquire_project_lease(task.id, owner_token=OWNER_A) is True
     iteration = repo.append_iteration(task.id, sequence=1, context_digest="a" * 64)
     approval = repo.record_approval(
         task.id,
@@ -78,10 +82,17 @@ def test_approved_intent_becomes_executable_until_completion(repo: SQLiteTaskRep
     )
 
     decided = repo.decide_approval(approval.id, ApprovalDecision.APPROVE)
-    intended = repo.mark_execution_intent(decided.id)
+    intended = repo.mark_execution_intent(
+        decided.id, expected_after_digests={"demo.py": "d" * 64}, owner_token=OWNER_A
+    )
 
-    assert repo.resume_snapshot(task.id).executable_approval == intended
-    assert repo.mark_execution_completed(intended.id).execution_state == "completed"
+    assert (
+        repo.resume_snapshot(task.id, owner_token=OWNER_A).executable_approval
+        == intended
+    )
+    assert repo.mark_execution_completed(
+        intended.id, owner_token=OWNER_A
+    ).execution_state == "completed"
     assert repo.resume_snapshot(task.id).executable_approval is None
 
 
@@ -108,7 +119,7 @@ def test_compare_and_set_rejects_stale_status_and_releases_terminal_lease(
     """A stale writer must not advance status or retain a lease after a terminal transition."""
     task = repo.create_task("C:/work/demo", "fix sum", round_limit=8)
     _start(repo, task.id)
-    assert repo.acquire_project_lease(task.id) is True
+    assert repo.acquire_project_lease(task.id, owner_token=OWNER_A) is True
     assert repo.set_status(task.id, TaskStatus.CREATED, TaskStatus.SUCCEEDED) is False
     result = TaskResult(
         task_id=task.id,
@@ -116,11 +127,17 @@ def test_compare_and_set_rejects_stale_status_and_releases_terminal_lease(
         iterations=0,
         verification_summary="All checks passed.",
     )
-    assert repo.set_status(task.id, TaskStatus.RUNNING, TaskStatus.SUCCEEDED, result) is True
+    assert repo.set_status(
+        task.id,
+        TaskStatus.RUNNING,
+        TaskStatus.SUCCEEDED,
+        result,
+        owner_token=OWNER_A,
+    ) is True
 
     next_task = repo.create_task("C:/work/demo", "fix subtract", round_limit=8)
     _start(repo, next_task.id)
-    assert repo.acquire_project_lease(next_task.id) is True
+    assert repo.acquire_project_lease(next_task.id, owner_token=OWNER_B) is True
     assert repo.resume_snapshot(task.id).task.result == result
 
 
@@ -185,13 +202,25 @@ def test_acquire_project_lease_rejects_non_running_tasks(
     task = repo.create_task(f"C:/work/{status.value}", "fix sum", round_limit=8)
     if status is TaskStatus.WAITING_APPROVAL:
         _start(repo, task.id)
-        assert repo.set_status(task.id, TaskStatus.RUNNING, TaskStatus.WAITING_APPROVAL) is True
+        assert repo.acquire_project_lease(task.id, owner_token=OWNER_A) is True
+        assert repo.set_status(
+            task.id,
+            TaskStatus.RUNNING,
+            TaskStatus.WAITING_APPROVAL,
+            owner_token=OWNER_A,
+        ) is True
     elif status is TaskStatus.SUCCEEDED:
         _start(repo, task.id)
-        assert repo.set_status(task.id, TaskStatus.RUNNING, TaskStatus.SUCCEEDED) is True
+        assert repo.acquire_project_lease(task.id, owner_token=OWNER_A) is True
+        assert repo.set_status(
+            task.id,
+            TaskStatus.RUNNING,
+            TaskStatus.SUCCEEDED,
+            owner_token=OWNER_A,
+        ) is True
 
     with pytest.raises(StorageStateError):
-        repo.acquire_project_lease(task.id)
+        repo.acquire_project_lease(task.id, owner_token=OWNER_A)
 
 
 def test_execution_intent_requires_running_task_lease(repo: SQLiteTaskRepository) -> None:
@@ -214,7 +243,7 @@ def test_execution_intent_rejects_another_tasks_lease(repo: SQLiteTaskRepository
     target = repo.create_task("C:/work/demo", "fix subtract", round_limit=8)
     _start(repo, owner.id)
     _start(repo, target.id)
-    assert repo.acquire_project_lease(owner.id) is True
+    assert repo.acquire_project_lease(owner.id, owner_token=OWNER_A) is True
     iteration = repo.append_iteration(target.id, sequence=1, context_digest="a" * 64)
     approval = repo.record_approval(
         target.id, iteration.id, '{"kind":"apply_patch"}', "b" * 64, "c" * 64
@@ -222,20 +251,29 @@ def test_execution_intent_rejects_another_tasks_lease(repo: SQLiteTaskRepository
     repo.decide_approval(approval.id, ApprovalDecision.APPROVE)
 
     with pytest.raises(StorageStateError):
-        repo.mark_execution_intent(approval.id)
+        repo.mark_execution_intent(
+            approval.id,
+            expected_after_digests={"demo.py": "d" * 64},
+            owner_token=OWNER_B,
+        )
 
 
 def test_terminal_snapshot_hides_an_approved_incomplete_action(repo: SQLiteTaskRepository) -> None:
     """A terminal task must never expose an unfinished approval for later dispatch."""
     task = repo.create_task("C:/work/demo", "fix sum", round_limit=8)
     _start(repo, task.id)
-    assert repo.acquire_project_lease(task.id) is True
+    assert repo.acquire_project_lease(task.id, owner_token=OWNER_A) is True
     iteration = repo.append_iteration(task.id, sequence=1, context_digest="a" * 64)
     approval = repo.record_approval(
         task.id, iteration.id, '{"kind":"apply_patch"}', "b" * 64, "c" * 64
     )
     repo.decide_approval(approval.id, ApprovalDecision.APPROVE)
-    assert repo.set_status(task.id, TaskStatus.RUNNING, TaskStatus.SUCCEEDED) is True
+    assert repo.set_status(
+        task.id,
+        TaskStatus.RUNNING,
+        TaskStatus.SUCCEEDED,
+        owner_token=OWNER_A,
+    ) is True
 
     assert repo.resume_snapshot(task.id).executable_approval is None
 
@@ -250,8 +288,169 @@ def test_repositories_contend_for_a_running_project_lease(tmp_path: Path) -> Non
     _start(first_repo, first.id)
     _start(second_repo, second.id)
 
-    assert first_repo.acquire_project_lease(first.id) is True
-    assert second_repo.acquire_project_lease(second.id) is False
+    assert first_repo.acquire_project_lease(first.id, owner_token=OWNER_A) is True
+    assert second_repo.acquire_project_lease(second.id, owner_token=OWNER_B) is False
+
+
+def test_same_task_cannot_be_leased_by_two_independent_runner_tokens(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.sqlite"
+    first_repo = SQLiteTaskRepository(db_path)
+    second_repo = SQLiteTaskRepository(db_path)
+    task = first_repo.create_task("C:/work/demo", "fix sum", round_limit=8)
+    _start(first_repo, task.id)
+
+    assert first_repo.acquire_project_lease(task.id, owner_token=OWNER_A) is True
+    assert second_repo.acquire_project_lease(task.id, owner_token=OWNER_B) is False
+    assert first_repo.acquire_project_lease(task.id, owner_token=OWNER_A) is True
+
+    with pytest.raises(StorageStateError, match="owner"):
+        second_repo.record_transition_intent(
+            task.id,
+            kind="model_call",
+            evidence_digest="a" * 64,
+            summary="context prepared",
+            owner_token=OWNER_B,
+        )
+
+
+def test_approval_insert_and_waiting_transition_are_one_transaction(
+    repo: SQLiteTaskRepository,
+) -> None:
+    task = repo.create_task("C:/work/demo", "fix sum", round_limit=8)
+    _start(repo, task.id)
+    assert repo.acquire_project_lease(task.id, owner_token=OWNER_A) is True
+    iteration = repo.append_iteration(task.id, sequence=1, context_digest="a" * 64)
+    waiting = TaskResult(
+        task_id=task.id,
+        status=TaskStatus.WAITING_APPROVAL,
+        iterations=1,
+        verification_summary="Approval required.",
+    )
+
+    repo._connection.execute(
+        """CREATE TRIGGER abort_wait BEFORE UPDATE OF status ON tasks
+           WHEN NEW.status = 'waiting_approval'
+           BEGIN SELECT RAISE(ABORT, 'simulated crash'); END"""
+    )
+    with pytest.raises(StorageStateError):
+        repo.request_approval_and_wait(
+            task.id,
+            iteration.id,
+            '{"arguments":{},"kind":"finish","rationale":"pause"}',
+            "b" * 64,
+            "c" * 64,
+            policy_decision=_approval_decision(),
+            waiting_result=waiting,
+            owner_token=OWNER_A,
+        )
+
+    snapshot = repo.resume_snapshot(task.id)
+    assert snapshot.task.status is TaskStatus.RUNNING
+    assert snapshot.pending_approval is None
+
+
+def test_replacement_approval_and_waiting_transition_are_one_transaction(
+    repo: SQLiteTaskRepository,
+) -> None:
+    task = repo.create_task("C:/work/demo", "fix sum", round_limit=8)
+    _start(repo, task.id)
+    assert repo.acquire_project_lease(task.id, owner_token=OWNER_A) is True
+    iteration = repo.append_iteration(task.id, sequence=1, context_digest="a" * 64)
+    original = repo.record_approval(
+        task.id,
+        iteration.id,
+        '{"arguments":{"patch":"x"},"kind":"apply_patch","rationale":"patch"}',
+        "b" * 64,
+        "c" * 64,
+        policy_decision=_approval_decision(),
+    )
+    repo.decide_approval(original.id, ApprovalDecision.APPROVE)
+    waiting = TaskResult(
+        task_id=task.id,
+        status=TaskStatus.WAITING_APPROVAL,
+        iterations=1,
+        verification_summary="Approval changed.",
+    )
+    refreshed = _approval_decision().model_copy(
+        update={"matched_rule": "new_rule", "impact_summary": "Changed policy."}
+    )
+    repo._connection.execute(
+        """CREATE TRIGGER abort_rewait BEFORE UPDATE OF status ON tasks
+           WHEN NEW.status = 'waiting_approval'
+           BEGIN SELECT RAISE(ABORT, 'simulated crash'); END"""
+    )
+
+    with pytest.raises(StorageStateError):
+        repo.replace_approval_and_wait(
+            original.id,
+            refreshed,
+            waiting_result=waiting,
+            owner_token=OWNER_A,
+        )
+
+    snapshot = repo.resume_snapshot(task.id)
+    assert snapshot.task.status is TaskStatus.RUNNING
+    assert snapshot.pending_approval is None
+    assert snapshot.decided_approval.execution_state == "pending"
+
+
+def test_empty_expected_patch_effect_cannot_mean_already_applied(
+    repo: SQLiteTaskRepository,
+) -> None:
+    task = repo.create_task("C:/work/demo", "fix sum", round_limit=8)
+    _start(repo, task.id)
+    assert repo.acquire_project_lease(task.id, owner_token=OWNER_A) is True
+    iteration = repo.append_iteration(task.id, sequence=1, context_digest="a" * 64)
+    approval = repo.record_approval(
+        task.id,
+        iteration.id,
+        '{"arguments":{"patch":"x"},"kind":"apply_patch","rationale":"patch"}',
+        "b" * 64,
+        "c" * 64,
+    )
+    repo.decide_approval(approval.id, ApprovalDecision.APPROVE)
+
+    with pytest.raises(StorageStateError, match="expected effect"):
+        repo.mark_execution_intent(
+            approval.id, expected_after_digests={}, owner_token=OWNER_A
+        )
+
+
+def test_expected_effect_paths_enforce_utf8_byte_limit(repo: SQLiteTaskRepository) -> None:
+    task = repo.create_task("C:/work/demo", "fix sum", round_limit=8)
+    _start(repo, task.id)
+    assert repo.acquire_project_lease(task.id, owner_token=OWNER_A) is True
+    iteration = repo.append_iteration(task.id, sequence=1, context_digest="a" * 64)
+    approval = repo.record_approval(
+        task.id,
+        iteration.id,
+        '{"arguments":{"patch":"x"},"kind":"apply_patch","rationale":"patch"}',
+        "b" * 64,
+        "c" * 64,
+    )
+    repo.decide_approval(approval.id, ApprovalDecision.APPROVE)
+
+    with pytest.raises(StorageStateError, match="UTF-8"):
+        repo.mark_execution_intent(
+            approval.id,
+            expected_after_digests={"界" * 4_000: "d" * 64},
+            owner_token=OWNER_A,
+        )
+
+
+def test_approval_action_payload_enforces_utf8_byte_limit(repo: SQLiteTaskRepository) -> None:
+    task = repo.create_task("C:/work/demo", "fix sum", round_limit=8)
+    iteration = repo.append_iteration(task.id, sequence=1, context_digest="a" * 64)
+    oversized = (
+        '{"arguments":{},"kind":"finish","rationale":"'
+        + "界" * 30_000
+        + '"}'
+    )
+
+    with pytest.raises(StorageStateError, match="action payload"):
+        repo.record_approval(
+            task.id, iteration.id, oversized, "b" * 64, "c" * 64
+        )
 
 
 def test_reopen_recovers_rejected_approval_and_saved_policy_decision(tmp_path: Path) -> None:
@@ -269,7 +468,13 @@ def test_reopen_recovers_rejected_approval_and_saved_policy_decision(tmp_path: P
         "c" * 64,
         policy_decision=_approval_decision(),
     )
-    assert repo.set_status(task.id, TaskStatus.RUNNING, TaskStatus.WAITING_APPROVAL) is True
+    assert repo.acquire_project_lease(task.id, owner_token=OWNER_A) is True
+    assert repo.set_status(
+        task.id,
+        TaskStatus.RUNNING,
+        TaskStatus.WAITING_APPROVAL,
+        owner_token=OWNER_A,
+    ) is True
     repo.decide_approval(approval.id, ApprovalDecision.REJECT)
 
     recovered = SQLiteTaskRepository(db_path).resume_snapshot(task.id).decided_approval
@@ -280,8 +485,8 @@ def test_reopen_recovers_rejected_approval_and_saved_policy_decision(tmp_path: P
     assert recovered.policy_decision == _approval_decision()
 
     assert repo.set_status(task.id, TaskStatus.WAITING_APPROVAL, TaskStatus.RUNNING) is True
-    assert repo.acquire_project_lease(task.id) is True
-    consumed = repo.mark_rejection_consumed(approval.id)
+    assert repo.acquire_project_lease(task.id, owner_token=OWNER_A) is True
+    consumed = repo.mark_rejection_consumed(approval.id, owner_token=OWNER_A)
     assert consumed.execution_state == "completed"
     assert SQLiteTaskRepository(db_path).resume_snapshot(task.id).decided_approval == consumed
 
@@ -294,7 +499,7 @@ def test_reopen_recovers_expected_after_digests_before_dispatch_completion(
     repo = SQLiteTaskRepository(db_path)
     task = repo.create_task("C:/work/demo", "fix sum", round_limit=8)
     _start(repo, task.id)
-    assert repo.acquire_project_lease(task.id) is True
+    assert repo.acquire_project_lease(task.id, owner_token=OWNER_A) is True
     iteration = repo.append_iteration(task.id, sequence=1, context_digest="a" * 64)
     approval = repo.record_approval(
         task.id,
@@ -308,9 +513,12 @@ def test_reopen_recovers_expected_after_digests_before_dispatch_completion(
     repo.mark_execution_intent(
         approval.id,
         expected_after_digests={"pyproject.toml": "d" * 64, "requirements.txt": None},
+        owner_token=OWNER_A,
     )
 
-    recovered = SQLiteTaskRepository(db_path).resume_snapshot(task.id).executable_approval
+    recovered = SQLiteTaskRepository(db_path).resume_snapshot(
+        task.id, owner_token=OWNER_A
+    ).executable_approval
 
     assert recovered is not None
     assert recovered.execution_state == "intent_recorded"
@@ -318,7 +526,9 @@ def test_reopen_recovers_expected_after_digests_before_dispatch_completion(
         "pyproject.toml": "d" * 64,
         "requirements.txt": None,
     }
-    completed = repo.mark_execution_completed(approval.id, result_digest="e" * 64)
+    completed = repo.mark_execution_completed(
+        approval.id, result_digest="e" * 64, owner_token=OWNER_A
+    )
     assert completed.result_digest == "e" * 64
 
 
@@ -328,12 +538,13 @@ def test_transition_intent_evidence_survives_reopen_and_completion(tmp_path: Pat
     repo = SQLiteTaskRepository(db_path)
     task = repo.create_task("C:/work/demo", "fix sum", round_limit=8)
     _start(repo, task.id)
-    assert repo.acquire_project_lease(task.id) is True
+    assert repo.acquire_project_lease(task.id, owner_token=OWNER_A) is True
     intent = repo.record_transition_intent(
         task.id,
         kind="model_call",
         evidence_digest="a" * 64,
         summary="context prepared",
+        owner_token=OWNER_A,
     )
 
     reopened = SQLiteTaskRepository(db_path)
@@ -345,10 +556,76 @@ def test_transition_intent_evidence_survives_reopen_and_completion(tmp_path: Pat
         intent.id,
         result_digest="b" * 64,
         summary="response persisted",
+        owner_token=OWNER_A,
     )
     assert completed.state == "completed"
     assert completed.result_digest == "b" * 64
     assert completed.completion_summary == "response persisted"
+
+
+def test_completed_transition_payload_is_bounded_and_consumed_with_iteration(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "state.sqlite"
+    repo = SQLiteTaskRepository(db_path)
+    task = repo.create_task("C:/work/demo", "fix sum", round_limit=8)
+    _start(repo, task.id)
+    assert repo.acquire_project_lease(task.id, owner_token=OWNER_A) is True
+    intent = repo.record_transition_intent(
+        task.id,
+        kind="model_call",
+        evidence_digest="a" * 64,
+        summary="context prepared",
+        owner_token=OWNER_A,
+    )
+    completed = repo.complete_transition_intent(
+        intent.id,
+        result_digest="b" * 64,
+        summary="normalized action persisted",
+        result_payload={
+            "outcome": "action",
+            "action": {"kind": "finish", "arguments": {}, "rationale": "verify"},
+        },
+        owner_token=OWNER_A,
+    )
+    assert completed.result_payload["outcome"] == "action"
+    repo.close()
+
+    reopened = SQLiteTaskRepository(db_path)
+    recovered = reopened.resume_snapshot(task.id).transition_intents[0]
+    assert recovered.result_payload == completed.result_payload
+    assert recovered.consumed_at is None
+    reopened.append_iteration(
+        task.id,
+        sequence=1,
+        context_digest="a" * 64,
+        action_json='{"arguments":{},"kind":"finish","rationale":"verify"}',
+        source_intent_ids=(intent.id,),
+        owner_token=OWNER_A,
+    )
+    assert reopened.resume_snapshot(task.id).transition_intents[0].consumed_at is not None
+
+
+def test_transition_payload_rejects_unbounded_utf8(repo: SQLiteTaskRepository) -> None:
+    task = repo.create_task("C:/work/demo", "fix sum", round_limit=8)
+    _start(repo, task.id)
+    assert repo.acquire_project_lease(task.id, owner_token=OWNER_A) is True
+    intent = repo.record_transition_intent(
+        task.id,
+        kind="model_call",
+        evidence_digest="a" * 64,
+        summary="context prepared",
+        owner_token=OWNER_A,
+    )
+
+    with pytest.raises(StorageStateError, match="payload"):
+        repo.complete_transition_intent(
+            intent.id,
+            result_digest="b" * 64,
+            summary="response persisted",
+            result_payload={"summary": "界" * 30_000},
+            owner_token=OWNER_A,
+        )
 
 
 def test_deferred_approval_outcome_completes_original_iteration_idempotently(
@@ -359,7 +636,7 @@ def test_deferred_approval_outcome_completes_original_iteration_idempotently(
     repo = SQLiteTaskRepository(db_path)
     task = repo.create_task("C:/work/demo", "fix sum", round_limit=8)
     _start(repo, task.id)
-    assert repo.acquire_project_lease(task.id) is True
+    assert repo.acquire_project_lease(task.id, owner_token=OWNER_A) is True
     iteration = repo.append_iteration(task.id, sequence=1, context_digest="a" * 64)
     finding = Finding(
         source="pytest",
@@ -380,6 +657,7 @@ def test_deferred_approval_outcome_completes_original_iteration_idempotently(
         relevant_digest="d" * 64,
         quality_outcome="failed",
         findings=(finding,),
+        owner_token=OWNER_A,
     )
     repeated = repo.complete_iteration_outcome(
         task.id,
@@ -389,6 +667,7 @@ def test_deferred_approval_outcome_completes_original_iteration_idempotently(
         relevant_digest="d" * 64,
         quality_outcome="failed",
         findings=(finding,),
+        owner_token=OWNER_A,
     )
     reopened = SQLiteTaskRepository(db_path).resume_snapshot(task.id)
 

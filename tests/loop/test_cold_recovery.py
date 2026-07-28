@@ -1,0 +1,507 @@
+from __future__ import annotations
+
+from datetime import timedelta
+from threading import Event, Thread
+
+import pytest
+from conftest import (
+    NOW,
+    FixedClock,
+    RecordingAuditSink,
+    RecordingDispatcher,
+    ScriptedPipeline,
+    action_json,
+    dependency_patch_json,
+    failed_report,
+    finish_json,
+    ordinary_patch_json,
+    successful_report,
+)
+
+from pyquality.context import ContextBuilder
+from pyquality.domain.models import ApprovalDecision, TaskStatus, ToolResult
+from pyquality.feedback import ProgressTracker
+from pyquality.llm import ActionParser, Message, ScriptedLLM
+from pyquality.loop import AgentLoop
+from pyquality.policy import PolicyEngine
+from pyquality.storage.sqlite import SQLiteTaskRepository
+
+
+class SimulatedCrash(BaseException):
+    pass
+
+
+def crash_after_completed_transition(harness, monkeypatch, kind: str) -> None:
+    complete = harness.repository.complete_transition_intent
+
+    def crashing_complete(intent_id, **kwargs):
+        record = complete(intent_id, **kwargs)
+        if record.kind == kind:
+            raise SimulatedCrash
+        return record
+
+    monkeypatch.setattr(
+        harness.repository, "complete_transition_intent", crashing_complete
+    )
+
+
+def test_completed_model_response_cold_reopen_does_not_call_provider_again(
+    loop_fixture, monkeypatch
+) -> None:
+    harness = loop_fixture(
+        responses=[finish_json()], reports=[successful_report()]
+    )
+    crash_after_completed_transition(harness, monkeypatch, "model_call")
+
+    with pytest.raises(SimulatedCrash):
+        harness.loop.run(harness.task_id)
+    assert len(harness.llm.calls) == 1
+    assert harness.repository.resume_snapshot(harness.task_id).iterations == ()
+
+    restarted_llm = ScriptedLLM([])
+    restarted_pipeline = ScriptedPipeline([successful_report()])
+    harness.restart(restarted_llm, restarted_pipeline)
+    result = harness.loop.resume(harness.task_id)
+
+    assert result.status is TaskStatus.SUCCEEDED
+    assert restarted_llm.calls == []
+    assert len(restarted_pipeline.calls) == 1
+
+
+def test_completed_rejection_cold_reopen_restores_feedback_once(
+    loop_fixture, monkeypatch
+) -> None:
+    harness = loop_fixture(
+        responses=[dependency_patch_json()], reports=[]
+    )
+    harness.loop.run(harness.task_id)
+    approval = harness.loop.pending_approval(harness.task_id)
+    harness.loop.decide_approval(approval.id, ApprovalDecision.REJECT)
+    consume = harness.repository.mark_rejection_consumed
+
+    def crash_after_consume(approval_id, **kwargs):
+        consume(approval_id, **kwargs)
+        raise SimulatedCrash
+
+    monkeypatch.setattr(harness.repository, "mark_rejection_consumed", crash_after_consume)
+    with pytest.raises(SimulatedCrash):
+        harness.loop.resume(harness.task_id)
+
+    restarted_llm = ScriptedLLM([finish_json()])
+    harness.restart(restarted_llm, ScriptedPipeline([successful_report()]))
+    result = harness.loop.resume(harness.task_id)
+
+    assert result.status is TaskStatus.SUCCEEDED
+    assert "rejected by user" in restarted_llm.calls[0][-1].content
+    snapshot = harness.repository.resume_snapshot(harness.task_id)
+    rejection_findings = [
+        item for item in snapshot.findings if "rejected" in item.finding.summary
+    ]
+    assert len(rejection_findings) == 1
+
+
+def test_completed_verifier_report_cold_reopen_is_not_rerun(
+    loop_fixture, monkeypatch
+) -> None:
+    harness = loop_fixture(
+        responses=[ordinary_patch_json()], reports=[failed_report()]
+    )
+    crash_after_completed_transition(harness, monkeypatch, "verifier")
+    with pytest.raises(SimulatedCrash):
+        harness.loop.run(harness.task_id)
+    assert len(harness.dispatcher.actions) == 1
+    assert len(harness.pipeline.calls) == 1
+
+    restarted_llm = ScriptedLLM([finish_json()])
+    restarted_pipeline = ScriptedPipeline([successful_report()])
+    harness.restart(restarted_llm, restarted_pipeline)
+    result = harness.loop.resume(harness.task_id)
+
+    assert result.status is TaskStatus.SUCCEEDED
+    assert len(harness.dispatcher.actions) == 1
+    assert len(restarted_pipeline.calls) == 1
+    assert "assertion" in restarted_llm.calls[0][-1].content
+
+
+def test_approved_completed_verifier_cold_reopen_is_not_rerun(
+    loop_fixture, monkeypatch
+) -> None:
+    harness = loop_fixture(
+        responses=[dependency_patch_json()], reports=[failed_report()]
+    )
+    harness.loop.run(harness.task_id)
+    approval = harness.loop.pending_approval(harness.task_id)
+    harness.loop.decide_approval(approval.id, ApprovalDecision.APPROVE)
+    crash_after_completed_transition(harness, monkeypatch, "verifier")
+
+    with pytest.raises(SimulatedCrash):
+        harness.loop.resume(harness.task_id)
+
+    restarted_llm = ScriptedLLM([finish_json()])
+    restarted_pipeline = ScriptedPipeline([successful_report()])
+    harness.restart(restarted_llm, restarted_pipeline)
+    result = harness.loop.resume(harness.task_id)
+
+    assert result.status is TaskStatus.SUCCEEDED
+    assert len(harness.dispatcher.actions) == 1
+    assert len(restarted_pipeline.calls) == 1
+    assert "assertion" in restarted_llm.calls[0][-1].content
+
+
+def test_approved_failed_report_persisted_before_completion_recovers_as_feedback(
+    loop_fixture, monkeypatch
+) -> None:
+    harness = loop_fixture(
+        responses=[dependency_patch_json()], reports=[failed_report()]
+    )
+    harness.loop.run(harness.task_id)
+    approval = harness.loop.pending_approval(harness.task_id)
+    harness.loop.decide_approval(approval.id, ApprovalDecision.APPROVE)
+    persist = harness.repository.complete_iteration_outcome
+
+    def crash_after_report(*args, **kwargs):
+        persist(*args, **kwargs)
+        raise SimulatedCrash
+
+    monkeypatch.setattr(harness.repository, "complete_iteration_outcome", crash_after_report)
+    with pytest.raises(SimulatedCrash):
+        harness.loop.resume(harness.task_id)
+
+    restarted_llm = ScriptedLLM([finish_json()])
+    restarted_pipeline = ScriptedPipeline([successful_report()])
+    harness.restart(restarted_llm, restarted_pipeline)
+    result = harness.loop.resume(harness.task_id)
+
+    assert result.status is TaskStatus.SUCCEEDED
+    assert len(harness.dispatcher.actions) == 1
+    assert len(restarted_pipeline.calls) == 1
+    assert "assertion" in restarted_llm.calls[0][-1].content
+
+
+def test_schema_repair_cap_survives_cold_reopen(loop_fixture) -> None:
+    class CrashBeforeSecondRound(ScriptedLLM):
+        def complete(self, messages: tuple[Message, ...]) -> str:
+            if self.calls:
+                raise SimulatedCrash
+            return super().complete(messages)
+
+    harness = loop_fixture(llm=CrashBeforeSecondRound(["not json"]))
+    with pytest.raises(SimulatedCrash):
+        harness.loop.run(harness.task_id)
+    assert len(harness.repository.resume_snapshot(harness.task_id).iterations) == 1
+
+    restarted_llm = ScriptedLLM(["[]", '{"kind":"unknown"}'])
+    harness.restart(restarted_llm, ScriptedPipeline([]))
+    result = harness.loop.resume(harness.task_id)
+
+    assert result.status is TaskStatus.FAILED
+    assert len(restarted_llm.calls) == 2
+    assert all("schema" in call[-1].content.casefold() for call in restarted_llm.calls)
+
+
+def test_non_mutating_tool_feedback_survives_exact_dispatch_crash(
+    loop_fixture, monkeypatch
+) -> None:
+    output = ToolResult(
+        effect_kind="read_file",
+        code_changed=False,
+        evidence="persisted tool output",
+        normalized_metadata={"code": "ok"},
+    )
+    harness = loop_fixture(
+        responses=[action_json("read_file", {"path": "src/calc.py"})],
+        dispatch_results=[output],
+    )
+    crash_after_completed_transition(harness, monkeypatch, "dispatch")
+    with pytest.raises(SimulatedCrash):
+        harness.loop.run(harness.task_id)
+
+    restarted_llm = ScriptedLLM([finish_json()])
+    harness.restart(restarted_llm, ScriptedPipeline([successful_report()]))
+    result = harness.loop.resume(harness.task_id)
+
+    assert result.status is TaskStatus.SUCCEEDED
+    assert len(harness.dispatcher.actions) == 1
+    assert "persisted tool output" in restarted_llm.calls[0][-1].content
+
+
+def test_non_mutating_tool_feedback_survives_crash_after_iteration_commit(
+    loop_fixture, monkeypatch
+) -> None:
+    output = ToolResult(
+        effect_kind="read_file",
+        code_changed=False,
+        evidence="committed tool output",
+        normalized_metadata={"code": "ok"},
+    )
+    harness = loop_fixture(
+        responses=[action_json("read_file", {"path": "src/calc.py"})],
+        dispatch_results=[output],
+    )
+    append = harness.repository.append_iteration
+
+    def crash_after_iteration(*args, **kwargs):
+        record = append(*args, **kwargs)
+        if record.tool_result_digest is not None:
+            raise SimulatedCrash
+        return record
+
+    monkeypatch.setattr(harness.repository, "append_iteration", crash_after_iteration)
+    with pytest.raises(SimulatedCrash):
+        harness.loop.run(harness.task_id)
+
+    restarted_llm = ScriptedLLM([finish_json()])
+    harness.restart(restarted_llm, ScriptedPipeline([successful_report()]))
+    result = harness.loop.resume(harness.task_id)
+
+    assert result.status is TaskStatus.SUCCEEDED
+    assert len(harness.dispatcher.actions) == 1
+    assert "committed tool output" in restarted_llm.calls[0][-1].content
+
+
+def test_cumulative_changed_paths_survive_cold_reopen(loop_fixture) -> None:
+    class CrashBeforeNextRound(ScriptedLLM):
+        def complete(self, messages: tuple[Message, ...]) -> str:
+            if self.calls:
+                raise SimulatedCrash
+            return super().complete(messages)
+
+    harness = loop_fixture(
+        llm=CrashBeforeNextRound([ordinary_patch_json()]), reports=[failed_report()]
+    )
+    with pytest.raises(SimulatedCrash):
+        harness.loop.run(harness.task_id)
+
+    harness.restart(
+        ScriptedLLM([finish_json()]), ScriptedPipeline([successful_report()])
+    )
+    result = harness.loop.resume(harness.task_id)
+
+    assert result.status is TaskStatus.SUCCEEDED
+    assert result.changed_paths == ("src/calc.py",)
+
+
+def test_deadline_after_model_response_wins_before_approval(loop_fixture) -> None:
+    clock = FixedClock(NOW)
+
+    class DeadlineAdvancingLLM(ScriptedLLM):
+        def complete(self, messages: tuple[Message, ...]) -> str:
+            response = super().complete(messages)
+            clock.value = NOW + timedelta(seconds=1)
+            return response
+
+    harness = loop_fixture(
+        llm=DeadlineAdvancingLLM([dependency_patch_json()]),
+        deadline=NOW + timedelta(seconds=1),
+        clock=clock,
+    )
+
+    result = harness.loop.run(harness.task_id)
+
+    assert result.status is TaskStatus.BUDGET_EXHAUSTED
+    assert harness.repository.pending_approval(harness.task_id) is None
+    assert harness.dispatcher.actions == []
+
+
+def test_two_independent_loops_cannot_enter_drive_for_same_task(loop_fixture) -> None:
+    entered = Event()
+    release = Event()
+
+    class BlockingLLM(ScriptedLLM):
+        def complete(self, messages: tuple[Message, ...]) -> str:
+            entered.set()
+            assert release.wait(timeout=5)
+            return super().complete(messages)
+
+    harness = loop_fixture(responses=[], reports=[])
+    first_client = BlockingLLM([finish_json()])
+    second_repo = SQLiteTaskRepository(harness.db_path)
+    second_client = ScriptedLLM([finish_json()])
+    second_loop = AgentLoop(
+        repository=second_repo,
+        policy=PolicyEngine(harness.repo_root),
+        dispatcher=RecordingDispatcher(),
+        pipeline=ScriptedPipeline([successful_report()]),
+        parser=ActionParser(),
+        llm=second_client,
+        context_builder=ContextBuilder(),
+        progress_tracker=ProgressTracker(),
+        clock=FixedClock(),
+        audit_sink=RecordingAuditSink(),
+    )
+    first_result = []
+
+    def run_first() -> None:
+        first_loop = AgentLoop(
+            repository=SQLiteTaskRepository(harness.db_path),
+            policy=PolicyEngine(harness.repo_root),
+            dispatcher=RecordingDispatcher(),
+            pipeline=ScriptedPipeline([successful_report()]),
+            parser=ActionParser(),
+            llm=first_client,
+            context_builder=ContextBuilder(),
+            progress_tracker=ProgressTracker(),
+            clock=FixedClock(),
+            audit_sink=RecordingAuditSink(),
+        )
+        first_result.append(first_loop.run(harness.task_id))
+
+    thread = Thread(
+        target=run_first,
+        daemon=True,
+    )
+    thread.start()
+    assert entered.wait(timeout=5)
+
+    competing = second_loop.resume(harness.task_id)
+    release.set()
+    thread.join(timeout=5)
+
+    assert competing.status is TaskStatus.BLOCKED
+    assert second_client.calls == []
+    assert first_result[0].status is TaskStatus.SUCCEEDED
+
+
+@pytest.mark.parametrize(
+    ("component", "response"),
+    [
+        ("context", finish_json()),
+        ("policy", finish_json()),
+        ("dispatcher", action_json("read_file", {"path": "src/calc.py"})),
+        ("pipeline", finish_json()),
+        ("progress", finish_json()),
+        ("audit", finish_json()),
+    ],
+)
+def test_injected_internal_exception_fails_and_releases_lease(
+    loop_fixture, monkeypatch, component: str, response: str
+) -> None:
+    harness = loop_fixture(responses=[response], reports=[successful_report()])
+
+    def explode(*args, **kwargs):
+        del args, kwargs
+        raise RuntimeError(f"{component} failed")
+
+    target, method = {
+        "context": (harness.loop._context_builder, "build"),
+        "policy": (harness.loop._policy, "evaluate"),
+        "dispatcher": (harness.dispatcher, "dispatch"),
+        "pipeline": (harness.pipeline, "run"),
+        "progress": (harness.loop._progress_tracker, "decide"),
+        "audit": (harness.audit, "emit"),
+    }[component]
+    monkeypatch.setattr(target, method, explode)
+
+    result = harness.loop.run(harness.task_id)
+
+    assert result.status is TaskStatus.FAILED
+    next_task = harness.repository.create_task(
+        str(harness.repo_root.resolve()), "next task", round_limit=2
+    )
+    assert harness.repository.set_status(
+        next_task.id, TaskStatus.CREATED, TaskStatus.RUNNING
+    ) is True
+    assert harness.repository.acquire_project_lease(
+        next_task.id, owner_token="next-owner"
+    ) is True
+
+
+def test_injected_availability_exception_blocks_and_releases_lease(
+    loop_fixture, monkeypatch
+) -> None:
+    harness = loop_fixture(responses=[finish_json()])
+    monkeypatch.setattr(
+        harness.loop._context_builder,
+        "build",
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("unavailable")),
+    )
+
+    result = harness.loop.run(harness.task_id)
+
+    assert result.status is TaskStatus.BLOCKED
+
+
+def test_audit_failure_after_atomic_wait_returns_saved_waiting_state(
+    loop_fixture, monkeypatch
+) -> None:
+    harness = loop_fixture(responses=[dependency_patch_json()])
+    original_emit = harness.audit.emit
+
+    def fail_requested(event):
+        if event.event_type == "approval_requested":
+            raise RuntimeError("audit unavailable after wait")
+        original_emit(event)
+
+    monkeypatch.setattr(harness.audit, "emit", fail_requested)
+
+    result = harness.loop.run(harness.task_id)
+
+    assert result.status is TaskStatus.WAITING_APPROVAL
+    assert harness.loop.pending_approval(harness.task_id) is not None
+
+
+def test_audit_failure_after_atomic_approval_decision_does_not_escape(
+    loop_fixture, monkeypatch
+) -> None:
+    harness = loop_fixture(responses=[dependency_patch_json()])
+    harness.loop.run(harness.task_id)
+    approval = harness.loop.pending_approval(harness.task_id)
+    monkeypatch.setattr(
+        harness.audit,
+        "emit",
+        lambda event: (_ for _ in ()).throw(RuntimeError(event.event_type)),
+    )
+
+    harness.loop.decide_approval(approval.id, ApprovalDecision.REJECT)
+
+    snapshot = harness.repository.resume_snapshot(harness.task_id)
+    assert snapshot.task.status is TaskStatus.RUNNING
+    assert snapshot.decided_approval.decision is ApprovalDecision.REJECT
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    [
+        "UPDATE tasks SET deadline = 'not-a-datetime' WHERE id = ?",
+        "UPDATE tasks SET status = 'not-a-state' WHERE id = ?",
+    ],
+)
+def test_corrupt_persisted_task_state_maps_durably_to_failed(
+    loop_fixture, corruption: str
+) -> None:
+    harness = loop_fixture(responses=[])
+    harness.repository._connection.execute(
+        corruption, (harness.task_id,)
+    )
+
+    result = harness.loop.resume(harness.task_id)
+
+    assert result.status is TaskStatus.FAILED
+    assert harness.repository.resume_snapshot(harness.task_id).task.status is TaskStatus.FAILED
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    [
+        "UPDATE approvals SET execution_state = 'not-a-state' WHERE id = ?",
+        "UPDATE approvals SET policy_decision_json = '{' WHERE id = ?",
+        "UPDATE approvals SET decided_at = 'not-a-datetime' WHERE id = ?",
+        "UPDATE approvals SET expected_after_digests_json = '{' WHERE id = ?",
+    ],
+)
+def test_corrupt_persisted_approval_maps_durably_to_failed(
+    loop_fixture, corruption: str
+) -> None:
+    harness = loop_fixture(responses=[dependency_patch_json()])
+    harness.loop.run(harness.task_id)
+    approval = harness.loop.pending_approval(harness.task_id)
+    harness.loop.decide_approval(approval.id, ApprovalDecision.APPROVE)
+    harness.repository._connection.execute(
+        corruption, (approval.id,)
+    )
+
+    result = harness.loop.resume(harness.task_id)
+    repeated = harness.loop.resume(harness.task_id)
+
+    assert result.status is TaskStatus.FAILED
+    assert repeated == result

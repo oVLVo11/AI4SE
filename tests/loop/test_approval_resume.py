@@ -106,10 +106,16 @@ def test_recovery_marks_already_applied_intent_complete_without_replay(loop_fixt
     harness.loop.run(harness.task_id)
     approval = harness.loop.pending_approval(harness.task_id)
     harness.loop.decide_approval(approval.id, ApprovalDecision.APPROVE)
-    assert harness.repository.acquire_project_lease(harness.task_id) is True
+    assert harness.repository.acquire_project_lease(
+        harness.task_id, owner_token="seed-owner"
+    ) is True
     harness.repository.mark_execution_intent(
         approval.id,
         expected_after_digests=harness.dispatcher.expected,
+        owner_token="seed-owner",
+    )
+    harness.repository.release_project_lease(
+        harness.task_id, owner_token="seed-owner"
     )
     harness.dispatcher.effect_already_matches = True
 
@@ -153,9 +159,16 @@ def test_applied_intent_evidence_wins_over_the_expected_repository_snapshot_chan
     harness.loop.run(harness.task_id)
     approval = harness.loop.pending_approval(harness.task_id)
     harness.loop.decide_approval(approval.id, ApprovalDecision.APPROVE)
-    assert harness.repository.acquire_project_lease(harness.task_id) is True
+    assert harness.repository.acquire_project_lease(
+        harness.task_id, owner_token="seed-owner"
+    ) is True
     harness.repository.mark_execution_intent(
-        approval.id, expected_after_digests=harness.dispatcher.expected
+        approval.id,
+        expected_after_digests=harness.dispatcher.expected,
+        owner_token="seed-owner",
+    )
+    harness.repository.release_project_lease(
+        harness.task_id, owner_token="seed-owner"
     )
     harness.dispatcher.effect_already_matches = True
     policies[0].drifted = True
@@ -176,10 +189,16 @@ def test_recovery_replays_intent_only_when_original_snapshot_is_still_current(
     harness.loop.run(harness.task_id)
     approval = harness.loop.pending_approval(harness.task_id)
     harness.loop.decide_approval(approval.id, ApprovalDecision.APPROVE)
-    assert harness.repository.acquire_project_lease(harness.task_id) is True
+    assert harness.repository.acquire_project_lease(
+        harness.task_id, owner_token="seed-owner"
+    ) is True
     harness.repository.mark_execution_intent(
         approval.id,
         expected_after_digests=harness.dispatcher.expected,
+        owner_token="seed-owner",
+    )
+    harness.repository.release_project_lease(
+        harness.task_id, owner_token="seed-owner"
     )
 
     result = harness.loop.resume(harness.task_id)
@@ -203,7 +222,9 @@ def test_out_of_state_decision_does_not_consume_pending_approval(loop_fixture) -
     else:
         raise AssertionError("out-of-state decision did not fail")
 
-    assert harness.repository.pending_approval(harness.task_id) == approval
+    snapshot = harness.repository.resume_snapshot(harness.task_id)
+    assert snapshot.pending_approval == approval
+    assert harness.repository.pending_approval(harness.task_id) is None
 
 
 def test_revalidation_policy_change_requires_a_new_bound_approval(loop_fixture) -> None:
@@ -234,9 +255,7 @@ def test_revalidation_policy_change_requires_a_new_bound_approval(loop_fixture) 
     assert harness.dispatcher.actions == []
 
 
-def test_reapproval_cas_failure_maps_to_failed_not_false_waiting_result(
-    loop_fixture, monkeypatch
-) -> None:
+def test_reapproval_storage_failure_maps_to_failed(loop_fixture, monkeypatch) -> None:
     class ChangedPolicy(PolicyEngine):
         def revalidate(self, decision, action, current_snapshot_digest):
             refreshed = super().revalidate(decision, action, current_snapshot_digest)
@@ -253,14 +272,15 @@ def test_reapproval_cas_failure_maps_to_failed_not_false_waiting_result(
     harness.loop.run(harness.task_id)
     original = harness.loop.pending_approval(harness.task_id)
     harness.loop.decide_approval(original.id, ApprovalDecision.APPROVE)
-    set_status = harness.repository.set_status
+    def fail_reapproval(*args, **kwargs):
+        del args, kwargs
+        from pyquality.storage.sqlite import StorageStateError
 
-    def lose_reapproval_cas(task_id, expected, new, result=None):
-        if expected is TaskStatus.RUNNING and new is TaskStatus.WAITING_APPROVAL:
-            return False
-        return set_status(task_id, expected, new, result)
+        raise StorageStateError("simulated atomic replacement failure")
 
-    monkeypatch.setattr(harness.repository, "set_status", lose_reapproval_cas)
+    monkeypatch.setattr(
+        harness.repository, "replace_approval_and_wait", fail_reapproval
+    )
 
     result = harness.loop.resume(harness.task_id)
 
@@ -311,7 +331,9 @@ def test_malformed_persisted_approval_action_maps_to_failed(loop_fixture) -> Non
     assert harness.repository.set_status(
         harness.task_id, TaskStatus.CREATED, TaskStatus.RUNNING
     ) is True
-    assert harness.repository.acquire_project_lease(harness.task_id) is True
+    assert harness.repository.acquire_project_lease(
+        harness.task_id, owner_token="seed-owner"
+    ) is True
     iteration = harness.repository.append_iteration(
         harness.task_id, sequence=1, context_digest="a" * 64
     )
@@ -330,9 +352,15 @@ def test_malformed_persisted_approval_action_maps_to_failed(loop_fixture) -> Non
         ),
     )
     assert harness.repository.set_status(
-        harness.task_id, TaskStatus.RUNNING, TaskStatus.WAITING_APPROVAL
+        harness.task_id,
+        TaskStatus.RUNNING,
+        TaskStatus.WAITING_APPROVAL,
+        owner_token="seed-owner",
     ) is True
     harness.loop.decide_approval(approval.id, ApprovalDecision.APPROVE)
+    harness.repository.release_project_lease(
+        harness.task_id, owner_token="seed-owner"
+    )
 
     result = harness.loop.resume(harness.task_id)
 

@@ -191,6 +191,7 @@ class Harness:
     db_path: Path
 
     def restart(self, llm: LLMClient, pipeline: ScriptedPipeline) -> None:
+        self.repository.close()
         self.repository = SQLiteTaskRepository(self.db_path)
         self.llm = llm
         self.pipeline = pipeline
