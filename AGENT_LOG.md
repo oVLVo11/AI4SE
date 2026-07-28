@@ -1,0 +1,18 @@
+# PyQuality Harness Agent Log
+
+## 2026-07-28 — Brainstorming
+
+Controller-supplied conversation evidence records the selected quality-loop scenario, Python-only scope, local-repository plus natural-language task input, pytest and Ruff verification, and a deep structured-feedback loop. Alternatives and dispositions are preserved in `SPEC_PROCESS.md`. Raw dialogue timestamps and quotes are not stored in the repository.
+
+## 2026-07-28 — Writing-plans
+
+The reviewed implementation plan was recorded in `docs/superpowers/plans/2026-07-28-pyquality-harness.md` by commit `743b69c` (`docs: add PyQuality Harness implementation plan`). It is the source for the self-contained `PLAN.md` course deliverable.
+
+## 2026-07-28 — Approved design commit
+
+Commit `de51d59` (`docs: add approved PyQuality Harness design`) added `docs/superpowers/specs/2026-07-28-pyquality-harness-design.md`. The commit metadata records 2026-07-28; this log does not infer a conversation timestamp from it.
+
+## 2026-07-28 — Task 0 baseline materialization
+
+Created self-contained root `SPEC.md`, `PLAN.md`, `SPEC_PROCESS.md`, and `AGENT_LOG.md` from approved repository documents and controller-supplied process evidence. Cold-start findings and correction evidence are not recorded until the validation occurs.
+
