@@ -79,6 +79,7 @@ def test_keyring_backend_failure_is_typed_and_sanitized() -> None:
 
     assert "sk-secret" not in str(raised.value)
     assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
 
 
 def test_get_requires_a_provider_callable(memory_keyring: MemoryKeyring) -> None:
@@ -100,6 +101,22 @@ def test_get_rejects_a_provider_that_echoes_the_credential(memory_keyring: Memor
 
     assert "sk-secret" not in str(raised.value)
     assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+
+
+def test_provider_result_rejects_secret_in_mapping_key_and_arbitrary_object(memory_keyring: MemoryKeyring) -> None:
+    """Catches a callback result that smuggles credentials through keys or object attributes."""
+    service = CredentialService(memory_keyring, service_name="pyquality")
+    service.set("provider", "sk-secret")
+
+    class Result:
+        key = "sk-secret"
+
+    for result in ({"sk-secret": "echo"}, Result()):
+        with pytest.raises(CredentialProviderError) as raised:
+            service.get("provider", lambda _, result=result: result)
+        assert raised.value.__cause__ is None
+        assert raised.value.__context__ is None
 
 
 def test_backend_exception_does_not_preserve_secret_in_exception_chain() -> None:

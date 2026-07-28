@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import multiprocessing
 import os
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -9,6 +10,12 @@ import pytest
 
 from pyquality.domain.models import AuditEvent
 from pyquality.security import AuditLogger, AuditWriteError, redact
+
+
+def _emit_in_process(path: str, start: int, count: int) -> None:
+    logger = AuditLogger(Path(path))
+    for index in range(start, start + count):
+        logger.emit(AuditEvent(event_type="transition", metadata={"intent_id": f"intent-{index}"}))
 
 
 def test_redacts_nested_headers_urls_and_exception_text(tmp_path: Path) -> None:
@@ -47,6 +54,35 @@ def test_redact_handles_cycles_bytes_and_dangerous_objects_without_mutating_inpu
     assert "sk-secret" not in json.dumps(clean)
 
 
+def test_redact_sanitizes_registered_secret_mapping_keys_and_resolves_collisions() -> None:
+    """Catches key leaks and order-dependent overwrites after key redaction/truncation."""
+    clean = redact(
+        {"sk-secret": "first", "[REDACTED]": "second"},
+        secrets={"sk-secret"},
+        sensitive_keys=set(),
+    )
+
+    assert "sk-secret" not in json.dumps(clean)
+    assert list(clean.values()) == ["first", "second"]
+    assert len(clean) == 2
+
+
+def test_redact_limits_lazy_generator_work_and_aggregate_output() -> None:
+    """Catches eager list materialization and unbounded aggregate traversal."""
+
+    def guarded_generator():
+        for index in range(10_000):
+            if index == 130:
+                raise AssertionError("redaction consumed an unbounded generator")
+            yield {"value": "x" * 2_000, "index": index}
+
+    clean = redact(guarded_generator(), secrets=set(), sensitive_keys=set())
+
+    assert isinstance(clean, list | str)
+    assert len(json.dumps(clean).encode("utf-8")) <= 8_192
+    assert len(clean) <= 129
+
+
 def test_audit_log_omits_source_and_prompt_by_default(tmp_path: Path) -> None:
     """Catches accepting prompt/source-bearing metadata into a persisted audit record."""
     logger = AuditLogger(tmp_path / "audit.jsonl", secrets={"sk-secret"})
@@ -55,6 +91,91 @@ def test_audit_log_omits_source_and_prompt_by_default(tmp_path: Path) -> None:
 
     text = (tmp_path / "audit.jsonl").read_text(encoding="utf-8")
     assert "source body" not in text and "sk-secret" not in text
+
+
+def test_audit_log_accepts_only_allowlisted_metadata_and_normalizes_aliases(tmp_path: Path) -> None:
+    """Catches body-bearing aliases bypassing a denylist instead of an approved metadata schema."""
+    logger = AuditLogger(tmp_path / "audit.jsonl")
+    logger.emit(
+        AuditEvent(
+            event_type="transition",
+            metadata={
+                "intentId": "intent-1",
+                "actionDigest": "a" * 64,
+                "payload": "source body",
+                "messages": [{"content": "source body"}],
+                "completion": "source body",
+                "conversation": "source body",
+            },
+        )
+    )
+
+    record = json.loads((tmp_path / "audit.jsonl").read_text(encoding="utf-8"))
+    assert record["metadata"] == {"action_digest": "a" * 64, "intent_id": "intent-1"}
+
+
+def test_audit_record_cap_applies_after_duration_and_outcome_fallback(tmp_path: Path) -> None:
+    """Catches a fallback that omits metadata but persists unbounded envelope outcome fields."""
+    logger = AuditLogger(tmp_path / "audit.jsonl")
+    logger.emit(
+        AuditEvent(
+            event_type="model",
+            metadata={"duration": "x" * 200_000, "outcome": "y" * 200_000, "intent_id": "ok"},
+        )
+    )
+
+    assert len((tmp_path / "audit.jsonl").read_bytes().rstrip(b"\n")) <= 16_384
+
+
+def test_audit_normalizes_lone_surrogates_to_valid_utf8(tmp_path: Path) -> None:
+    """Catches a Unicode encoding error from strings that contain a lone surrogate."""
+    logger = AuditLogger(tmp_path / "audit.jsonl")
+    logger.emit(AuditEvent.model_construct(event_type="model\ud800", metadata={"intent_id": "ok\udcff"}))
+
+    text = (tmp_path / "audit.jsonl").read_text(encoding="utf-8")
+    assert "\ud800" not in text and "\udcff" not in text
+
+
+def test_audit_rejects_final_and_parent_symlink_targets(tmp_path: Path) -> None:
+    """Catches audit writes that follow a final-file or parent-directory link outside the audit root."""
+    outside = tmp_path / "outside.txt"
+    outside.write_text("outside\n", encoding="utf-8")
+    final_link = tmp_path / "audit.jsonl"
+    parent_link = tmp_path / "audit-parent"
+    outside_dir = tmp_path / "outside-dir"
+    outside_dir.mkdir()
+    try:
+        final_link.symlink_to(outside)
+        parent_link.symlink_to(outside_dir, target_is_directory=True)
+    except OSError as error:
+        pytest.skip(f"symlink creation unavailable: {error.__class__.__name__}")
+
+    for path in (final_link, parent_link / "audit.jsonl"):
+        with pytest.raises(AuditWriteError) as raised:
+            AuditLogger(path).emit(AuditEvent(event_type="model", metadata={"intent_id": "ok"}))
+        assert raised.value.__cause__ is None
+        assert raised.value.__context__ is None
+    assert outside.read_text(encoding="utf-8") == "outside\n"
+    assert not (outside_dir / "audit.jsonl").exists()
+
+
+def test_audit_recovers_partial_tail_and_serializes_multi_process_emits(tmp_path: Path) -> None:
+    """Catches inter-process interleaving and a crash tail that makes future JSONL unreadable."""
+    path = tmp_path / "audit.jsonl"
+    path.write_bytes(b'{"event_type":"partial"')
+    context = multiprocessing.get_context("spawn")
+    processes = [context.Process(target=_emit_in_process, args=(str(path), index * 20, 20)) for index in range(3)]
+    for process in processes:
+        process.start()
+    for process in processes:
+        process.join(20)
+        assert process.exitcode == 0
+
+    records = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    assert len(records) == 60
+    assert {record["metadata"]["intent_id"] for record in records} == {
+        f"intent-{index}" for index in range(60)
+    }
 
 
 def test_audit_log_omits_nested_model_body_metadata(tmp_path: Path) -> None:
@@ -68,7 +189,7 @@ def test_audit_log_omits_nested_model_body_metadata(tmp_path: Path) -> None:
     )
 
     record = json.loads((tmp_path / "audit.jsonl").read_text(encoding="utf-8"))
-    assert record["metadata"] == {"request": {}}
+    assert record["metadata"] == {}
 
 
 def test_audit_log_keeps_approved_scalar_metadata_in_its_envelope(tmp_path: Path) -> None:
@@ -153,3 +274,4 @@ def test_audit_write_failure_is_typed_and_does_not_chain_sensitive_event(tmp_pat
 
     assert "sk-secret" not in str(raised.value)
     assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None

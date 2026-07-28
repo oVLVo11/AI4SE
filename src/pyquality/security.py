@@ -1,4 +1,4 @@
-"""Credential isolation, recursive redaction, and durable local audit output."""
+"""Credential isolation, bounded redaction, and hardened local JSONL audit output."""
 
 from __future__ import annotations
 
@@ -6,12 +6,13 @@ import json
 import math
 import os
 import re
-import threading
-from collections.abc import Callable, Mapping, Sequence
+import stat
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from collections.abc import Set as AbstractSet
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import BinaryIO, Literal
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from pydantic import Field
@@ -24,46 +25,50 @@ _UNSUPPORTED = "[UNSUPPORTED_OBJECT]"
 _CYCLE = "[CYCLE]"
 _TRUNCATED = "[TRUNCATED]"
 _MAX_DEPTH = 16
-_MAX_ITEMS = 100
+_MAX_WORK = 512
+_MAX_ITEMS = 128
 _MAX_TEXT_BYTES = 4_096
+_MAX_REDACTION_BYTES = 8_192
 _MAX_RECORD_BYTES = 16_384
 _SENSITIVE_KEY_PARTS = frozenset(
     {"authorization", "api_key", "apikey", "token", "secret", "password", "credential"}
 )
-_BODY_KEY_PARTS = frozenset({"prompt", "response", "source", "body", "model_input", "model_output"})
 _BEARER = re.compile(r"(?i)(bearer\s+)([^\s,;]+)")
+_APPROVED_ALIASES = {
+    "intent_id": "intent_id", "intentId": "intent_id", "intent-id": "intent_id",
+    "approval_id": "approval_id", "approvalId": "approval_id", "approval-id": "approval_id",
+    "action_digest": "action_digest", "actionDigest": "action_digest", "action-digest": "action_digest",
+    "digest": "digest", "status": "status", "decision": "decision", "duration": "duration",
+    "outcome": "outcome", "error_code": "error_code", "errorCode": "error_code",
+}
 
 
 class CredentialError(RuntimeError):
-    """Base class for credential operations that deliberately hides backend details."""
+    """Base class for deliberately detail-free credential failures."""
 
 
 class CredentialBackendError(CredentialError):
-    """The selected keyring cannot safely perform the requested operation."""
+    pass
 
 
 class CredentialNotFoundError(CredentialError):
-    """No credential is available from the explicitly selected source."""
+    pass
 
 
 class CredentialProviderError(CredentialError):
-    """The provider callable failed after receiving an isolated credential."""
+    pass
 
 
 class AuditWriteError(RuntimeError):
-    """An audit record could not be safely appended."""
+    pass
 
 
 class CredentialWarning(PublicModel):
-    """A safe, serializable warning returned for environment credential use."""
-
     code: Literal["environment_plaintext"]
     message: str = Field(min_length=1, max_length=256)
 
 
 class CredentialStatus(PublicModel):
-    """Presence-only credential state; it intentionally has no value field."""
-
     present: bool
     source: Literal["keyring", "environment"]
     warning: CredentialWarning | None = None
@@ -71,8 +76,6 @@ class CredentialStatus(PublicModel):
 
 @dataclass(frozen=True, repr=False)
 class CredentialUse[T]:
-    """Provider output plus any source warning, with a value-safe representation."""
-
     value: T
     warning: CredentialWarning | None = None
 
@@ -81,8 +84,6 @@ class CredentialUse[T]:
 
 
 class CredentialService:
-    """A no-list/no-echo credential boundary over an injected keyring-compatible backend."""
-
     def __init__(self, backend: object, *, service_name: str) -> None:
         if not isinstance(service_name, str) or not service_name:
             raise ValueError("service_name must be non-empty text")
@@ -90,164 +91,195 @@ class CredentialService:
         self._service_name = service_name
 
     def set(self, account: str, secret: str) -> None:
-        """Create or replace a keyring secret without returning it."""
-        self._validate_account_and_secret(account, secret)
+        self._valid_account(account)
+        if not isinstance(secret, str) or not secret:
+            raise ValueError("credential must be non-empty text")
         backend = self._usable_backend()
+        failed = False
         try:
-            backend.set_password(self._service_name, account, secret)
-        except Exception:  # noqa: BLE001 - backend details can include the secret.
-            raise CredentialBackendError("credential backend write failed") from None
+            backend.set_password(self._service_name, account, secret)  # type: ignore[attr-defined]
+        except Exception:  # noqa: BLE001
+            failed = True
+        if failed:
+            raise CredentialBackendError("credential backend write failed")
 
     def status(self, account: str, *, source: Literal["keyring", "environment"] = "keyring") -> CredentialStatus:
-        """Return only presence and source information for an explicitly selected source."""
-        self._validate_account(account)
+        self._valid_account(account)
+        self._valid_source(source)
         if source == "environment":
-            return CredentialStatus(
-                present=bool(os.environ.get("PYQUALITY_API_KEY")),
-                source="environment",
-                warning=_environment_warning(),
-            )
-        self._validate_source(source)
+            return CredentialStatus(present=bool(os.environ.get("PYQUALITY_API_KEY")), source="environment", warning=_environment_warning())
         backend = self._usable_backend()
+        failed = False
+        present = False
         try:
-            present = backend.get_password(self._service_name, account) is not None
-        except Exception:  # noqa: BLE001 - backend messages are not safe to expose.
-            raise CredentialBackendError("credential backend status check failed") from None
+            present = backend.get_password(self._service_name, account) is not None  # type: ignore[attr-defined]
+        except Exception:  # noqa: BLE001
+            failed = True
+        if failed:
+            raise CredentialBackendError("credential backend status check failed")
         return CredentialStatus(present=present, source="keyring")
 
-    def get[T](
-        self,
-        account: str,
-        provider: Callable[[str], T],
-        *,
-        source: Literal["keyring", "environment"] = "keyring",
-    ) -> CredentialUse[T]:
-        """Pass a secret to the provider callable, never back to this method's caller."""
-        self._validate_account(account)
+    def get[T](self, account: str, provider: Callable[[str], T], *, source: Literal["keyring", "environment"] = "keyring") -> CredentialUse[object]:
+        self._valid_account(account)
+        self._valid_source(source)
         if not callable(provider):
             raise TypeError("provider must be callable")
-        self._validate_source(source)
         warning: CredentialWarning | None = None
+        failed = False
         if source == "environment":
             secret = os.environ.get("PYQUALITY_API_KEY")
             warning = _environment_warning()
         else:
+            secret = None
             backend = self._usable_backend()
             try:
-                secret = backend.get_password(self._service_name, account)
-            except Exception:  # noqa: BLE001 - backend messages are not safe to expose.
-                raise CredentialBackendError("credential backend read failed") from None
+                secret = backend.get_password(self._service_name, account)  # type: ignore[attr-defined]
+            except Exception:  # noqa: BLE001
+                failed = True
+        if failed:
+            raise CredentialBackendError("credential backend read failed")
         if not isinstance(secret, str) or not secret:
             raise CredentialNotFoundError("credential is not available from the selected source")
+        provider_failed = False
+        value: object = None
         try:
             value = provider(secret)
-        except Exception:  # noqa: BLE001 - providers can accidentally include credentials in errors.
-            raise CredentialProviderError("credential provider operation failed") from None
-        if _contains_secret(value, secret, set(), 0):
-            raise CredentialProviderError("credential provider returned a credential")
-        return CredentialUse(value=value, warning=warning)
+        except Exception:  # noqa: BLE001
+            provider_failed = True
+        if provider_failed:
+            raise CredentialProviderError("credential provider operation failed")
+        try:
+            safe_value = _safe_provider_value(value, secret, set(), 0)
+        except ValueError:
+            safe_value = None
+            provider_failed = True
+        if provider_failed:
+            raise CredentialProviderError("credential provider returned an unsafe result")
+        return CredentialUse(value=safe_value, warning=warning)
 
     def clear(self, account: str) -> None:
-        """Delete one named keyring credential without exposing stored data."""
-        self._validate_account(account)
+        self._valid_account(account)
         backend = self._usable_backend()
+        failed = False
         try:
-            backend.delete_password(self._service_name, account)
-        except Exception:  # noqa: BLE001 - backend messages are not safe to expose.
-            raise CredentialBackendError("credential backend delete failed") from None
+            backend.delete_password(self._service_name, account)  # type: ignore[attr-defined]
+        except Exception:  # noqa: BLE001
+            failed = True
+        if failed:
+            raise CredentialBackendError("credential backend delete failed")
 
     def _usable_backend(self) -> object:
-        backend = self._backend
         try:
-            methods = (backend.get_password, backend.set_password, backend.delete_password)  # type: ignore[attr-defined]
-            priority = getattr(backend, "priority", None)
-            usable = all(callable(method) for method in methods) and (
+            methods = (self._backend.get_password, self._backend.set_password, self._backend.delete_password)  # type: ignore[attr-defined]
+            priority = getattr(self._backend, "priority", None)
+            valid = all(callable(item) for item in methods) and (
                 priority is None or (isinstance(priority, (int, float)) and not isinstance(priority, bool) and priority > 0)
             )
-        except Exception:  # noqa: BLE001 - a hostile backend must not disclose its details.
-            usable = False
-        if not usable:
+        except Exception:  # noqa: BLE001
+            valid = False
+        if not valid:
             raise CredentialBackendError("credential backend is unavailable")
-        return backend
+        return self._backend
 
     @staticmethod
-    def _validate_account(account: str) -> None:
+    def _valid_account(account: str) -> None:
         if not isinstance(account, str) or not account:
             raise ValueError("account must be non-empty text")
 
-    @classmethod
-    def _validate_account_and_secret(cls, account: str, secret: str) -> None:
-        cls._validate_account(account)
-        if not isinstance(secret, str) or not secret:
-            raise ValueError("credential must be non-empty text")
-
     @staticmethod
-    def _validate_source(source: str) -> None:
+    def _valid_source(source: str) -> None:
         if source not in {"keyring", "environment"}:
             raise ValueError("credential source must be keyring or environment")
 
 
 def _environment_warning() -> CredentialWarning:
-    return CredentialWarning(
-        code="environment_plaintext",
-        message="Environment credentials are plaintext and visible to processes with access to this process environment.",
-    )
+    return CredentialWarning(code="environment_plaintext", message="Environment credentials are plaintext and visible to processes with access to this process environment.")
 
 
-def _contains_secret(value: object, secret: str, active: set[int], depth: int) -> bool:
-    """Inspect only built-in container data without invoking arbitrary object methods."""
+def _safe_provider_value(value: object, secret: str, active: set[int], depth: int) -> object:
+    """Copy only JSON-like provider results, rejecting unknown objects and secret-bearing keys/values."""
     if depth > _MAX_DEPTH:
-        return False
-    if isinstance(value, str):
-        return secret in value
-    if isinstance(value, bytes | bytearray | memoryview):
-        return secret.encode("utf-8") in bytes(value)
-    if not isinstance(value, Mapping | Sequence | AbstractSet) or isinstance(value, str):
-        return False
+        raise ValueError
+    if value is None or type(value) in {bool, int}:
+        return value
+    if type(value) is float:
+        if not math.isfinite(value):
+            raise ValueError
+        return value
+    if type(value) is str:
+        if secret in value:
+            raise ValueError
+        return _valid_utf8(value)
+    if type(value) in {bytes, bytearray}:
+        if secret.encode("utf-8") in bytes(value):
+            raise ValueError
+        return bytes(value)
+    if type(value) not in {dict, list, tuple}:
+        raise ValueError
     identity = id(value)
     if identity in active:
-        return False
+        raise ValueError
     active.add(identity)
     try:
-        values = value.values() if isinstance(value, Mapping) else value
-        return any(_contains_secret(item, secret, active, depth + 1) for item in values)
-    except Exception:  # noqa: BLE001 - do not let a provider-controlled object leak through errors.
-        return True
+        if type(value) is dict:
+            result: dict[str, object] = {}
+            for key, item in value.items():
+                if type(key) is not str or secret in key:
+                    raise ValueError
+                result[_valid_utf8(key)] = _safe_provider_value(item, secret, active, depth + 1)
+            return result
+        items = [_safe_provider_value(item, secret, active, depth + 1) for item in value]
+        return tuple(items) if type(value) is tuple else items
     finally:
         active.discard(identity)
 
 
+@dataclass
+class _Budget:
+    work: int = _MAX_WORK
+    items: int = _MAX_ITEMS
+    bytes: int = _MAX_REDACTION_BYTES
+
+    def node(self) -> bool:
+        self.work -= 1
+        return self.work >= 0
+
+    def item(self) -> bool:
+        self.items -= 1
+        return self.items >= 0
+
+    def text_limit(self, limit: int) -> int:
+        return max(0, min(limit, self.bytes))
+
+    def used_text(self, value: str) -> None:
+        self.bytes -= len(value.encode("utf-8"))
+
+
 def redact(value: object, secrets: set[str], sensitive_keys: set[str]) -> object:
-    """Return a bounded JSON-safe copy with secrets and unsafe values replaced."""
-    normalized_secrets = tuple(
-        sorted((secret for secret in secrets if isinstance(secret, str) and secret), key=len, reverse=True)
-    )
-    normalized_keys = frozenset(
-        key.casefold() for key in sensitive_keys if isinstance(key, str) and key
-    ) | _SENSITIVE_KEY_PARTS
-    return _redact(value, normalized_secrets, normalized_keys, set(), 0)
+    normalized_secrets = tuple(sorted((_valid_utf8(item) for item in secrets if isinstance(item, str) and item), key=len, reverse=True))
+    keys = frozenset(_valid_utf8(item).casefold() for item in sensitive_keys if isinstance(item, str) and item) | _SENSITIVE_KEY_PARTS
+    result = _redact(value, normalized_secrets, keys, set(), 0, _Budget())
+    try:
+        if len(_stable_json(result).encode("utf-8")) > _MAX_REDACTION_BYTES:
+            return _TRUNCATED
+    except Exception:  # noqa: BLE001
+        return _TRUNCATED
+    return result
 
 
-def _redact(
-    value: object,
-    secrets: tuple[str, ...],
-    sensitive_keys: frozenset[str],
-    active: set[int],
-    depth: int,
-) -> object:
-    if depth > _MAX_DEPTH:
+def _redact(value: object, secrets: tuple[str, ...], keys: frozenset[str], active: set[int], depth: int, budget: _Budget) -> object:
+    if depth > _MAX_DEPTH or not budget.node():
         return _TRUNCATED
     if value is None or isinstance(value, (bool, int)):
         return value
     if isinstance(value, float):
         return value if math.isfinite(value) else _UNSUPPORTED
     if isinstance(value, str):
-        return _redact_text(value, secrets, sensitive_keys)
+        return _redact_text(value, secrets, keys, budget)
     if isinstance(value, bytes | bytearray | memoryview):
         return _REDACTED_BYTES
     if isinstance(value, BaseException):
         return _REDACTED
-
     identity = id(value)
     if identity in active:
         return _CYCLE
@@ -255,71 +287,97 @@ def _redact(
         active.add(identity)
         try:
             output: dict[str, object] = {}
-            for index, (key, item) in enumerate(value.items()):
-                if index >= _MAX_ITEMS:
-                    output["[TRUNCATED]"] = _TRUNCATED
+            for key, item in value.items():
+                if not budget.item():
+                    _insert(output, _TRUNCATED, _TRUNCATED)
                     break
-                clean_key = _clean_key(key)
-                output[clean_key] = (
-                    _REDACTED
-                    if _is_sensitive_key(clean_key, sensitive_keys)
-                    else _redact(item, secrets, sensitive_keys, active, depth + 1)
-                )
+                clean_key = _unique_key(output, _clean_key(key, secrets, budget))
+                output[clean_key] = _REDACTED if _is_sensitive_key(clean_key, keys) else _redact(item, secrets, keys, active, depth + 1, budget)
             return output
-        except Exception:  # noqa: BLE001 - mapping implementations can be hostile.
+        except Exception:  # noqa: BLE001
             return _UNSUPPORTED
         finally:
             active.discard(identity)
-    if isinstance(value, Sequence | AbstractSet):
+    if isinstance(value, AbstractSet):
+        try:
+            if len(value) > max(0, budget.items):
+                return [_TRUNCATED]
+            items = [_redact(item, secrets, keys, active, depth + 1, budget) for item in value]
+            return sorted(items, key=_stable_json)
+        except Exception:  # noqa: BLE001
+            return _UNSUPPORTED
+    if isinstance(value, Iterable):
         active.add(identity)
         try:
-            items = list(value)
-            output = [_redact(item, secrets, sensitive_keys, active, depth + 1) for item in items[:_MAX_ITEMS]]
-            if len(items) > _MAX_ITEMS:
-                output.append(_TRUNCATED)
-            if isinstance(value, AbstractSet):
-                output.sort(key=_stable_json)
-            return output
-        except Exception:  # noqa: BLE001 - never call arbitrary object representations.
+            output = []
+            iterator = iter(value)
+            while budget.item():
+                try:
+                    item = next(iterator)
+                except StopIteration:
+                    return output
+                output.append(_redact(item, secrets, keys, active, depth + 1, budget))
+            return output + [_TRUNCATED]
+        except Exception:  # noqa: BLE001
             return _UNSUPPORTED
         finally:
             active.discard(identity)
     return _UNSUPPORTED
 
 
-def _clean_key(key: object) -> str:
-    return _truncate_text(key, _MAX_TEXT_BYTES) if isinstance(key, str) else "[NON_STRING_KEY]"
+def _insert(mapping: dict[str, object], key: str, value: object) -> None:
+    mapping[_unique_key(mapping, key)] = value
 
 
-def _redact_text(value: str, secrets: tuple[str, ...], sensitive_keys: frozenset[str]) -> str:
-    clean = value
+def _unique_key(mapping: Mapping[str, object], key: str) -> str:
+    if key not in mapping:
+        return key
+    index = 2
+    while f"{key}#{index}" in mapping:
+        index += 1
+    return f"{key}#{index}"
+
+
+def _clean_key(key: object, secrets: tuple[str, ...], budget: _Budget) -> str:
+    return _redact_text(key, secrets, frozenset(), budget) if isinstance(key, str) else "[NON_STRING_KEY]"
+
+
+def _redact_text(value: str, secrets: tuple[str, ...], keys: frozenset[str], budget: _Budget) -> str:
+    clean = _valid_utf8(value)
     for secret in secrets:
         clean = clean.replace(secret, _REDACTED)
     clean = _BEARER.sub(r"\1" + _REDACTED, clean)
     try:
         parsed = urlsplit(clean)
         if parsed.scheme and parsed.netloc and parsed.query:
-            query = parse_qsl(parsed.query, keep_blank_values=True)
-            clean_query = [
-                (key, _REDACTED if _is_sensitive_key(key, sensitive_keys) else item)
-                for key, item in query
-            ]
-            clean = urlunsplit((parsed.scheme, parsed.netloc, parsed.path, urlencode(clean_query), parsed.fragment))
-    except Exception:  # noqa: BLE001 - malformed text is preserved after direct secret replacement.
-        return _truncate_text(clean, _MAX_TEXT_BYTES)
-    return _truncate_text(clean, _MAX_TEXT_BYTES)
+            clean = urlunsplit((parsed.scheme, parsed.netloc, parsed.path, urlencode([(key, _REDACTED if _is_sensitive_key(key, keys) else item) for key, item in parse_qsl(parsed.query, keep_blank_values=True)]), parsed.fragment))
+    except Exception:  # noqa: BLE001
+        clean = _truncate_text(clean, budget.text_limit(_MAX_TEXT_BYTES))
+        budget.used_text(clean)
+        return clean or _TRUNCATED
+    clean = _truncate_text(clean, budget.text_limit(_MAX_TEXT_BYTES))
+    budget.used_text(clean)
+    return clean or _TRUNCATED
 
 
-def _is_sensitive_key(key: str, sensitive_keys: frozenset[str]) -> bool:
+def _is_sensitive_key(key: str, keys: frozenset[str]) -> bool:
     folded = key.casefold().replace("-", "_")
-    return folded in sensitive_keys or any(part in folded for part in sensitive_keys)
+    return folded in keys or any(part in folded for part in keys)
+
+
+def _valid_utf8(value: str) -> str:
+    return value.encode("utf-8", errors="replace").decode("utf-8")
 
 
 def _truncate_text(value: str, limit: int) -> str:
-    encoded = value.encode("utf-8", errors="replace")
+    if limit <= 0:
+        return _TRUNCATED
+    encoded = value.encode("utf-8")
     if len(encoded) <= limit:
         return value
     suffix = _TRUNCATED.encode("utf-8")
+    if limit <= len(suffix):
+        return suffix[:limit].decode("utf-8", errors="ignore") or _TRUNCATED
     return encoded[: limit - len(suffix)].decode("utf-8", errors="ignore") + _TRUNCATED
 
 
@@ -327,125 +385,182 @@ def _stable_json(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
-_LOCK_GUARD = threading.Lock()
-_PATH_LOCKS: dict[Path, threading.Lock] = {}
-
-
 class AuditLogger:
-    """Append-only local JSONL sink that redacts and bounds every persisted record."""
-
     def __init__(self, path: Path, *, secrets: set[str] | None = None) -> None:
-        self._path = Path(path)
+        self._path = Path(path).absolute()
         self._secrets = set(secrets or ())
-        with _LOCK_GUARD:
-            self._lock = _PATH_LOCKS.setdefault(self._path.absolute(), threading.Lock())
 
     def emit(self, event: AuditEvent) -> None:
-        """Redact, serialize, and append exactly one complete JSON object line."""
+        failed = False
         try:
-            record = self._record(event)
-            encoded = json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-            if len(encoded.encode("utf-8")) > _MAX_RECORD_BYTES:
-                record["metadata"] = {"truncated": _TRUNCATED}
-                encoded = json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-            with self._lock:
-                self._prepare_path()
-                descriptor = os.open(self._path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
-                try:
-                    try:
-                        os.chmod(self._path, 0o600)
-                    except OSError:
-                        pass
-                    with os.fdopen(descriptor, "a", encoding="utf-8", newline="\n") as stream:
-                        descriptor = -1
-                        stream.write(encoded + "\n")
-                        stream.flush()
-                finally:
-                    if descriptor != -1:
-                        os.close(descriptor)
-        except AuditWriteError:
-            raise
-        except Exception:  # noqa: BLE001 - events and OS errors can contain sensitive details.
-            raise AuditWriteError("audit record could not be written") from None
+            encoded = self._encode(event)
+            self._append(encoded)
+        except Exception:  # noqa: BLE001
+            failed = True
+        if failed:
+            raise AuditWriteError("audit record could not be written")
+
+    def _encode(self, event: AuditEvent) -> bytes:
+        record = self._record(event)
+        encoded = _stable_json(record).encode("utf-8")
+        if len(encoded) > _MAX_RECORD_BYTES:
+            record["metadata"] = {"truncated": _TRUNCATED}
+            encoded = _stable_json(record).encode("utf-8")
+        if len(encoded) > _MAX_RECORD_BYTES:
+            raise ValueError("audit record exceeds bound")
+        return encoded + b"\n"
 
     def _record(self, event: AuditEvent) -> dict[str, object]:
-        metadata = _audit_metadata(event.metadata, self._secrets)
-        duration = metadata.pop("duration", None)
-        outcome = metadata.pop("outcome", None)
+        metadata, duration, outcome = _approved_metadata(event.metadata, self._secrets)
         return {
-            "task_id": _bounded_audit_scalar(event.task_id, self._secrets),
-            "iteration": _bounded_audit_scalar(event.iteration_id, self._secrets),
-            "component": _bounded_audit_scalar(event.component, self._secrets),
-            "event_type": _bounded_audit_scalar(event.event_type, self._secrets),
+            "task_id": _audit_scalar(event.task_id, self._secrets, 1_024),
+            "iteration": _audit_scalar(event.iteration_id, self._secrets, 1_024),
+            "component": _audit_scalar(event.component, self._secrets, 1_024),
+            "event_type": _audit_scalar(event.event_type, self._secrets, 1_024),
             "duration": duration,
             "outcome": outcome,
             "metadata": metadata,
         }
 
+    def _append(self, encoded: bytes) -> None:
+        self._prepare_path()
+        with _audit_lock(self._path):
+            self._prepare_path()
+            descriptor = _open_audit(self._path)
+            try:
+                _recover_tail(descriptor)
+                os.write(descriptor, encoded)
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+
     def _prepare_path(self) -> None:
+        _reject_links(self._path, include_final=True)
         self._path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        _reject_links(self._path, include_final=True)
         try:
             os.chmod(self._path.parent, 0o700)
         except OSError:
             pass
 
 
-def _audit_metadata(metadata: Mapping[str, object], secrets: set[str]) -> dict[str, object]:
+def _approved_metadata(metadata: Mapping[str, object], secrets: set[str]) -> tuple[dict[str, object], float | int | None, str | None]:
     output: dict[str, object] = {}
+    duration: float | int | None = None
+    outcome: str | None = None
     for key, value in metadata.items():
-        clean_key = _clean_key(key)
-        if _is_body_key(clean_key) or _is_sensitive_key(clean_key, _SENSITIVE_KEY_PARTS):
+        canonical = _APPROVED_ALIASES.get(key) if isinstance(key, str) else None
+        if canonical is None:
             continue
-        output[clean_key] = _audit_value(value, secrets, set(), 0)
-    return output
+        if canonical == "duration":
+            if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value):
+                duration = value
+            continue
+        if canonical == "outcome":
+            if isinstance(value, str):
+                outcome = _audit_scalar(value, secrets, 256)
+            continue
+        output[canonical] = _audit_scalar(value, secrets, 1_024)
+    return dict(sorted(output.items())), duration, outcome
 
 
-def _audit_value(value: object, secrets: set[str], active: set[int], depth: int) -> object:
-    """Recursively discard body-bearing metadata while retaining approved structural context."""
-    if depth > _MAX_DEPTH:
-        return _TRUNCATED
-    if value is None or isinstance(value, (str, bytes, bytearray, memoryview, bool, int, float, BaseException)):
-        return redact(value, secrets, set())
-    if isinstance(value, Mapping):
-        identity = id(value)
-        if identity in active:
-            return _CYCLE
-        active.add(identity)
-        try:
-            output: dict[str, object] = {}
-            for index, (key, item) in enumerate(value.items()):
-                if index >= _MAX_ITEMS:
-                    output["[TRUNCATED]"] = _TRUNCATED
-                    break
-                clean_key = _clean_key(key)
-                if _is_body_key(clean_key) or _is_sensitive_key(clean_key, _SENSITIVE_KEY_PARTS):
-                    continue
-                output[clean_key] = _audit_value(item, secrets, active, depth + 1)
-            return output
-        except Exception:  # noqa: BLE001 - metadata must never call arbitrary representations.
-            return _UNSUPPORTED
-        finally:
-            active.discard(identity)
-    if isinstance(value, Sequence | AbstractSet):
-        identity = id(value)
-        if identity in active:
-            return _CYCLE
-        active.add(identity)
-        try:
-            output = [_audit_value(item, secrets, active, depth + 1) for item in list(value)[:_MAX_ITEMS]]
-            return output + ([_TRUNCATED] if len(value) > _MAX_ITEMS else [])
-        except Exception:  # noqa: BLE001 - metadata must stay JSON-safe under hostile values.
-            return _UNSUPPORTED
-        finally:
-            active.discard(identity)
-    return redact(value, secrets, set())
-
-
-def _is_body_key(key: str) -> bool:
-    folded = key.casefold().replace("-", "_")
-    return any(part in folded for part in _BODY_KEY_PARTS)
-
-
-def _bounded_audit_scalar(value: object, secrets: set[str]) -> object:
+def _audit_scalar(value: object, secrets: set[str], limit: int) -> object:
     clean = redact(value, secrets, set())
-    return _truncate_text(clean, 1_024) if isinstance(clean, str) else clean
+    return _truncate_text(clean, limit) if isinstance(clean, str) else clean
+
+
+def _is_link(path: Path) -> bool:
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return False
+    return stat.S_ISLNK(info.st_mode) or bool(getattr(info, "st_file_attributes", 0) & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+
+
+def _reject_links(path: Path, *, include_final: bool) -> None:
+    absolute = path.absolute()
+    parts = absolute.parts
+    current = Path(parts[0])
+    stop = len(parts) if include_final else len(parts) - 1
+    for part in parts[1:stop]:
+        current /= part
+        if _is_link(current):
+            raise OSError("audit path contains a link")
+
+
+def _open_audit(path: Path) -> int:
+    _reject_links(path, include_final=True)
+    flags = os.O_APPEND | os.O_CREAT | os.O_RDWR
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(path, flags, 0o600)
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise OSError("audit target is not a regular file")
+        try:
+            os.fchmod(descriptor, 0o600)
+        except (AttributeError, OSError):
+            pass
+        return descriptor
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+@contextmanager
+def _audit_lock(path: Path) -> Iterator[None]:
+    lock_path = path.with_name(path.name + ".lock")
+    _reject_links(lock_path, include_final=True)
+    handle = lock_path.open("a+b")
+    try:
+        handle.seek(0, os.SEEK_END)
+        if handle.tell() == 0:
+            handle.write(b"\0")
+            handle.flush()
+        handle.seek(0)
+        _lock(handle)
+        yield
+    finally:
+        try:
+            _unlock(handle)
+        finally:
+            handle.close()
+
+
+def _recover_tail(descriptor: int) -> None:
+    size = os.lseek(descriptor, 0, os.SEEK_END)
+    if size == 0:
+        return
+    position = size
+    tail = b""
+    while position:
+        take = min(4096, position)
+        position -= take
+        os.lseek(descriptor, position, os.SEEK_SET)
+        chunk = os.read(descriptor, take)
+        tail = chunk + tail
+        index = tail.rfind(b"\n")
+        if index >= 0:
+            if position + len(tail) != size or not tail.endswith(b"\n"):
+                os.ftruncate(descriptor, position + index + 1)
+            return
+    os.ftruncate(descriptor, 0)
+
+
+if os.name == "nt":
+    import msvcrt
+
+    def _lock(handle: BinaryIO) -> None:
+        msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+
+    def _unlock(handle: BinaryIO) -> None:
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+
+else:
+    import fcntl
+
+    def _lock(handle: BinaryIO) -> None:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+
+    def _unlock(handle: BinaryIO) -> None:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
