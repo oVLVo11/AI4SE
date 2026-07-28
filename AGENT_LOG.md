@@ -43,3 +43,7 @@ Agent `/root/task3_policy` implemented deterministic path confinement and govern
 ## 2026-07-28 Task 4 clarified tool restrictions
 
 The initial repository search surface is literal UTF-8 substring search only; model-provided regular expressions are deliberately unsupported. The shared unified-diff grammar also deliberately rejects `\\ No newline at end of file` markers, and the dispatcher rejects a target that lacks a final newline. Valid patch application preserves the target's existing LF or CRLF convention.
+
+## 2026-07-28 Task 4 implementation and review fixes
+
+Agent `/root/task4_tools` implemented the typed bounded dispatcher, shared contextual patch grammar, atomic patch effects, and bounded subprocess protocol in `b7a5d6c`. Review fixes in `ae7785d`, `c20a668`, and `14becd2` hardened sensitive discovery, literal search, process-tree termination, atomic capture, concurrency-safe install/restore, recovery reporting, cleanup, and retained parent pins. Agent `/root/task4_fix_round4` completed POSIX descriptor-relative preparation, commit, rollback, and cleanup in `6eea0e9`; its portable syscall-contract test recorded RED before implementation and passed afterward. Final verification reported 113 passed, 5 skipped, and Ruff clean, and the Task 4 spec and quality review is clean after fix round 4. The real POSIX rename/symlink end-to-end test was unavailable on the Windows host, while the portable retained-`dir_fd` syscall contract passed locally.
