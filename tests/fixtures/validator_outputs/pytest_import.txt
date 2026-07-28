@@ -1,0 +1,11 @@
+============================= test session starts =============================
+________________ ERROR collecting tests/test_imports.py _________________
+ImportError while importing test module 'tests/test_imports.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+tests/test_imports.py:3: in <module>
+    from app import missing
+E   ImportError: cannot import name 'missing' from 'app'
+=========================== short test summary info ===========================
+ERROR tests/test_imports.py
+!!!!!!!!!!!!!!!!!!!! Interrupted: 1 error during collection !!!!!!!!!!!!!!!!!!!!

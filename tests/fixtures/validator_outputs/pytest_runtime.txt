@@ -1,0 +1,11 @@
+==================================== ERRORS ====================================
+_____________________ ERROR at setup of test_service _____________________
+
+    @pytest.fixture
+    def service():
+>       raise RuntimeError("database unavailable")
+E       RuntimeError: database unavailable
+
+tests/test_service.py:8: RuntimeError
+=========================== short test summary info ===========================
+ERROR tests/test_service.py::test_service - RuntimeError: database unavailable

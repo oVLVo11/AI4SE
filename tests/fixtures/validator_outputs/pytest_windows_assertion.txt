@@ -1,0 +1,7 @@
+============================= FAILURES =============================
+____________________________ test_adds ______________________________
+E       assert 4 == 5
+
+tests\test_math.py:5: AssertionError
+=========================== short test summary info ===========================
+FAILED tests\test_math.py::test_adds - assert 4 == 5

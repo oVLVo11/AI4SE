@@ -1,0 +1,7 @@
+________________ ERROR collecting src/broken.py _________________
+E     File "src/broken.py", line 7
+E       return (
+E              ^
+E   SyntaxError: '(' was never closed
+=========================== short test summary info ===========================
+ERROR src/broken.py
