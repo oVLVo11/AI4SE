@@ -45,8 +45,7 @@ Rejected: validator-plugin extensibility, an event-driven workflow, and the Visu
 
 ## Cold-start Validation
 
-Pending. This section will contain only the fresh agent's actual questions, divergent interpretations, expected file/interface mismatches, and the narrow corrections made in response. The validator is instructed to stop at uncertainty rather than guess.
-+
+Completed on 2026-07-28. The exact validator output is preserved in `docs/superpowers/reviews/2026-07-28-cold-start-validation.md`; this section indexes that evidence and records the resulting corrections.
 
 ### Validator Identity and Scope
 
@@ -74,5 +73,4 @@ Expected mismatches: no aggregate core-protocol constructor boundary; missing re
 
 ### Corrections Made
 
-Specification section 15 and the matching root `SPEC.md` now define the requested model/configuration contract, state-transition and round accounting, typed tool-result data, deterministic digest, approval/lease/drift/recovery rules, repository and dependency-injection interfaces, and pre-Task-9 redacted audit sink. The canonical plan and root `PLAN.md` add matching Task 1–8 consumption and production amendments. These corrections directly address the findings above; no product code was written.
-
+Specification section 14 and the matching root `SPEC.md` now define the requested model/configuration contract, state-transition and round accounting, typed tool-result data, deterministic digest, approval/lease/drift/recovery rules, repository and dependency-injection interfaces, and pre-Task-9 redacted audit sink. The canonical plan and root `PLAN.md` add matching Task 1–8 consumption and production amendments. These corrections directly address the findings above; no product code was written.

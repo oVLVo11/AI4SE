@@ -2,7 +2,7 @@
 
 | Task | Status | Implementing agent | Spec review | Quality review | Commit |
 | --- | --- | --- | --- | --- | --- |
-| 0 | Cold-start validated; correction commit pending | `/root/task0_docs_coldstart`, `/root/task0_docs_coldstart/coldstart_validator` | Findings incorporated into Specification section 15 | Documentation contract checks pending | — |
+| 0 | Fix round 1 in progress | `/root/task0_docs_coldstart`, `/root/task0_docs_coldstart/coldstart_validator` | Cold-start feedback incorporated; re-review pending | Documentation contract checks pending | `2fdb099`, `b5cdd29`; fix-round commit pending |
 | 1–13 | Not started | — | — | — | — |
 
 # PyQuality Harness Implementation Plan
@@ -1034,8 +1034,8 @@ Before claiming completion, invoke `superpowers:verification-before-completion` 
 
 ## Cold-start Amendments for Tasks 1 and 8
 
-Task 1 must implement the public-model, configuration-source, secure-default, argument-grammar, and status/iteration contracts in Specification section 15.1 before later tasks consume them. In particular, it produces `PolicyOutcome` and `PolicyDecision`, typed `ToolResult`, `QualityReport`, `TaskResult`, `ApprovalDecision`, and `AuditEvent`, and treats `pyquality.toml` as the sole repository configuration file.
+Task 1 must implement the public-model, configuration-source, secure-default, argument-grammar, and status/iteration contracts in Specification section 14.1 before later tasks consume them. In particular, it produces `PolicyOutcome` and `PolicyDecision`, typed `ToolResult`, `QualityReport`, `TaskResult`, `ApprovalDecision`, and `AuditEvent`, and treats `pyquality.toml` as the sole repository configuration file.
 
 Task 2 must expose compare-and-set transitions, approval lookup/decision/execution marking, durable transition intents, lease methods, and repository snapshots. Task 3 revalidation receives both the normalized action and current snapshot. Task 4 returns changed paths and before/after digests in `ToolResult`. Task 6 consumes those digests when making a stall decision. Task 7 exposes provider retry metadata only through the injected client policy; transport retries remain inside one model round.
 
-Task 8 must use the state, round-accounting, approval, recovery, audit-sink, and idempotent-dispatch rules in Specification section 15.2. Its declared interface additionally includes `pending_approval(task_id: str) -> Approval`; its constructor receives all listed core protocols explicitly. Its tests must distinguish provider retries from model rounds and prove terminal resume idempotency, drift blocking, duplicate-decision rejection, and recovery of a persisted dispatch intent.
+Task 8 must use the state, round-accounting, approval, recovery, audit-sink, and idempotent-dispatch rules in Specification section 14.2. Its declared interface additionally includes `pending_approval(task_id: str) -> Approval`; its constructor receives all listed core protocols explicitly. Its tests must distinguish provider retries from model rounds and prove terminal resume idempotency, drift blocking, duplicate-decision rejection, and recovery of a persisted dispatch intent.

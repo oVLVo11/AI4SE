@@ -350,13 +350,11 @@ One command runs a bundled scenario:
 - **SQLite process concurrency:** Use a single application worker initially, transactional writes, and repository leases.
 - **Course materials mention both GitHub Actions and `.gitlab-ci.yml`:** Provide both configurations so neither delivery expectation is omitted.
 - **Broad patches are hard to classify:** Require approval when a patch touches more than 10 files or changes more than 300 total lines; count additions and deletions before applying the patch.
-+
-
-## 15. Cold-start Contract Clarifications
+## 14. Cold-start Contract Clarifications
 
 These clarifications resolve the documented cold-start review without changing product scope.
 
-### 15.1 Public Models and Configuration
+### 14.1 Public Models and Configuration
 
 Task 1 defines public Pydantic models with `extra="forbid"`: `Action`, `Finding`, `QualityReport`, `TaskResult`, `PolicyOutcome`, `PolicyDecision`, `ToolResult`, `ApprovalDecision`, and `AuditEvent`. `PolicyOutcome` is the enum `ALLOW | REQUIRE_APPROVAL | DENY`; `PolicyDecision` contains that outcome, the matched rule, an impact summary, and a normalized action digest. `ApprovalDecision` is `APPROVE | REJECT`.
 
@@ -366,7 +364,7 @@ Task 1 defines public Pydantic models with `extra="forbid"`: `Action`, `Finding`
 
 Secure defaults are: round limit 8, global concurrency 2, subprocess timeout 60 seconds, provider timeout 30 seconds, provider retries 2, total feedback 32 KiB, per-finding evidence 4 KiB, tool output 64 KiB, read/search result 64 KiB, and source excerpt 8 KiB. Safe pytest arguments are only paths beneath the repository plus `-q`, `-v`, `-x`, and `-k <expression>`; safe Ruff arguments are only repository-relative paths plus `--select <codes>`, `--ignore <codes>`, and `--output-format text`. No setting may add shell syntax, command executables, or arbitrary pytest/Ruff flags.
 
-### 15.2 Loop, Approval, and Recovery Contract
+### 14.2 Loop, Approval, and Recovery Contract
 
 The legal persisted task states are `CREATED`, `RUNNING`, `WAITING_APPROVAL`, `SUCCEEDED`, `STALLED`, `BUDGET_EXHAUSTED`, `BLOCKED`, and `FAILED`. `CREATED -> RUNNING`; `RUNNING -> WAITING_APPROVAL` for an approvable action; `WAITING_APPROVAL -> RUNNING` after either decision; and only `RUNNING` reaches terminal states. Terminal `resume()` is idempotent and returns the saved `TaskResult`. A deadline checked before each model call, dispatch, and verifier transition wins over further work; a running subprocess is governed by its timeout.
 
@@ -379,7 +377,7 @@ Approval records retain the normalized action, digest, repository snapshot diges
 `TaskRepository` provides compare-and-set state transitions, transition intents, approval lookup/decision/execution marking, lease acquire/release, and recovery snapshots. Leases release on every terminal transition and on a waiting approval after the snapshot is saved. `AgentLoop` receives repository, policy, dispatcher, pipeline, parser, LLM, context builder, progress tracker, clock, and an audit sink through explicit constructor protocols. The injected audit sink redacts metadata from Task 8 onward; Task 9 supplies the JSONL implementation. Transition records contain digests and bounded redacted summaries, never complete prompts or model responses. Storage, verifier/tool availability, configuration, and permission failures are `BLOCKED`; unrecoverable internal consistency failures are `FAILED`.
 
 
-## 14. Design Decisions Summary
+## 15. Design Decisions Summary
 
 - Focus on a deep structured quality-feedback pipeline rather than general extensibility.
 - Support Python only, using pytest and Ruff.
