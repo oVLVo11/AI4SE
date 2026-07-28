@@ -34,7 +34,7 @@ _PRIORITY = {
     "ruff": 3,
 }
 _VOLATILE_TEMP_PATH = re.compile(
-    r"(?i)(?<![A-Za-z0-9_.-])(?:[a-z]:/(?:temp|tmp)|/(?:tmp|var/tmp|private/tmp))/[^\s:]+"
+    r"(?i)(?<![A-Za-z0-9_./-])(?:[a-z]:/(?:temp|tmp)|/(?:tmp|var/tmp|private/tmp))/[^\s:]+"
 )
 _TIMING = re.compile(r"(?i)\b\d+(?:\.\d+)?\s*(?:ms|s|sec|secs|seconds)\b")
 
@@ -68,7 +68,7 @@ class FeedbackFinding(PublicModel):
             if (
                 not self.path
                 or "\\" in self.path
-                or re.match(r"^[A-Za-z]:/", self.path) is not None
+                or re.match(r"^[A-Za-z]:", self.path) is not None
                 or normalized.is_absolute()
                 or ".." in normalized.parts
             ):
@@ -195,7 +195,7 @@ def failure_fingerprint(findings: Iterable[Any]) -> str:
     tuples = sorted(
         (
             str(finding.category),
-            _fingerprint_text(getattr(finding, "path", None)),
+            _fingerprint_path(getattr(finding, "path", None)),
             getattr(finding, "line", None),
             _fingerprint_text(getattr(finding, "group_key", "")),
         )
@@ -296,6 +296,15 @@ def _fingerprint_text(value: object) -> str:
     text = "" if value is None else str(value).replace("\\", "/")
     text = _VOLATILE_TEMP_PATH.sub("<temp>", text)
     text = _TIMING.sub("<time>", text)
+    return text
+
+
+def _fingerprint_path(value: object) -> str:
+    text = "" if value is None else str(value).replace("\\", "/")
+    if not text.startswith("/") and re.match(r"^[A-Za-z]:", text) is None:
+        return PurePosixPath(text).as_posix()
+    if _VOLATILE_TEMP_PATH.fullmatch(text) is not None:
+        return "<temp>"
     return text
 
 

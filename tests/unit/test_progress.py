@@ -114,6 +114,36 @@ def test_fingerprint_collapses_only_explicit_platform_temp_roots() -> None:
     )
 
 
+def test_fingerprint_structurally_normalizes_only_repository_relative_paths() -> None:
+    def item(path: str):
+        return SimpleNamespace(
+            category="assertion", path=path, line=1, group_key="stable", evidence="x"
+        )
+
+    assert failure_fingerprint((item("./src/a.py"),)) == failure_fingerprint(
+        (item("src/a.py"),)
+    )
+    assert failure_fingerprint((item("src//tmp/a.py"),)) != failure_fingerprint(
+        (item("src//tmp/b.py"),)
+    )
+    assert failure_fingerprint((item("src//A.py"),)) != failure_fingerprint(
+        (item("src/a.py"),)
+    )
+    assert failure_fingerprint((item("/tmp/a.py"),)) == failure_fingerprint(
+        (item("/tmp/b.py"),)
+    )
+
+    embedded_a = SimpleNamespace(
+        category="assertion", path="src//tmp/a.py", line=1,
+        group_key="failed src//tmp/a.py", evidence="x",
+    )
+    embedded_b = SimpleNamespace(
+        category="assertion", path="src//tmp/b.py", line=1,
+        group_key="failed src//tmp/b.py", evidence="x",
+    )
+    assert failure_fingerprint((embedded_a,)) != failure_fingerprint((embedded_b,))
+
+
 def test_success_has_highest_precedence() -> None:
     history = [entry("abc", success=True, blocked=True, failed=True)]
     assert ProgressTracker().decide(history, 1, NOW - timedelta(seconds=1), NOW) is TaskStatus.SUCCEEDED

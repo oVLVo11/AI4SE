@@ -136,6 +136,11 @@ def test_feedback_public_models_reject_invalid_category_location_and_budget() ->
     with pytest.raises(ValidationError):
         FeedbackFinding(**base, path="C:/repo/file.py")
     with pytest.raises(ValidationError):
+        FeedbackFinding(**base, path="C:outside.py")
+    with pytest.raises(ValidationError):
+        FeedbackFinding(**base, path="z:relative.py")
+    assert FeedbackFinding(**base, path="./src//file.py").path == "./src//file.py"
+    with pytest.raises(ValidationError):
         FeedbackFinding(**base, path="a" * 1_025)
 
     valid = FeedbackFinding(**base)
