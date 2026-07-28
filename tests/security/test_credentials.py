@@ -145,6 +145,56 @@ def test_provider_result_compares_stored_and_returned_scalars_with_one_grammar(m
         service.get("provider", lambda _, result=result: result)
 
 
+@pytest.mark.parametrize(
+    ("secret", "result"),
+    [
+        ("1e3", 1000),
+        ("1000", 1000.0),
+        ("1000.0", "1e3"),
+        ("-0", 0),
+        ("+001.00", 1.0),
+        ("-001e+2", -100),
+        ("false", False),
+    ],
+)
+def test_provider_result_canonicalizes_bounded_decimal_spellings(
+    memory_keyring: MemoryKeyring, secret: str, result: object
+) -> None:
+    """Catches exponent, fixed-point, signed-zero, or leading-zero credential echoes."""
+    service = CredentialService(memory_keyring, service_name="pyquality")
+    service.set("provider", secret)
+
+    with pytest.raises(CredentialProviderError):
+        service.get("provider", lambda _, result=result: result)
+
+
+@pytest.mark.parametrize(("secret", "result"), [("1", True), ("0", False)])
+def test_provider_result_does_not_conflate_boolean_and_numeric_scalars(
+    memory_keyring: MemoryKeyring, secret: str, result: bool
+) -> None:
+    """Catches a numeric grammar that treats bool as the integers one and zero."""
+    service = CredentialService(memory_keyring, service_name="pyquality")
+    service.set("provider", secret)
+
+    use = service.get("provider", lambda _: result)
+
+    assert use.value is result
+
+
+def test_provider_scalar_grammar_rejects_huge_results_without_poisoning_huge_text_secrets(
+    memory_keyring: MemoryKeyring,
+) -> None:
+    """Catches unbounded numeric conversion and false positives from an unparseable text secret."""
+    service = CredentialService(memory_keyring, service_name="pyquality")
+    service.set("provider", "9" * 10_000)
+
+    assert service.get("provider", lambda _: 7).value == 7
+    with pytest.raises(CredentialProviderError) as raised:
+        service.get("provider", lambda _: 10**10_000)
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+
+
 def test_backend_exception_does_not_preserve_secret_in_exception_chain() -> None:
     """Catches chaining a backend exception whose message contains the credential."""
 

@@ -13,8 +13,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import BinaryIO, Literal
-from urllib.parse import parse_qsl, quote, unquote, urlencode, urlsplit, urlunsplit
+from typing import Literal
+from urllib.parse import quote, urlsplit, urlunsplit
 
 from pydantic import Field
 
@@ -35,8 +35,13 @@ _SENSITIVE_KEY_PARTS = frozenset(
     {"authorization", "api_key", "apikey", "token", "secret", "password", "credential"}
 )
 _BEARER = re.compile(r"(?i)(bearer\s+)([^\s,;]+)")
-_INTEGER = re.compile(r"[+-]?\d+\Z")
-_DECIMAL = re.compile(r"[+-]?(?:\d+\.\d*|\d*\.\d+)\Z")
+_SCALAR_NUMBER = re.compile(
+    r"[+-]?(?:(?:\d+(?:\.\d*)?)|(?:\.\d+))(?:[eE][+-]?\d+)?\Z",
+    re.ASCII,
+)
+_MAX_SCALAR_TEXT = 256
+_MAX_SCALAR_DIGITS = 128
+_MAX_SCALAR_ADJUSTED_EXPONENT = 256
 _MAX_DURATION_SECONDS = 86_400
 _APPROVED_ALIASES = {
     "intent_id": "intent_id", "intentId": "intent_id", "intent-id": "intent_id",
@@ -244,8 +249,17 @@ def _safe_provider_value(value: object, secret_forms: frozenset[str], secrets: t
         active.discard(identity)
 
 
-def _canonical_scalar(value: bool | float) -> str:
-    return _canonical_text(str(value))
+def _canonical_scalar(value: object) -> str:
+    if type(value) is bool:
+        return f"bool:{str(value).casefold()}"
+    if type(value) is int and value.bit_length() > _MAX_SCALAR_DIGITS * 4:
+        raise ValueError
+    if type(value) is float and not math.isfinite(value):
+        raise ValueError
+    canonical = _canonical_decimal_text(str(value))
+    if canonical is None:
+        raise ValueError
+    return canonical
 
 
 def _canonical_text(value: str) -> str:
@@ -253,17 +267,38 @@ def _canonical_text(value: str) -> str:
     lowered = text.casefold()
     if lowered in {"true", "false"}:
         return f"bool:{lowered}"
-    if _INTEGER.fullmatch(text):
-        return f"number:{int(text)}"
-    if _DECIMAL.fullmatch(text):
-        try:
-            decimal = Decimal(text)
-        except InvalidOperation:
-            return f"text:{text}"
-        if decimal.is_finite():
-            normalized = decimal.normalize()
-            return f"number:{normalized}"
+    canonical = _canonical_decimal_text(text)
+    if canonical is not None:
+        return canonical
     return f"text:{text}"
+
+
+def _canonical_decimal_text(text: str) -> str | None:
+    if len(text) > _MAX_SCALAR_TEXT or _SCALAR_NUMBER.fullmatch(text) is None:
+        return None
+    if sum(character.isdigit() for character in text) > _MAX_SCALAR_DIGITS:
+        return None
+    try:
+        decimal = Decimal(text)
+    except InvalidOperation:
+        return None
+    if not decimal.is_finite():
+        return None
+    parts = decimal.as_tuple()
+    digits = list(parts.digits)
+    if not any(digits):
+        return "number:0"
+    while digits and digits[0] == 0:
+        digits.pop(0)
+    exponent = parts.exponent
+    while digits and digits[-1] == 0:
+        digits.pop()
+        exponent += 1
+    adjusted = exponent + len(digits) - 1
+    if abs(adjusted) > _MAX_SCALAR_ADJUSTED_EXPONENT:
+        return None
+    sign = "-" if parts.sign else ""
+    return f"number:{sign}{''.join(str(digit) for digit in digits)}e{exponent}"
 
 
 @dataclass
@@ -292,8 +327,9 @@ def redact(value: object, secrets: set[str], sensitive_keys: set[str]) -> object
     keys = frozenset(_valid_utf8(item).casefold() for item in sensitive_keys if isinstance(item, str) and item) | _SENSITIVE_KEY_PARTS
     result = _redact(value, normalized_secrets, keys, set(), 0, _Budget())
     try:
-        if len(_stable_json(result).encode("utf-8")) > _MAX_REDACTION_BYTES:
-            return [result[0], _TRUNCATED] if isinstance(result, list) and result else _TRUNCATED
+        if _json_size(result) > _MAX_REDACTION_BYTES:
+            candidate = [result[0], _TRUNCATED] if isinstance(result, list) and result else _TRUNCATED
+            return candidate if _json_size(candidate) <= _MAX_REDACTION_BYTES else _TRUNCATED
     except Exception:  # noqa: BLE001
         return _TRUNCATED
     return result
@@ -378,29 +414,136 @@ def _clean_key(key: object, secrets: tuple[str, ...], budget: _Budget) -> str:
 
 def _redact_text(value: str, secrets: tuple[str, ...], keys: frozenset[str], budget: _Budget) -> str:
     clean = _valid_utf8(value)
-    for secret in secrets:
-        clean = clean.replace(secret, _REDACTED)
-    clean = _BEARER.sub(r"\1" + _REDACTED, clean)
     try:
         parsed = urlsplit(clean)
         if parsed.scheme and parsed.netloc:
-            decoded_path = unquote(parsed.path)
-            for secret in secrets:
-                decoded_path = decoded_path.replace(secret, _REDACTED)
-            query = []
-            for key, item in parse_qsl(parsed.query, keep_blank_values=True):
-                for secret in secrets:
-                    key = key.replace(secret, _REDACTED)
-                    item = item.replace(secret, _REDACTED)
-                query.append((key, _REDACTED if _is_sensitive_key(key, keys) else item))
-            clean = urlunsplit((parsed.scheme, parsed.netloc, quote(decoded_path, safe="/[]"), urlencode(query), parsed.fragment))
+            clean = urlunsplit(
+                (
+                    _redact_plain_text(parsed.scheme, secrets),
+                    _redact_url_component(parsed.netloc, secrets),
+                    _redact_url_component(parsed.path, secrets),
+                    _redact_url_query(parsed.query, secrets, keys),
+                    _redact_url_component(parsed.fragment, secrets),
+                )
+            )
+        else:
+            clean = _redact_plain_text(clean, secrets)
     except Exception:  # noqa: BLE001
+        clean = _redact_plain_text(clean, secrets)
         clean = _truncate_text(clean, budget.text_limit(_MAX_TEXT_BYTES))
         budget.used_text(clean)
         return clean or _TRUNCATED
     clean = _truncate_text(clean, budget.text_limit(_MAX_TEXT_BYTES))
     budget.used_text(clean)
     return clean or _TRUNCATED
+
+
+@dataclass(frozen=True)
+class _UrlUnit:
+    decoded: str
+    raw: str
+
+
+def _redact_plain_text(value: str, secrets: tuple[str, ...]) -> str:
+    clean = value
+    for secret in secrets:
+        clean = clean.replace(secret, _REDACTED)
+    return _BEARER.sub(r"\1" + _REDACTED, clean)
+
+
+def _redact_url_query(raw_query: str, secrets: tuple[str, ...], keys: frozenset[str]) -> str:
+    fields: list[str] = []
+    for field in raw_query.split("&"):
+        raw_key, separator, raw_value = field.partition("=")
+        decoded_key = _decoded_url_component(raw_key, plus_as_space=True)
+        clean_key = _redact_url_component(raw_key, secrets, plus_as_space=True)
+        if not separator:
+            fields.append(clean_key)
+            continue
+        clean_value = (
+            _encoded_url_marker()
+            if _is_sensitive_key(decoded_key, keys)
+            else _redact_url_component(raw_value, secrets, plus_as_space=True)
+        )
+        fields.append(f"{clean_key}={clean_value}")
+    return "&".join(fields)
+
+
+def _redact_url_component(
+    raw: str, secrets: tuple[str, ...], *, plus_as_space: bool = False
+) -> str:
+    units = _url_units(raw, plus_as_space=plus_as_space)
+    decoded = "".join(unit.decoded for unit in units)
+    spans = _secret_spans(decoded, secrets)
+    spans.extend(match.span(2) for match in _BEARER.finditer(decoded))
+    spans = _merged_spans(spans)
+    if not spans:
+        return raw
+    output: list[str] = []
+    position = 0
+    redacting = False
+    for unit in units:
+        end = position + len(unit.decoded)
+        overlaps = any(start < end and stop > position for start, stop in spans)
+        if overlaps:
+            if not redacting:
+                output.append(_encoded_url_marker())
+            redacting = True
+        else:
+            output.append(unit.raw)
+            redacting = False
+        position = end
+    return "".join(output)
+
+
+def _decoded_url_component(raw: str, *, plus_as_space: bool) -> str:
+    return "".join(unit.decoded for unit in _url_units(raw, plus_as_space=plus_as_space))
+
+
+def _url_units(raw: str, *, plus_as_space: bool) -> list[_UrlUnit]:
+    units: list[_UrlUnit] = []
+    index = 0
+    while index < len(raw):
+        if raw[index] == "%" and index + 2 < len(raw) and _is_hex_pair(raw[index + 1:index + 3]):
+            start = index
+            encoded = bytearray()
+            while index + 2 < len(raw) and raw[index] == "%" and _is_hex_pair(raw[index + 1:index + 3]):
+                encoded.append(int(raw[index + 1:index + 3], 16))
+                index += 3
+            units.append(_UrlUnit(encoded.decode("utf-8", errors="replace"), raw[start:index]))
+            continue
+        character = raw[index]
+        units.append(_UrlUnit(" " if plus_as_space and character == "+" else character, character))
+        index += 1
+    return units
+
+
+def _is_hex_pair(value: str) -> bool:
+    return len(value) == 2 and all(character in "0123456789abcdefABCDEF" for character in value)
+
+
+def _secret_spans(value: str, secrets: tuple[str, ...]) -> list[tuple[int, int]]:
+    spans: list[tuple[int, int]] = []
+    for secret in secrets:
+        start = 0
+        while (found := value.find(secret, start)) >= 0:
+            spans.append((found, found + len(secret)))
+            start = found + len(secret)
+    return spans
+
+
+def _merged_spans(spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    merged: list[tuple[int, int]] = []
+    for start, stop in sorted(spans):
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(stop, merged[-1][1]))
+        else:
+            merged.append((start, stop))
+    return merged
+
+
+def _encoded_url_marker() -> str:
+    return quote(_REDACTED, safe="")
 
 
 def _is_sensitive_key(key: str, keys: frozenset[str]) -> bool:
@@ -428,11 +571,22 @@ def _stable_json(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
+def _json_size(value: object) -> int:
+    return len(_stable_json(value).encode("utf-8"))
+
+
 class AuditLogger:
-    def __init__(self, path: Path, *, secrets: set[str] | None = None, lock_root: Path | None = None) -> None:
-        self._path = Path(path).absolute()
+    def __init__(self, path: Path, *, secrets: set[str] | None = None) -> None:
+        failed = False
+        audit_path: Path | None = None
+        try:
+            audit_path = Path(path)
+        except OSError:
+            failed = True
+        if failed or audit_path is None:
+            raise AuditWriteError("audit path is invalid")
+        self._path = audit_path
         self._secrets = set(secrets or ())
-        self._lock_root = _prepare_lock_root(Path(lock_root).absolute()) if lock_root is not None else _lock_root()
 
     def emit(self, event: AuditEvent) -> None:
         failed = False
@@ -467,21 +621,14 @@ class AuditLogger:
         }
 
     def _append(self, encoded: bytes) -> None:
-        self._prepare_path()
         descriptor = _open_audit(self._path)
         try:
-            with _identity_lock(self._path, descriptor, self._lock_root):
-                self._prepare_path()
+            with _audit_file_lock(descriptor):
                 _recover_tail(descriptor)
                 _write_all(descriptor, encoded)
                 os.fsync(descriptor)
         finally:
             os.close(descriptor)
-
-    def _prepare_path(self) -> None:
-        _reject_links(self._path, include_final=True)
-        self._path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        _reject_links(self._path, include_final=True)
 
 
 def _approved_metadata(metadata: Mapping[str, object], secrets: set[str]) -> tuple[dict[str, object], float | int | None, str | None]:
@@ -512,115 +659,71 @@ def _audit_scalar(value: object, secrets: set[str], limit: int) -> object:
     return _truncate_text(clean, limit) if isinstance(clean, str) else clean
 
 
-def _is_link(path: Path) -> bool:
-    try:
-        info = path.lstat()
-    except FileNotFoundError:
-        return False
-    return stat.S_ISLNK(info.st_mode) or bool(getattr(info, "st_file_attributes", 0) & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
-
-
-def _reject_links(path: Path, *, include_final: bool) -> None:
-    absolute = path.absolute()
-    parts = absolute.parts
-    current = Path(parts[0])
-    stop = len(parts) if include_final else len(parts) - 1
-    for part in parts[1:stop]:
-        current /= part
-        if _is_link(current):
-            raise OSError("audit path contains a link")
-
-
 def _open_audit(path: Path) -> int:
-    _reject_links(path, include_final=True)
-    flags = os.O_APPEND | os.O_CREAT | os.O_RDWR
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
+    absolute = path.absolute()
     if os.name == "nt":
-        descriptor = os.open(path, flags, 0o600)
-    else:
-        parent_descriptor = _open_parent_no_follow(path.parent)
-        try:
-            descriptor = os.open(path.name, flags, 0o600, dir_fd=parent_descriptor)
-        finally:
+        return _open_windows_audit(absolute)
+    return _open_posix_audit(absolute)
+
+
+def _open_posix_audit(path: Path) -> int:
+    no_follow = getattr(os, "O_NOFOLLOW", None)
+    directory = getattr(os, "O_DIRECTORY", None)
+    if no_follow is None or directory is None:
+        raise OSError("descriptor-relative no-follow opens are unavailable")
+    root = Path(path.anchor)
+    parts = path.relative_to(root).parts
+    if not parts or parts[-1] in {"", ".", ".."}:
+        raise OSError("audit path has no file component")
+    directory_flags = os.O_RDONLY | directory | no_follow | getattr(os, "O_CLOEXEC", 0)
+    parent_descriptor = os.open(root, directory_flags)
+    try:
+        for index, part in enumerate(parts[:-1]):
+            if part in {"", ".", ".."} or "/" in part or "\\" in part:
+                raise OSError("audit path contains an invalid component")
+            next_descriptor, created = _open_or_create_posix_directory(
+                parent_descriptor, part, directory_flags
+            )
             os.close(parent_descriptor)
+            parent_descriptor = next_descriptor
+            if created or index == len(parts) - 2:
+                os.fchmod(parent_descriptor, 0o700)
+
+        flags = os.O_APPEND | os.O_CREAT | os.O_RDWR | no_follow | getattr(os, "O_CLOEXEC", 0)
+        descriptor = os.open(parts[-1], flags, 0o600, dir_fd=parent_descriptor)
+    finally:
+        os.close(parent_descriptor)
     try:
         if not stat.S_ISREG(os.fstat(descriptor).st_mode):
             raise OSError("audit target is not a regular file")
-        try:
-            os.fchmod(descriptor, 0o600)
-        except (AttributeError, OSError):
-            pass
+        os.fchmod(descriptor, 0o600)
         return descriptor
     except Exception:
         os.close(descriptor)
         raise
 
 
-def _open_parent_no_follow(parent: Path) -> int:
-    """Traverse existing POSIX parents by descriptor; Windows keeps reparse-point validation."""
-    if os.name == "nt":
-        raise OSError("Windows parent traversal uses reparse-safe validation")
-    absolute = parent.absolute()
-    root = Path(absolute.anchor)
-    descriptor = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+def _open_or_create_posix_directory(
+    parent_descriptor: int, name: str, flags: int
+) -> tuple[int, bool]:
     try:
-        for part in absolute.relative_to(root).parts:
-            next_descriptor = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=descriptor)
-            os.close(descriptor)
-            descriptor = next_descriptor
-        os.fchmod(descriptor, 0o700)
-        return descriptor
-    except Exception:
-        os.close(descriptor)
-        raise
+        return os.open(name, flags, dir_fd=parent_descriptor), False
+    except FileNotFoundError:
+        try:
+            os.mkdir(name, 0o700, dir_fd=parent_descriptor)
+            created = True
+        except FileExistsError:
+            created = False
+        return os.open(name, flags, dir_fd=parent_descriptor), created
 
 
 @contextmanager
-def _identity_lock(path: Path, descriptor: int, lock_root: Path | None) -> Iterator[None]:
-    identity = os.fstat(descriptor)
-    lock_path = lock_root / f"{identity.st_dev}-{identity.st_ino}.lock"
-    _reject_links(lock_path, include_final=True)
-    handle = lock_path.open("a+b")
+def _audit_file_lock(descriptor: int) -> Iterator[None]:
+    _lock_descriptor(descriptor)
     try:
-        handle.seek(0, os.SEEK_END)
-        if handle.tell() == 0:
-            handle.write(b"\0")
-            handle.flush()
-        handle.seek(0)
-        _lock(handle)
         yield
     finally:
-        try:
-            _unlock(handle)
-        finally:
-            handle.close()
-
-
-def _lock_root() -> Path:
-    if os.name == "nt":
-        local_app_data = os.environ.get("LOCALAPPDATA")
-        base = Path(local_app_data) if local_app_data else Path.home() / "AppData" / "Local"
-    else:
-        base = Path.home() / ".local" / "state"
-    root = base / "pyquality" / "audit-locks"
-    return _prepare_lock_root(root)
-
-
-def _prepare_lock_root(root: Path) -> Path:
-    if _is_link(root):
-        raise OSError("audit lock root is a link")
-    root.mkdir(mode=0o700, parents=True, exist_ok=True)
-    if _is_link(root) or not root.is_dir():
-        raise OSError("audit lock root is unsafe")
-    try:
-        os.chmod(root, 0o700)
-    except OSError:
-        pass
-    info = root.stat()
-    if os.name != "nt" and (info.st_mode & 0o077 or info.st_uid != os.getuid()):
-        raise OSError("audit lock root permissions are unsafe")
-    return root
+        _unlock_descriptor(descriptor)
 
 
 def _write_all(descriptor: int, data: bytes) -> None:
@@ -653,19 +756,392 @@ def _recover_tail(descriptor: int) -> None:
 
 
 if os.name == "nt":
+    import ctypes
     import msvcrt
+    from ctypes import wintypes
 
-    def _lock(handle: BinaryIO) -> None:
-        msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+    _INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+    _FILE_ATTRIBUTE_DIRECTORY = 0x00000010
+    _FILE_ATTRIBUTE_NORMAL = 0x00000080
+    _FILE_ATTRIBUTE_REPARSE_POINT = 0x00000400
+    _FILE_SHARE_ALL = 0x00000001 | 0x00000002 | 0x00000004
+    _FILE_OPEN = 1
+    _FILE_CREATE = 2
+    _FILE_OPEN_IF = 3
+    _FILE_DIRECTORY_FILE = 0x00000001
+    _FILE_SYNCHRONOUS_IO_NONALERT = 0x00000020
+    _FILE_NON_DIRECTORY_FILE = 0x00000040
+    _FILE_OPEN_REPARSE_POINT = 0x00200000
+    _FILE_READ_ATTRIBUTES = 0x00000080
+    _FILE_WRITE_ATTRIBUTES = 0x00000100
+    _SYNCHRONIZE = 0x00100000
+    _GENERIC_READ = 0x80000000
+    _GENERIC_WRITE = 0x40000000
+    _OBJ_CASE_INSENSITIVE = 0x00000040
+    _OPEN_EXISTING = 3
+    _FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
+    _FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
+    _LOCKFILE_EXCLUSIVE_LOCK = 0x00000002
+    _DUPLICATE_SAME_ACCESS = 0x00000002
 
-    def _unlock(handle: BinaryIO) -> None:
-        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+    class _UnicodeString(ctypes.Structure):
+        _fields_ = [
+            ("Length", wintypes.USHORT),
+            ("MaximumLength", wintypes.USHORT),
+            ("Buffer", wintypes.LPWSTR),
+        ]
+
+    class _ObjectAttributes(ctypes.Structure):
+        _fields_ = [
+            ("Length", wintypes.ULONG),
+            ("RootDirectory", wintypes.HANDLE),
+            ("ObjectName", ctypes.POINTER(_UnicodeString)),
+            ("Attributes", wintypes.ULONG),
+            ("SecurityDescriptor", wintypes.LPVOID),
+            ("SecurityQualityOfService", wintypes.LPVOID),
+        ]
+
+    class _IoStatusBlock(ctypes.Structure):
+        _fields_ = [("Status", ctypes.c_void_p), ("Information", ctypes.c_size_t)]
+
+    class _ByHandleFileInformation(ctypes.Structure):
+        _fields_ = [
+            ("dwFileAttributes", wintypes.DWORD),
+            ("ftCreationTime", wintypes.FILETIME),
+            ("ftLastAccessTime", wintypes.FILETIME),
+            ("ftLastWriteTime", wintypes.FILETIME),
+            ("dwVolumeSerialNumber", wintypes.DWORD),
+            ("nFileSizeHigh", wintypes.DWORD),
+            ("nFileSizeLow", wintypes.DWORD),
+            ("nNumberOfLinks", wintypes.DWORD),
+            ("nFileIndexHigh", wintypes.DWORD),
+            ("nFileIndexLow", wintypes.DWORD),
+        ]
+
+    class _Overlapped(ctypes.Structure):
+        _fields_ = [
+            ("Internal", ctypes.c_size_t),
+            ("InternalHigh", ctypes.c_size_t),
+            ("Offset", wintypes.DWORD),
+            ("OffsetHigh", wintypes.DWORD),
+            ("hEvent", wintypes.HANDLE),
+        ]
+
+    _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _ntdll = ctypes.WinDLL("ntdll")
+    _create_file = _kernel32.CreateFileW
+    _create_file.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    _create_file.restype = wintypes.HANDLE
+    _close_handle = _kernel32.CloseHandle
+    _close_handle.argtypes = [wintypes.HANDLE]
+    _close_handle.restype = wintypes.BOOL
+    _get_file_information = _kernel32.GetFileInformationByHandle
+    _get_file_information.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(_ByHandleFileInformation),
+    ]
+    _get_file_information.restype = wintypes.BOOL
+    _duplicate_handle = _kernel32.DuplicateHandle
+    _duplicate_handle.argtypes = [
+        wintypes.HANDLE,
+        wintypes.HANDLE,
+        wintypes.HANDLE,
+        ctypes.POINTER(wintypes.HANDLE),
+        wintypes.DWORD,
+        wintypes.BOOL,
+        wintypes.DWORD,
+    ]
+    _duplicate_handle.restype = wintypes.BOOL
+    _get_current_process = _kernel32.GetCurrentProcess
+    _get_current_process.restype = wintypes.HANDLE
+    _lock_file_ex = _kernel32.LockFileEx
+    _lock_file_ex.argtypes = [
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.POINTER(_Overlapped),
+    ]
+    _lock_file_ex.restype = wintypes.BOOL
+    _unlock_file_ex = _kernel32.UnlockFileEx
+    _unlock_file_ex.argtypes = [
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.POINTER(_Overlapped),
+    ]
+    _unlock_file_ex.restype = wintypes.BOOL
+    _nt_create_file = _ntdll.NtCreateFile
+    _nt_create_file.argtypes = [
+        ctypes.POINTER(wintypes.HANDLE),
+        wintypes.DWORD,
+        ctypes.POINTER(_ObjectAttributes),
+        ctypes.POINTER(_IoStatusBlock),
+        wintypes.LPVOID,
+        wintypes.ULONG,
+        wintypes.ULONG,
+        wintypes.ULONG,
+        wintypes.ULONG,
+        wintypes.LPVOID,
+        wintypes.ULONG,
+    ]
+    _nt_create_file.restype = wintypes.LONG
+    _rtl_nt_status_to_dos_error = _ntdll.RtlNtStatusToDosError
+    _rtl_nt_status_to_dos_error.argtypes = [wintypes.LONG]
+    _rtl_nt_status_to_dos_error.restype = wintypes.ULONG
+
+    def _open_windows_audit(path: Path) -> int:
+        root_handle: int | None = None
+        parent_handle: int | None = None
+        final_handle: int | None = None
+        descriptor: int | None = None
+        try:
+            root = Path(path.anchor)
+            parts = path.relative_to(root).parts
+            if not parts or parts[-1] in {"", ".", ".."}:
+                raise OSError("audit path has no file component")
+            root_handle = _open_windows_root(str(root))
+            _validate_windows_handle(root_handle, directory=True)
+            parent_handle = root_handle
+            root_handle = None
+            for part in parts[:-1]:
+                _validate_windows_component(part)
+                next_handle, created = _open_or_create_windows_directory(parent_handle, part)
+                try:
+                    _validate_windows_handle(next_handle, directory=True)
+                    if created:
+                        _fchmod_windows_handle(next_handle, 0o700)
+                except Exception:
+                    _close_windows_handle(next_handle)
+                    raise
+                _close_windows_handle(parent_handle)
+                parent_handle = next_handle
+            _validate_windows_component(parts[-1])
+            final_handle = _nt_open_relative(
+                parent_handle,
+                parts[-1],
+                desired_access=_GENERIC_READ | _GENERIC_WRITE | _SYNCHRONIZE,
+                disposition=_FILE_OPEN_IF,
+                attributes=_FILE_ATTRIBUTE_NORMAL,
+                options=(
+                    _FILE_NON_DIRECTORY_FILE
+                    | _FILE_OPEN_REPARSE_POINT
+                    | _FILE_SYNCHRONOUS_IO_NONALERT
+                ),
+            )
+            _validate_windows_handle(final_handle, directory=False)
+            descriptor = msvcrt.open_osfhandle(
+                final_handle, os.O_APPEND | os.O_RDWR | getattr(os, "O_BINARY", 0)
+            )
+            final_handle = None
+            os.fchmod(descriptor, 0o600)
+            return descriptor
+        except Exception:
+            if descriptor is not None:
+                os.close(descriptor)
+            raise
+        finally:
+            if final_handle is not None:
+                _close_windows_handle(final_handle)
+            if parent_handle is not None:
+                _close_windows_handle(parent_handle)
+            if root_handle is not None:
+                _close_windows_handle(root_handle)
+
+    def _open_windows_root(root: str) -> int:
+        handle = _create_file(
+            root,
+            _FILE_READ_ATTRIBUTES,
+            _FILE_SHARE_ALL,
+            None,
+            _OPEN_EXISTING,
+            _FILE_FLAG_BACKUP_SEMANTICS | _FILE_FLAG_OPEN_REPARSE_POINT,
+            None,
+        )
+        value = int(handle) if handle is not None else None
+        if value in {None, _INVALID_HANDLE_VALUE}:
+            raise ctypes.WinError(ctypes.get_last_error())
+        return value
+
+    def _open_or_create_windows_directory(parent: int, name: str) -> tuple[int, bool]:
+        access = _FILE_READ_ATTRIBUTES
+        options = _FILE_DIRECTORY_FILE | _FILE_OPEN_REPARSE_POINT
+        try:
+            return (
+                _nt_open_relative(
+                    parent,
+                    name,
+                    desired_access=access,
+                    disposition=_FILE_OPEN,
+                    attributes=_FILE_ATTRIBUTE_DIRECTORY,
+                    options=options,
+                ),
+                False,
+            )
+        except OSError as error:
+            if error.errno not in {2, 3}:
+                raise
+        try:
+            return (
+                _nt_open_relative(
+                    parent,
+                    name,
+                    desired_access=access | _FILE_WRITE_ATTRIBUTES,
+                    disposition=_FILE_CREATE,
+                    attributes=_FILE_ATTRIBUTE_DIRECTORY,
+                    options=options,
+                ),
+                True,
+            )
+        except OSError as error:
+            if error.errno not in {80, 183}:
+                raise
+        return (
+            _nt_open_relative(
+                parent,
+                name,
+                desired_access=access,
+                disposition=_FILE_OPEN,
+                attributes=_FILE_ATTRIBUTE_DIRECTORY,
+                options=options,
+            ),
+            False,
+        )
+
+    def _nt_open_relative(
+        parent: int,
+        name: str,
+        *,
+        desired_access: int,
+        disposition: int,
+        attributes: int,
+        options: int,
+    ) -> int:
+        buffer = ctypes.create_unicode_buffer(name)
+        name_length = len(name.encode("utf-16-le"))
+        unicode_name = _UnicodeString(
+            Length=name_length,
+            MaximumLength=name_length + 2,
+            Buffer=ctypes.cast(buffer, wintypes.LPWSTR),
+        )
+        object_attributes = _ObjectAttributes(
+            Length=ctypes.sizeof(_ObjectAttributes),
+            RootDirectory=wintypes.HANDLE(parent),
+            ObjectName=ctypes.pointer(unicode_name),
+            Attributes=_OBJ_CASE_INSENSITIVE,
+            SecurityDescriptor=None,
+            SecurityQualityOfService=None,
+        )
+        io_status = _IoStatusBlock()
+        handle = wintypes.HANDLE()
+        status = _nt_create_file(
+            ctypes.byref(handle),
+            desired_access,
+            ctypes.byref(object_attributes),
+            ctypes.byref(io_status),
+            None,
+            attributes,
+            _FILE_SHARE_ALL,
+            disposition,
+            options,
+            None,
+            0,
+        )
+        if status < 0:
+            error = int(_rtl_nt_status_to_dos_error(status))
+            raise OSError(error, "native audit component open failed")
+        if handle.value in {None, _INVALID_HANDLE_VALUE}:
+            raise OSError("native audit component returned an invalid handle")
+        return int(handle.value)
+
+    def _validate_windows_component(name: str) -> None:
+        encoded_length = len(name.encode("utf-16-le"))
+        if (
+            not name
+            or name in {".", ".."}
+            or encoded_length > 510
+            or any(character in name for character in ("/", "\\", ":", "\0"))
+        ):
+            raise OSError("audit path contains an invalid component")
+
+    def _validate_windows_handle(handle: int, *, directory: bool) -> None:
+        information = _ByHandleFileInformation()
+        if not _get_file_information(wintypes.HANDLE(handle), ctypes.byref(information)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        if information.dwFileAttributes & _FILE_ATTRIBUTE_REPARSE_POINT:
+            raise OSError("audit path contains a reparse point")
+        is_directory = bool(information.dwFileAttributes & _FILE_ATTRIBUTE_DIRECTORY)
+        if is_directory != directory:
+            raise OSError("audit path component has the wrong type")
+
+    def _fchmod_windows_handle(handle: int, mode: int) -> None:
+        duplicate = wintypes.HANDLE()
+        process = _get_current_process()
+        if not _duplicate_handle(
+            process,
+            wintypes.HANDLE(handle),
+            process,
+            ctypes.byref(duplicate),
+            0,
+            False,
+            _DUPLICATE_SAME_ACCESS,
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+        duplicate_value = int(duplicate.value)
+        descriptor: int | None = None
+        try:
+            descriptor = msvcrt.open_osfhandle(
+                duplicate_value, os.O_RDONLY | getattr(os, "O_BINARY", 0)
+            )
+            duplicate_value = 0
+            os.fchmod(descriptor, mode)
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+            if duplicate_value:
+                _close_windows_handle(duplicate_value)
+
+    def _close_windows_handle(handle: int) -> None:
+        _close_handle(wintypes.HANDLE(handle))
+
+    def _lock_descriptor(descriptor: int) -> None:
+        overlapped = _Overlapped()
+        handle = wintypes.HANDLE(msvcrt.get_osfhandle(descriptor))
+        if not _lock_file_ex(
+            handle,
+            _LOCKFILE_EXCLUSIVE_LOCK,
+            0,
+            1,
+            0,
+            ctypes.byref(overlapped),
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+
+    def _unlock_descriptor(descriptor: int) -> None:
+        overlapped = _Overlapped()
+        handle = wintypes.HANDLE(msvcrt.get_osfhandle(descriptor))
+        if not _unlock_file_ex(handle, 0, 1, 0, ctypes.byref(overlapped)):
+            raise ctypes.WinError(ctypes.get_last_error())
 
 else:
     import fcntl
 
-    def _lock(handle: BinaryIO) -> None:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+    def _open_windows_audit(path: Path) -> int:
+        del path
+        raise OSError("Windows native audit opens are unavailable")
 
-    def _unlock(handle: BinaryIO) -> None:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    def _lock_descriptor(descriptor: int) -> None:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+
+    def _unlock_descriptor(descriptor: int) -> None:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)

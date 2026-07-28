@@ -5,6 +5,7 @@ import multiprocessing
 import os
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from urllib.parse import unquote
 
 import pytest
 
@@ -12,36 +13,58 @@ from pyquality.domain.models import AuditEvent
 from pyquality.security import AuditLogger, AuditWriteError, redact
 
 
-@pytest.fixture(autouse=True)
-def isolated_lock_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Keep deterministic tests in their tmp directory while production defaults to application data."""
-    real_logger = AuditLogger
-    monkeypatch.setitem(
-        globals(),
-        "AuditLogger",
-        lambda path, **kwargs: real_logger(path, lock_root=tmp_path / ".audit-locks", **kwargs),
-    )
+def _set_process_environment(root: str) -> None:
+    for name in ("HOME", "LOCALAPPDATA", "TEMP", "TMP", "USERPROFILE"):
+        os.environ[name] = root
 
 
-def _emit_in_process(path: str, start: int, count: int, lock_root: str) -> None:
-    logger = AuditLogger(Path(path), lock_root=Path(lock_root))
+def _emit_in_process(path: str, start: int, count: int, environment_root: str) -> None:
+    _set_process_environment(environment_root)
+    logger = AuditLogger(Path(path))
     for index in range(start, start + count):
         logger.emit(AuditEvent(event_type="transition", metadata={"intent_id": f"intent-{index}"}))
 
 
-def _emit_aliases(first: str, second: str, start: int, lock_root: str) -> None:
+def _emit_aliases(first: str, second: str, start: int, environment_root: str) -> None:
+    _set_process_environment(environment_root)
     for index in range(start, start + 30):
-        AuditLogger(Path(first if index % 2 else second), lock_root=Path(lock_root)).emit(
+        AuditLogger(Path(first if index % 2 else second)).emit(
             AuditEvent(event_type="transition", metadata={"intent_id": f"alias-{index}"})
         )
 
 
-def _lock_root_from_custom_temp(temp: str, root: str, queue: multiprocessing.Queue[str]) -> None:
-    os.environ["TEMP"] = temp
-    os.environ["TMP"] = temp
+def _emit_while_write_is_held(
+    path: str,
+    environment_root: str,
+    ready: object,
+    release: object,
+) -> None:
+    _set_process_environment(environment_root)
     from pyquality import security
 
-    queue.put(str(security._prepare_lock_root(Path(root))))
+    real_write_all = security._write_all
+
+    def held_write(descriptor: int, data: bytes) -> None:
+        ready.set()  # type: ignore[attr-defined]
+        if not release.wait(15):  # type: ignore[attr-defined]
+            raise RuntimeError("timed out waiting to release audit write")
+        real_write_all(descriptor, data)
+
+    security._write_all = held_write
+    security.AuditLogger(Path(path)).emit(
+        AuditEvent(event_type="transition", metadata={"intent_id": "held"})
+    )
+
+
+def _emit_with_signals(path: str, environment_root: str, started: object, finished: object) -> None:
+    _set_process_environment(environment_root)
+    started.set()  # type: ignore[attr-defined]
+    try:
+        AuditLogger(Path(path)).emit(
+            AuditEvent(event_type="transition", metadata={"intent_id": "contender"})
+        )
+    finally:
+        finished.set()  # type: ignore[attr-defined]
 
 
 def test_redacts_nested_headers_urls_and_exception_text(tmp_path: Path) -> None:
@@ -79,6 +102,25 @@ def test_redacts_decoded_url_keys_and_preserves_percent_literals_and_unicode() -
     assert "secret" not in clean
     assert "%2525" in clean
     assert "%E9%9B%AA" in clean
+
+
+def test_url_redaction_preserves_raw_encoded_structure_while_redacting_decoded_secrets() -> None:
+    """Catches whole-component decode/re-encode that changes encoded URL data into structure."""
+    clean = redact(
+        "https://x.test/keep%2Fdata/%5Bencoded%5D/%25/secret%2Fvalue"
+        "?note=keep%2Fdata&bracket=%5Bencoded%5D&percent=%25"
+        "&api%2Fkey=safe&plain=secret%2Fvalue",
+        secrets={"secret/value", "api/key"},
+        sensitive_keys=set(),
+    )
+
+    assert isinstance(clean, str)
+    assert "secret/value" not in unquote(clean)
+    assert "api/key" not in unquote(clean)
+    assert "/keep%2Fdata/%5Bencoded%5D/%25/" in clean
+    assert "note=keep%2Fdata" in clean
+    assert "bracket=%5Bencoded%5D" in clean
+    assert "percent=%25" in clean
 
 
 def test_redact_handles_cycles_bytes_and_dangerous_objects_without_mutating_input() -> None:
@@ -135,6 +177,89 @@ def test_redact_limits_lazy_generator_work_and_aggregate_output() -> None:
     assert len(json.dumps(clean).encode("utf-8")) <= 8_192
     assert clean[-1] == "[TRUNCATED]"
     assert pulls == 5
+
+
+def test_redact_fallback_rechecks_a_huge_one_element_nested_result() -> None:
+    """Catches returning an oversized first element from the aggregate-size fallback."""
+    value = [
+        {
+            f"key-{index:03d}-" + ("k" * 64): "x" * 4_096
+            for index in range(128)
+        }
+    ]
+
+    clean = redact(value, secrets=set(), sensitive_keys=set())
+
+    encoded = json.dumps(clean, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    assert len(encoded) <= 8_192
+
+
+def test_audit_logger_rejects_configurable_sidecar_lock_authority(tmp_path: Path) -> None:
+    """Catches allowing callers to select a lock namespace that can diverge across processes."""
+    from pyquality import security
+
+    with pytest.raises(TypeError):
+        security.AuditLogger(tmp_path / "audit.jsonl", lock_root=tmp_path / "locks")
+
+
+def test_audit_logger_constructor_performs_no_external_io(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches creating lock roots or audit parents before the first emit."""
+    from pyquality import security
+
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "app-data"))
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path / "home"))
+    real_mkdir = Path.mkdir
+    created: list[Path] = []
+
+    def recording_mkdir(path: Path, *args: object, **kwargs: object) -> None:
+        created.append(path)
+        real_mkdir(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "mkdir", recording_mkdir)
+
+    security.AuditLogger(tmp_path / "missing" / "audit.jsonl")
+
+    assert created == []
+
+
+def test_audit_logger_constructor_sanitizes_path_conversion_errors() -> None:
+    """Catches exposing an OSError (and its sensitive text) from constructor path coercion."""
+    from pyquality import security
+
+    class ExplodingPath(os.PathLike[str]):
+        def __fspath__(self) -> str:
+            raise OSError("path contained sk-secret")
+
+    with pytest.raises(AuditWriteError) as raised:
+        security.AuditLogger(ExplodingPath())  # type: ignore[arg-type]
+
+    assert "sk-secret" not in str(raised.value)
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+
+
+def test_audit_path_creation_uses_only_descriptor_or_handle_relative_operations(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches path-based check-then-create/open operations for audit components."""
+    target = tmp_path / "new" / "nested" / "audit.jsonl"
+    logger = AuditLogger(target)
+
+    def forbidden(*_: object, **__: object) -> None:
+        raise AssertionError("path-based filesystem operation used")
+
+    with monkeypatch.context() as patcher:
+        patcher.setattr(Path, "lstat", forbidden)
+        patcher.setattr(Path, "mkdir", forbidden)
+        patcher.setattr(Path, "open", forbidden)
+        patcher.setattr(os, "chmod", forbidden)
+        logger.emit(AuditEvent(event_type="transition", metadata={"intent_id": "safe-open"}))
+
+    assert json.loads(target.read_text(encoding="utf-8"))["metadata"] == {
+        "intent_id": "safe-open"
+    }
 
 
 def test_audit_log_omits_source_and_prompt_by_default(tmp_path: Path) -> None:
@@ -254,8 +379,13 @@ def test_audit_multi_process_hardlink_aliases_share_one_complete_record_stream(t
     except OSError as error:
         pytest.skip(f"hardlink creation unavailable: {error.__class__.__name__}")
     context = multiprocessing.get_context("spawn")
-    lock_root = tmp_path / ".audit-locks"
-    processes = [context.Process(target=_emit_aliases, args=(str(path), str(alias), index * 30, str(lock_root))) for index in range(2)]
+    processes = [
+        context.Process(
+            target=_emit_aliases,
+            args=(str(path), str(alias), index * 30, str(tmp_path / f"environment-{index}")),
+        )
+        for index in range(2)
+    ]
     for process in processes:
         process.start()
     for process in processes:
@@ -265,20 +395,54 @@ def test_audit_multi_process_hardlink_aliases_share_one_complete_record_stream(t
     assert {record["metadata"]["intent_id"] for record in records} == {f"alias-{index}" for index in range(60)}
 
 
-def test_lock_root_is_stable_across_subprocess_temp_environment_changes(tmp_path: Path) -> None:
-    """Catches lock authority that follows process-local TEMP/TMP instead of per-user application data."""
+def test_audit_file_lock_excludes_live_hardlink_alias_writer_with_different_environment_root(
+    tmp_path: Path,
+) -> None:
+    """Catches sidecar locks that do not exclude a live writer through another hardlink name."""
+    left = tmp_path / "left"
+    right = tmp_path / "right"
+    left.mkdir()
+    right.mkdir()
+    path = left / "audit.jsonl"
+    path.touch()
+    alias = right / "audit-alias.jsonl"
+    try:
+        os.link(path, alias)
+    except OSError as error:
+        pytest.skip(f"hardlink creation unavailable: {error.__class__.__name__}")
+
     context = multiprocessing.get_context("spawn")
-    queue: multiprocessing.Queue[str] = context.Queue()
-    root = tmp_path / ".audit-locks"
-    first = context.Process(target=_lock_root_from_custom_temp, args=(str(tmp_path / "one"), str(root), queue))
-    second = context.Process(target=_lock_root_from_custom_temp, args=(str(tmp_path / "two"), str(root), queue))
-    first.start()
-    second.start()
-    roots = {queue.get(timeout=20), queue.get(timeout=20)}
-    first.join(20)
-    second.join(20)
-    assert (first.exitcode, second.exitcode) == (0, 0)
-    assert len(roots) == 1
+    ready = context.Event()
+    release = context.Event()
+    contender_started = context.Event()
+    contender_finished = context.Event()
+    holder = context.Process(
+        target=_emit_while_write_is_held,
+        args=(str(path), str(tmp_path / "environment-holder"), ready, release),
+    )
+    contender = context.Process(
+        target=_emit_with_signals,
+        args=(
+            str(alias),
+            str(tmp_path / "environment-contender"),
+            contender_started,
+            contender_finished,
+        ),
+    )
+    holder.start()
+    assert ready.wait(15)
+    assert path.stat().st_size == 0
+    contender.start()
+    assert contender_started.wait(15)
+    was_excluded = not contender_finished.wait(1)
+    release.set()
+    holder.join(20)
+    contender.join(20)
+
+    assert was_excluded
+    assert (holder.exitcode, contender.exitcode) == (0, 0)
+    records = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    assert {record["metadata"]["intent_id"] for record in records} == {"held", "contender"}
 
 
 def test_audit_normalizes_lone_surrogates_to_valid_utf8(tmp_path: Path) -> None:
@@ -290,27 +454,68 @@ def test_audit_normalizes_lone_surrogates_to_valid_utf8(tmp_path: Path) -> None:
     assert "\ud800" not in text and "\udcff" not in text
 
 
-def test_audit_rejects_final_and_parent_symlink_targets(tmp_path: Path) -> None:
-    """Catches audit writes that follow a final-file or parent-directory link outside the audit root."""
+@pytest.mark.parametrize("linked_component", ["final", "parent"])
+def test_audit_rejects_final_and_parent_symlink_targets(
+    tmp_path: Path, linked_component: str
+) -> None:
+    """Catches following either final-file or parent-directory links outside the audit root."""
     outside = tmp_path / "outside.txt"
     outside.write_text("outside\n", encoding="utf-8")
-    final_link = tmp_path / "audit.jsonl"
-    parent_link = tmp_path / "audit-parent"
     outside_dir = tmp_path / "outside-dir"
     outside_dir.mkdir()
+    if linked_component == "final":
+        path = tmp_path / "audit.jsonl"
+        link_target = outside
+        is_directory = False
+    else:
+        parent_link = tmp_path / "audit-parent"
+        path = parent_link / "audit.jsonl"
+        link_target = outside_dir
+        is_directory = True
     try:
-        final_link.symlink_to(outside)
-        parent_link.symlink_to(outside_dir, target_is_directory=True)
+        (path if linked_component == "final" else path.parent).symlink_to(
+            link_target, target_is_directory=is_directory
+        )
     except OSError as error:
-        pytest.skip(f"symlink creation unavailable: {error.__class__.__name__}")
+        pytest.skip(
+            f"{linked_component} symlink creation unavailable: {error.__class__.__name__}"
+        )
 
-    for path in (final_link, parent_link / "audit.jsonl"):
-        with pytest.raises(AuditWriteError) as raised:
-            AuditLogger(path).emit(AuditEvent(event_type="model", metadata={"intent_id": "ok"}))
-        assert raised.value.__cause__ is None
-        assert raised.value.__context__ is None
+    with pytest.raises(AuditWriteError) as raised:
+        AuditLogger(path).emit(AuditEvent(event_type="model", metadata={"intent_id": "ok"}))
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
     assert outside.read_text(encoding="utf-8") == "outside\n"
     assert not (outside_dir / "audit.jsonl").exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows process handle accounting only")
+def test_windows_failed_audit_opens_close_all_native_handles(tmp_path: Path) -> None:
+    """Catches leaking retained parent/final handles when a Windows native open fails."""
+    import ctypes
+    from ctypes import wintypes
+
+    get_process_handle_count = ctypes.windll.kernel32.GetProcessHandleCount
+    get_process_handle_count.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+    get_process_handle_count.restype = wintypes.BOOL
+    get_current_process = ctypes.windll.kernel32.GetCurrentProcess
+    get_current_process.restype = wintypes.HANDLE
+
+    def handle_count() -> int:
+        count = wintypes.DWORD()
+        assert get_process_handle_count(get_current_process(), ctypes.byref(count))
+        return count.value
+
+    directory_target = tmp_path / "audit-target"
+    directory_target.mkdir()
+    logger = AuditLogger(directory_target)
+    before = handle_count()
+    for _ in range(25):
+        with pytest.raises(AuditWriteError) as raised:
+            logger.emit(AuditEvent(event_type="model", metadata={"intent_id": "ok"}))
+        assert raised.value.__cause__ is None
+        assert raised.value.__context__ is None
+    assert handle_count() <= before + 2
 
 
 def test_audit_recovers_partial_tail_and_serializes_multi_process_emits(tmp_path: Path) -> None:
@@ -318,8 +523,13 @@ def test_audit_recovers_partial_tail_and_serializes_multi_process_emits(tmp_path
     path = tmp_path / "audit.jsonl"
     path.write_bytes(b'{"event_type":"partial"')
     context = multiprocessing.get_context("spawn")
-    lock_root = tmp_path / ".audit-locks"
-    processes = [context.Process(target=_emit_in_process, args=(str(path), index * 20, 20, str(lock_root))) for index in range(3)]
+    processes = [
+        context.Process(
+            target=_emit_in_process,
+            args=(str(path), index * 20, 20, str(tmp_path / f"environment-{index}")),
+        )
+        for index in range(3)
+    ]
     for process in processes:
         process.start()
     for process in processes:
