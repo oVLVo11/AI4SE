@@ -6,8 +6,12 @@ import json
 import re
 from collections.abc import Mapping
 from pathlib import PurePosixPath
+from typing import TYPE_CHECKING
 
 from pyquality.domain.models import Finding
+
+if TYPE_CHECKING:
+    from pyquality.config import Settings
 
 _EVIDENCE_LIMIT = 2_048
 _SUMMARY_LIMIT = 512
@@ -17,49 +21,58 @@ _EXCEPTION = re.compile(r"^E\s+(?P<message>.+)$", re.MULTILINE)
 
 
 def parse_pytest(
-    output: str, exit_code: int | None, *, timed_out: bool = False
+    output: str,
+    exit_code: int | None,
+    *,
+    timed_out: bool = False,
+    settings: Settings | None = None,
 ) -> tuple[Finding, ...]:
     """Turn a pytest process outcome into one compact, actionable finding."""
     if timed_out:
-        return (_harness_finding("timeout", output),)
+        return (_harness_finding("timeout", output, settings),)
     if exit_code == 0:
         return ()
     if _missing_tool(output, "pytest"):
-        return (_harness_finding("missing_tool_dependency", output),)
+        return (_harness_finding("missing_tool_dependency", output, settings),)
 
     category = _pytest_category(output)
     path, line = _location(output)
     summary = _pytest_summary(output, category)
     return (
-        Finding(
+        _finding(
+            settings,
             source="pytest",
             category=category,
             severity="error",
             path=path,
             line=line,
-            summary=summary,
-            evidence=_compact(output),
-            group_key=_group_key("pytest", category, path, line),
+            summary=_compact(summary, _limit(settings, "max_finding_summary_bytes", _SUMMARY_LIMIT)),
+            evidence=_compact(output, _limit(settings, "max_finding_evidence_bytes", _EVIDENCE_LIMIT)),
+            group_key=_group_key("pytest", category, path, line, settings),
         ),
     )
 
 
 def parse_ruff(
-    output: str, exit_code: int | None, *, timed_out: bool = False
+    output: str,
+    exit_code: int | None,
+    *,
+    timed_out: bool = False,
+    settings: Settings | None = None,
 ) -> tuple[Finding, ...]:
     """Turn Ruff's JSON protocol into deterministic, bounded findings."""
     if timed_out:
-        return (_harness_finding("timeout", output),)
+        return (_harness_finding("timeout", output, settings),)
     if exit_code == 0:
         return ()
     if _missing_tool(output, "ruff"):
-        return (_harness_finding("missing_tool_dependency", output),)
+        return (_harness_finding("missing_tool_dependency", output, settings),)
     try:
         records = json.loads(output)
     except json.JSONDecodeError:
-        return (_infrastructure_finding("ruff", output),)
+        return (_infrastructure_finding("ruff", output, settings),)
     if not isinstance(records, list):
-        return (_infrastructure_finding("ruff", output),)
+        return (_infrastructure_finding("ruff", output, settings),)
 
     findings: list[Finding] = []
     for record in records:
@@ -75,24 +88,40 @@ def parse_ruff(
         if path is None:
             continue
         line = location.get("row") if isinstance(location, Mapping) else None
-        if not isinstance(line, int) or line < 1:
+        if not isinstance(line, int) or isinstance(line, bool) or line < 1:
             line = None
-        summary = _compact(f"{code}: {message}", _SUMMARY_LIMIT)
+        summary = _compact(
+            f"{code}: {message}", _limit(settings, "max_finding_summary_bytes", _SUMMARY_LIMIT)
+        )
         findings.append(
-            Finding(
+            _finding(
+                settings,
                 source="ruff",
                 category="ruff",
                 severity="warning",
                 path=path,
                 line=line,
                 summary=summary,
-                evidence=_compact(f"{path}:{line or 0}: {summary}"),
-                group_key=_group_key("ruff", code, path, line),
+                evidence=_compact(
+                    f"{path}:{line or 0}: {summary}",
+                    _limit(settings, "max_finding_evidence_bytes", _EVIDENCE_LIMIT),
+                ),
+                group_key=_group_key("ruff", code, path, line, settings),
             )
         )
     if not findings:
-        return (_infrastructure_finding("ruff", output),)
-    return tuple(sorted(findings, key=lambda finding: (finding.path or "", finding.line or 0, finding.summary)))
+        return (_infrastructure_finding("ruff", output, settings),)
+    return tuple(
+        sorted(
+            findings,
+            key=lambda finding: (
+                finding.path or "",
+                finding.line or 0,
+                finding.summary,
+                finding.group_key,
+            ),
+        )
+    )
 
 
 def _pytest_category(output: str) -> str:
@@ -127,7 +156,8 @@ def _location(output: str) -> tuple[str | None, int | None]:
             continue
         path = _normalize_path(match.group("path"))
         if path is not None:
-            return path, int(match.group("line"))
+            line = int(match.group("line"))
+            return path, line if line >= 1 else None
     return None, None
 
 
@@ -150,8 +180,9 @@ def _missing_tool(output: str, tool: str) -> bool:
     )
 
 
-def _harness_finding(category: str, output: str) -> Finding:
-    return Finding(
+def _harness_finding(category: str, output: str, settings: Settings | None) -> Finding:
+    return _finding(
+        settings,
         source="harness",
         category=category,
         severity="error",
@@ -159,25 +190,49 @@ def _harness_finding(category: str, output: str) -> Finding:
             "timeout": "quality command timed out",
             "missing_tool_dependency": "quality tool dependency is unavailable",
         }[category],
-        evidence=_compact(output),
-        group_key=f"harness:{category}",
+        evidence=_compact(output, _limit(settings, "max_finding_evidence_bytes", _EVIDENCE_LIMIT)),
+        group_key=_compact(
+            f"harness:{category}", _limit(settings, "max_group_key_bytes", _SUMMARY_LIMIT)
+        ),
     )
 
 
-def _infrastructure_finding(source: str, output: str) -> Finding:
-    return Finding(
+def _infrastructure_finding(
+    source: str, output: str, settings: Settings | None
+) -> Finding:
+    return _finding(
+        settings,
         source="harness" if source == "ruff" else "pytest",
         category="infrastructure",
         severity="error",
         summary=f"{source} exited with unrecognized failure output",
-        evidence=_compact(output),
-        group_key=f"{source}:infrastructure",
+        evidence=_compact(output, _limit(settings, "max_finding_evidence_bytes", _EVIDENCE_LIMIT)),
+        group_key=_compact(
+            f"{source}:infrastructure", _limit(settings, "max_group_key_bytes", _SUMMARY_LIMIT)
+        ),
     )
 
 
-def _group_key(source: str, category: str, path: str | None, line: int | None) -> str:
+def _group_key(
+    source: str,
+    category: str,
+    path: str | None,
+    line: int | None,
+    settings: Settings | None,
+) -> str:
     location = f"{path or '-'}:{line or 0}"
-    return _compact(f"{source}:{category}:{location}", _SUMMARY_LIMIT)
+    return _compact(
+        f"{source}:{category}:{location}",
+        _limit(settings, "max_group_key_bytes", _SUMMARY_LIMIT),
+    )
+
+
+def _finding(settings: Settings | None, **data: object) -> Finding:
+    return Finding.model_validate(data, context={"settings": settings} if settings else None)
+
+
+def _limit(settings: Settings | None, name: str, default: int) -> int:
+    return getattr(settings, name, default)
 
 
 def _compact(value: str, limit: int = _EVIDENCE_LIMIT) -> str:

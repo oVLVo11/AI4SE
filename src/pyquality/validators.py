@@ -35,7 +35,9 @@ class PytestValidator:
 
     def run(self, changed_paths: set[Path]) -> RawValidationResult:
         targets = _changed_test_paths(changed_paths)
-        return self._execute([sys.executable, "-m", "pytest", *targets])
+        return self._execute(
+            [sys.executable, "-m", "pytest", *self._settings.pytest_args, *targets]
+        )
 
     def _execute(self, argv: list[str]) -> RawValidationResult:
         return _run(self._runner, self._settings, self._cwd, argv)
@@ -50,11 +52,21 @@ class RuffValidator:
         self._cwd = cwd or Path.cwd()
 
     def run(self) -> RawValidationResult:
+        configured = _without_ruff_output_format(self._settings.ruff_args)
         return _run(
             self._runner,
             self._settings,
             self._cwd,
-            [sys.executable, "-m", "ruff", "check", "--output-format", "json", "."],
+            [
+                sys.executable,
+                "-m",
+                "ruff",
+                "check",
+                *configured,
+                "--output-format",
+                "json",
+                ".",
+            ],
         )
 
 
@@ -62,6 +74,7 @@ class QualityPipeline:
     """Run targeted pytest preflight, full pytest, then Ruff in a fixed order."""
 
     def __init__(self, runner: ProcessRunner, settings: Settings, cwd: Path | None = None) -> None:
+        self._settings = settings
         self._pytest = PytestValidator(runner, settings, cwd)
         self._ruff = RuffValidator(runner, settings, cwd)
 
@@ -69,16 +82,20 @@ class QualityPipeline:
         normalized_paths = _normalized_changed_paths(changed_paths)
         target_paths = {Path(path) for path in _changed_test_paths(changed_paths)}
         targeted = self._pytest.run(target_paths) if target_paths else None
-        targeted_findings = _pytest_findings(targeted) if targeted is not None else ()
+        targeted_findings = (
+            _pytest_findings(targeted, self._settings) if targeted is not None else ()
+        )
 
         full: RawValidationResult | None = None
         full_findings: tuple[Finding, ...] = ()
-        if targeted is None or not _preflight_blocked(targeted_findings):
+        if targeted is None or not _preflight_blocked(targeted, targeted_findings):
             full = self._pytest.run(set())
-            full_findings = _pytest_findings(full)
+            full_findings = _pytest_findings(full, self._settings)
 
         ruff = self._ruff.run()
-        ruff_findings = parse_ruff(ruff.output, ruff.exit_code, timed_out=ruff.timed_out)
+        ruff_findings = parse_ruff(
+            ruff.output, ruff.exit_code, timed_out=ruff.timed_out, settings=self._settings
+        )
         results = tuple(result for result in (targeted, full, ruff) if result is not None)
         timed_out = tuple(
             name
@@ -136,7 +153,12 @@ def _normalized_changed_paths(changed_paths: set[Path]) -> tuple[str, ...]:
         while value.startswith("./"):
             value = value[2:]
         candidate = PurePosixPath(value)
-        if value and not candidate.is_absolute() and ".." not in candidate.parts:
+        if (
+            value
+            and not candidate.is_absolute()
+            and ".." not in candidate.parts
+            and not _is_windows_drive_path(value)
+        ):
             normalized.add(candidate.as_posix())
     return tuple(sorted(normalized))
 
@@ -148,15 +170,34 @@ def _is_direct_test_path(path: str) -> bool:
     return len(candidate.parts) == 2 and candidate.parts[0] == "tests" and candidate.match("tests/test_*.py")
 
 
-def _pytest_findings(result: RawValidationResult) -> tuple[Finding, ...]:
-    return parse_pytest(result.output, result.exit_code, timed_out=result.timed_out)
-
-
-def _preflight_blocked(findings: tuple[Finding, ...]) -> bool:
-    return any(
-        finding.category in {"timeout", "missing_tool_dependency", "infrastructure"}
-        for finding in findings
+def _pytest_findings(result: RawValidationResult, settings: Settings) -> tuple[Finding, ...]:
+    return parse_pytest(
+        result.output, result.exit_code, timed_out=result.timed_out, settings=settings
     )
+
+
+def _preflight_blocked(
+    result: RawValidationResult, findings: tuple[Finding, ...]
+) -> bool:
+    return result.timed_out or result.exit_code is None or any(
+        finding.category == "missing_tool_dependency" for finding in findings
+    )
+
+
+def _without_ruff_output_format(arguments: tuple[str, ...]) -> tuple[str, ...]:
+    kept: list[str] = []
+    index = 0
+    while index < len(arguments):
+        if arguments[index] == "--output-format":
+            index += 2
+        else:
+            kept.append(arguments[index])
+            index += 1
+    return tuple(kept)
+
+
+def _is_windows_drive_path(value: str) -> bool:
+    return len(value) >= 3 and value[0].isalpha() and value[1:3] == ":/"
 
 
 def _status(result: RawValidationResult | None) -> CheckStatus:

@@ -34,6 +34,42 @@ git diff --check
 exit 0
 ```
 
+## Review fix round 1
+
+- Honored validated `pytest_args` and `ruff_args`, replacing any configured Ruff
+  output-format pair with exactly one JSON protocol pair.
+- Limited targeted-preflight short-circuiting to timeouts, absent exit status, and
+  explicit missing-tool failures, so pytest exit 5 still permits the mandatory suite.
+- Sanitized invalid pytest line bounds and boolean/non-positive Ruff rows.
+- Passed effective Settings limits through both parser paths and Finding validation.
+- Excluded Windows drive-qualified changed paths from repository targets.
+- Added Ruff group/code as a deterministic ordering tie-breaker.
+
+TDD evidence for this round:
+
+1. The first focused run collected 22 tests and failed 10 tests for the six reviewed
+   behaviors before production changes.
+2. After the minimal fixes, all 22 focused tests passed.
+3. A pipeline-level pytest Settings-limit test was then added and failed with 124
+   evidence bytes against a 16-byte limit before Settings was threaded through that path.
+4. The final focused run passed 23 tests.
+
+Fresh verification after review fixes:
+
+```text
+python -m pytest tests/unit/test_parsers.py tests/component/test_validators.py -v
+23 passed in 0.14s
+
+python -m pytest -v
+136 passed, 5 skipped in 3.41s
+
+python -m ruff check src tests
+All checks passed!
+
+git diff --check
+exit 0
+```
+
 ## Contract note
 
 `QualityReport` was consumed without schema changes. The required raw command
