@@ -317,6 +317,7 @@ class SQLiteTaskRepository:
             row = self._require_approval(connection, approval_id)
             if row["decision"] != ApprovalDecision.APPROVE.value or row["execution_state"] != "pending":
                 raise StorageStateError("approval is not ready for execution intent")
+            self._require_running_lease(connection, row["task_id"])
             connection.execute(
                 "UPDATE approvals SET execution_state = 'intent_recorded' WHERE id = ?", (approval_id,)
             )
@@ -340,6 +341,8 @@ class SQLiteTaskRepository:
     def acquire_project_lease(self, task_id: str) -> bool:
         with self._transaction() as connection:
             task = self._require_task(connection, task_id)
+            if task["status"] != TaskStatus.RUNNING.value:
+                raise StorageStateError("only running tasks can acquire a project lease")
             try:
                 connection.execute(
                     "INSERT INTO project_leases (project_id, task_id, acquired_at) VALUES (?, ?, ?)",
@@ -412,50 +415,77 @@ class SQLiteTaskRepository:
         )
 
     def resume_snapshot(self, task_id: str) -> RecoverySnapshot:
-        task_row = self._connection.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
-        if task_row is None:
-            raise StorageStateError("task does not exist")
-        iterations = tuple(
-            _iteration_from_row(row)
-            for row in self._connection.execute(
-                "SELECT * FROM iterations WHERE task_id = ? ORDER BY sequence, created_at, id", (task_id,)
+        with self._read_transaction() as connection:
+            task_row = connection.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+            if task_row is None:
+                raise StorageStateError("task does not exist")
+            iterations = tuple(
+                _iteration_from_row(row)
+                for row in connection.execute(
+                    "SELECT * FROM iterations WHERE task_id = ? ORDER BY sequence, created_at, id", (task_id,)
+                )
             )
-        )
-        findings = tuple(
-            _finding_from_row(row)
-            for row in self._connection.execute(
-                """SELECT findings.* FROM findings
-                   JOIN iterations ON iterations.id = findings.iteration_id
-                   WHERE iterations.task_id = ? ORDER BY findings.created_at, findings.id""",
+            findings = tuple(
+                _finding_from_row(row)
+                for row in connection.execute(
+                    """SELECT findings.* FROM findings
+                       JOIN iterations ON iterations.id = findings.iteration_id
+                       WHERE iterations.task_id = ? ORDER BY findings.created_at, findings.id""",
+                    (task_id,),
+                )
+            )
+            decisions = tuple(
+                _decision_from_row(row)
+                for row in connection.execute(
+                    "SELECT * FROM decisions WHERE project_id = ? ORDER BY created_at, id",
+                    (task_row["project_id"],),
+                )
+            )
+            pending_row = connection.execute(
+                """SELECT * FROM approvals WHERE task_id = ? AND decision IS NULL
+                   ORDER BY created_at DESC, id DESC LIMIT 1""",
                 (task_id,),
+            ).fetchone()
+            lease_row = connection.execute(
+                "SELECT task_id FROM project_leases WHERE project_id = ?", (task_row["project_id"],)
+            ).fetchone()
+            executable_row = None
+            if (
+                task_row["status"] == TaskStatus.RUNNING.value
+                and lease_row is not None
+                and lease_row["task_id"] == task_id
+            ):
+                executable_row = connection.execute(
+                    """SELECT * FROM approvals
+                       WHERE task_id = ? AND decision = ? AND execution_state != 'completed'
+                       ORDER BY decided_at, id LIMIT 1""",
+                    (task_id, ApprovalDecision.APPROVE.value),
+                ).fetchone()
+            return RecoverySnapshot(
+                task=_task_from_row(task_row),
+                iterations=iterations,
+                findings=findings,
+                decisions=decisions,
+                pending_approval=_approval_from_row(pending_row) if pending_row is not None else None,
+                executable_approval=_approval_from_row(executable_row)
+                if executable_row is not None
+                else None,
             )
-        )
-        decisions = tuple(
-            _decision_from_row(row)
-            for row in self._connection.execute(
-                "SELECT * FROM decisions WHERE project_id = ? ORDER BY created_at, id",
-                (task_row["project_id"],),
-            )
-        )
-        pending = self.pending_approval(task_id)
-        executable_row = self._connection.execute(
-            """SELECT * FROM approvals
-               WHERE task_id = ? AND decision = ? AND execution_state != 'completed'
-               ORDER BY decided_at, id LIMIT 1""",
-            (task_id, ApprovalDecision.APPROVE.value),
-        ).fetchone()
-        return RecoverySnapshot(
-            task=_task_from_row(task_row),
-            iterations=iterations,
-            findings=findings,
-            decisions=decisions,
-            pending_approval=pending,
-            executable_approval=_approval_from_row(executable_row) if executable_row is not None else None,
-        )
 
     @contextmanager
     def _transaction(self) -> Iterator[sqlite3.Connection]:
         self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            yield self._connection
+        except Exception:
+            self._connection.rollback()
+            raise
+        else:
+            self._connection.commit()
+
+    @contextmanager
+    def _read_transaction(self) -> Iterator[sqlite3.Connection]:
+        self._connection.execute("BEGIN")
         try:
             yield self._connection
         except Exception:
@@ -564,6 +594,15 @@ class SQLiteTaskRepository:
         if row is None:
             raise StorageStateError("approval does not exist")
         return row
+
+    @classmethod
+    def _require_running_lease(cls, connection: sqlite3.Connection, task_id: str) -> None:
+        task = cls._require_task(connection, task_id)
+        lease = connection.execute(
+            "SELECT task_id FROM project_leases WHERE project_id = ?", (task["project_id"],)
+        ).fetchone()
+        if task["status"] != TaskStatus.RUNNING.value or lease is None or lease["task_id"] != task_id:
+            raise StorageStateError("running task does not own the project lease")
 
     def _approval_by_id(self, approval_id: str) -> ApprovalRecord:
         row = self._connection.execute("SELECT * FROM approvals WHERE id = ?", (approval_id,)).fetchone()
