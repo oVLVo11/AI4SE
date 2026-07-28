@@ -39,9 +39,10 @@ _SCALAR_NUMBER = re.compile(
     r"[+-]?(?:(?:\d+(?:\.\d*)?)|(?:\.\d+))(?:[eE][+-]?\d+)?\Z",
     re.ASCII,
 )
-_MAX_SCALAR_TEXT = 256
-_MAX_SCALAR_DIGITS = 128
-_MAX_SCALAR_ADJUSTED_EXPONENT = 256
+_MAX_SCALAR_TEXT = 4_096
+_MAX_SCALAR_DIGITS = 4_096
+_MAX_SCALAR_ADJUSTED_EXPONENT = 4_096
+_MAX_PROVIDER_INTEGER_BITS = 512
 _MAX_DURATION_SECONDS = 86_400
 _APPROVED_ALIASES = {
     "intent_id": "intent_id", "intentId": "intent_id", "intent-id": "intent_id",
@@ -205,7 +206,13 @@ def _environment_warning() -> CredentialWarning:
     return CredentialWarning(code="environment_plaintext", message="Environment credentials are plaintext and visible to processes with access to this process environment.")
 
 
-def _safe_provider_value(value: object, secret_forms: frozenset[str], secrets: tuple[str, ...], active: set[int], depth: int) -> object:
+type _CanonicalDecimal = tuple[Literal["number"], int, tuple[int, ...], int]
+type _CanonicalScalar = (
+    _CanonicalDecimal | tuple[Literal["bool"], bool] | tuple[Literal["text"], str]
+)
+
+
+def _safe_provider_value(value: object, secret_forms: frozenset[_CanonicalScalar], secrets: tuple[str, ...], active: set[int], depth: int) -> object:
     """Copy only JSON-like provider results, rejecting unknown objects and secret-bearing keys/values."""
     if depth > _MAX_DEPTH:
         raise ValueError
@@ -249,10 +256,10 @@ def _safe_provider_value(value: object, secret_forms: frozenset[str], secrets: t
         active.discard(identity)
 
 
-def _canonical_scalar(value: object) -> str:
+def _canonical_scalar(value: object) -> _CanonicalScalar:
     if type(value) is bool:
-        return f"bool:{str(value).casefold()}"
-    if type(value) is int and value.bit_length() > _MAX_SCALAR_DIGITS * 4:
+        return ("bool", value)
+    if type(value) is int and value.bit_length() > _MAX_PROVIDER_INTEGER_BITS:
         raise ValueError
     if type(value) is float and not math.isfinite(value):
         raise ValueError
@@ -262,18 +269,18 @@ def _canonical_scalar(value: object) -> str:
     return canonical
 
 
-def _canonical_text(value: str) -> str:
+def _canonical_text(value: str) -> _CanonicalScalar:
     text = _valid_utf8(value)
     lowered = text.casefold()
     if lowered in {"true", "false"}:
-        return f"bool:{lowered}"
+        return ("bool", lowered == "true")
     canonical = _canonical_decimal_text(text)
     if canonical is not None:
         return canonical
-    return f"text:{text}"
+    return ("text", text)
 
 
-def _canonical_decimal_text(text: str) -> str | None:
+def _canonical_decimal_text(text: str) -> _CanonicalDecimal | None:
     if len(text) > _MAX_SCALAR_TEXT or _SCALAR_NUMBER.fullmatch(text) is None:
         return None
     if sum(character.isdigit() for character in text) > _MAX_SCALAR_DIGITS:
@@ -287,7 +294,7 @@ def _canonical_decimal_text(text: str) -> str | None:
     parts = decimal.as_tuple()
     digits = list(parts.digits)
     if not any(digits):
-        return "number:0"
+        return ("number", 0, (0,), 0)
     while digits and digits[0] == 0:
         digits.pop(0)
     exponent = parts.exponent
@@ -297,8 +304,7 @@ def _canonical_decimal_text(text: str) -> str | None:
     adjusted = exponent + len(digits) - 1
     if abs(adjusted) > _MAX_SCALAR_ADJUSTED_EXPONENT:
         return None
-    sign = "-" if parts.sign else ""
-    return f"number:{sign}{''.join(str(digit) for digit in digits)}e{exponent}"
+    return ("number", parts.sign, tuple(digits), exponent)
 
 
 @dataclass
@@ -686,7 +692,7 @@ def _open_posix_audit(path: Path) -> int:
             )
             os.close(parent_descriptor)
             parent_descriptor = next_descriptor
-            if created or index == len(parts) - 2:
+            if created:
                 os.fchmod(parent_descriptor, 0o700)
 
         flags = os.O_APPEND | os.O_CREAT | os.O_RDWR | no_follow | getattr(os, "O_CLOEXEC", 0)
@@ -694,8 +700,11 @@ def _open_posix_audit(path: Path) -> int:
     finally:
         os.close(parent_descriptor)
     try:
-        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+        information = os.fstat(descriptor)
+        if not stat.S_ISREG(information.st_mode):
             raise OSError("audit target is not a regular file")
+        if information.st_uid != os.geteuid():
+            raise OSError("audit target has an unsafe owner")
         os.fchmod(descriptor, 0o600)
         return descriptor
     except Exception:
@@ -764,7 +773,10 @@ if os.name == "nt":
     _FILE_ATTRIBUTE_DIRECTORY = 0x00000010
     _FILE_ATTRIBUTE_NORMAL = 0x00000080
     _FILE_ATTRIBUTE_REPARSE_POINT = 0x00000400
-    _FILE_SHARE_ALL = 0x00000001 | 0x00000002 | 0x00000004
+    _FILE_SHARE_READ = 0x00000001
+    _FILE_SHARE_WRITE = 0x00000002
+    _FILE_SHARE_DELETE = 0x00000004
+    _FILE_SHARE_ALL = _FILE_SHARE_READ | _FILE_SHARE_WRITE | _FILE_SHARE_DELETE
     _FILE_OPEN = 1
     _FILE_CREATE = 2
     _FILE_OPEN_IF = 3
@@ -774,15 +786,31 @@ if os.name == "nt":
     _FILE_OPEN_REPARSE_POINT = 0x00200000
     _FILE_READ_ATTRIBUTES = 0x00000080
     _FILE_WRITE_ATTRIBUTES = 0x00000100
+    _READ_CONTROL = 0x00020000
+    _WRITE_DAC = 0x00040000
     _SYNCHRONIZE = 0x00100000
     _GENERIC_READ = 0x80000000
     _GENERIC_WRITE = 0x40000000
+    _FILE_ALL_ACCESS = 0x001F01FF
     _OBJ_CASE_INSENSITIVE = 0x00000040
     _OPEN_EXISTING = 3
     _FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
     _FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
     _LOCKFILE_EXCLUSIVE_LOCK = 0x00000002
     _DUPLICATE_SAME_ACCESS = 0x00000002
+    _TOKEN_QUERY = 0x00000008
+    _TOKEN_USER = 1
+    _ERROR_INSUFFICIENT_BUFFER = 122
+    _SE_FILE_OBJECT = 1
+    _OWNER_SECURITY_INFORMATION = 0x00000001
+    _DACL_SECURITY_INFORMATION = 0x00000004
+    _PROTECTED_DACL_SECURITY_INFORMATION = 0x80000000
+    _SE_DACL_PROTECTED = 0x1000
+    _SET_ACCESS = 2
+    _TRUSTEE_IS_SID = 0
+    _TRUSTEE_IS_USER = 1
+    _ACL_SIZE_INFORMATION_CLASS = 2
+    _ACCESS_ALLOWED_ACE_TYPE = 0
 
     class _UnicodeString(ctypes.Structure):
         _fields_ = [
@@ -827,7 +855,47 @@ if os.name == "nt":
             ("hEvent", wintypes.HANDLE),
         ]
 
+    class _Trustee(ctypes.Structure):
+        _fields_ = [
+            ("pMultipleTrustee", wintypes.LPVOID),
+            ("MultipleTrusteeOperation", wintypes.DWORD),
+            ("TrusteeForm", wintypes.DWORD),
+            ("TrusteeType", wintypes.DWORD),
+            ("ptstrName", wintypes.LPWSTR),
+        ]
+
+    class _ExplicitAccess(ctypes.Structure):
+        _fields_ = [
+            ("grfAccessPermissions", wintypes.DWORD),
+            ("grfAccessMode", wintypes.DWORD),
+            ("grfInheritance", wintypes.DWORD),
+            ("Trustee", _Trustee),
+        ]
+
+    class _SidAndAttributes(ctypes.Structure):
+        _fields_ = [("Sid", wintypes.LPVOID), ("Attributes", wintypes.DWORD)]
+
+    class _TokenUser(ctypes.Structure):
+        _fields_ = [("User", _SidAndAttributes)]
+
+    class _AclSizeInformation(ctypes.Structure):
+        _fields_ = [
+            ("AceCount", wintypes.DWORD),
+            ("AclBytesInUse", wintypes.DWORD),
+            ("AclBytesFree", wintypes.DWORD),
+        ]
+
+    class _AccessAllowedAce(ctypes.Structure):
+        _fields_ = [
+            ("AceType", ctypes.c_ubyte),
+            ("AceFlags", ctypes.c_ubyte),
+            ("AceSize", wintypes.WORD),
+            ("Mask", wintypes.DWORD),
+            ("SidStart", wintypes.DWORD),
+        ]
+
     _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
     _ntdll = ctypes.WinDLL("ntdll")
     _create_file = _kernel32.CreateFileW
     _create_file.argtypes = [
@@ -862,6 +930,9 @@ if os.name == "nt":
     _duplicate_handle.restype = wintypes.BOOL
     _get_current_process = _kernel32.GetCurrentProcess
     _get_current_process.restype = wintypes.HANDLE
+    _local_free = _kernel32.LocalFree
+    _local_free.argtypes = [wintypes.LPVOID]
+    _local_free.restype = wintypes.LPVOID
     _lock_file_ex = _kernel32.LockFileEx
     _lock_file_ex.argtypes = [
         wintypes.HANDLE,
@@ -899,6 +970,81 @@ if os.name == "nt":
     _rtl_nt_status_to_dos_error = _ntdll.RtlNtStatusToDosError
     _rtl_nt_status_to_dos_error.argtypes = [wintypes.LONG]
     _rtl_nt_status_to_dos_error.restype = wintypes.ULONG
+    _open_process_token = _advapi32.OpenProcessToken
+    _open_process_token.argtypes = [
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.HANDLE),
+    ]
+    _open_process_token.restype = wintypes.BOOL
+    _get_token_information = _advapi32.GetTokenInformation
+    _get_token_information.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_int,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    _get_token_information.restype = wintypes.BOOL
+    _get_security_info = _advapi32.GetSecurityInfo
+    _get_security_info.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_int,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.LPVOID),
+        ctypes.POINTER(wintypes.LPVOID),
+        ctypes.POINTER(wintypes.LPVOID),
+        ctypes.POINTER(wintypes.LPVOID),
+        ctypes.POINTER(wintypes.LPVOID),
+    ]
+    _get_security_info.restype = wintypes.DWORD
+    _set_security_info = _advapi32.SetSecurityInfo
+    _set_security_info.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_int,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.LPVOID,
+        wintypes.LPVOID,
+        wintypes.LPVOID,
+    ]
+    _set_security_info.restype = wintypes.DWORD
+    _set_entries_in_acl = _advapi32.SetEntriesInAclW
+    _set_entries_in_acl.argtypes = [
+        wintypes.ULONG,
+        ctypes.POINTER(_ExplicitAccess),
+        wintypes.LPVOID,
+        ctypes.POINTER(wintypes.LPVOID),
+    ]
+    _set_entries_in_acl.restype = wintypes.DWORD
+    _get_security_descriptor_control = _advapi32.GetSecurityDescriptorControl
+    _get_security_descriptor_control.argtypes = [
+        wintypes.LPVOID,
+        ctypes.POINTER(wintypes.WORD),
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    _get_security_descriptor_control.restype = wintypes.BOOL
+    _get_acl_information = _advapi32.GetAclInformation
+    _get_acl_information.argtypes = [
+        wintypes.LPVOID,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        ctypes.c_int,
+    ]
+    _get_acl_information.restype = wintypes.BOOL
+    _get_ace = _advapi32.GetAce
+    _get_ace.argtypes = [
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.LPVOID),
+    ]
+    _get_ace.restype = wintypes.BOOL
+    _equal_sid = _advapi32.EqualSid
+    _equal_sid.argtypes = [wintypes.LPVOID, wintypes.LPVOID]
+    _equal_sid.restype = wintypes.BOOL
+    _is_valid_sid = _advapi32.IsValidSid
+    _is_valid_sid.argtypes = [wintypes.LPVOID]
+    _is_valid_sid.restype = wintypes.BOOL
 
     def _open_windows_audit(path: Path) -> int:
         root_handle: int | None = None
@@ -930,7 +1076,13 @@ if os.name == "nt":
             final_handle = _nt_open_relative(
                 parent_handle,
                 parts[-1],
-                desired_access=_GENERIC_READ | _GENERIC_WRITE | _SYNCHRONIZE,
+                desired_access=(
+                    _GENERIC_READ
+                    | _GENERIC_WRITE
+                    | _SYNCHRONIZE
+                    | _READ_CONTROL
+                    | _WRITE_DAC
+                ),
                 disposition=_FILE_OPEN_IF,
                 attributes=_FILE_ATTRIBUTE_NORMAL,
                 options=(
@@ -938,8 +1090,10 @@ if os.name == "nt":
                     | _FILE_OPEN_REPARSE_POINT
                     | _FILE_SYNCHRONOUS_IO_NONALERT
                 ),
+                share_access=_FILE_SHARE_READ | _FILE_SHARE_WRITE,
             )
             _validate_windows_handle(final_handle, directory=False)
+            _secure_windows_audit_handle(final_handle)
             descriptor = msvcrt.open_osfhandle(
                 final_handle, os.O_APPEND | os.O_RDWR | getattr(os, "O_BINARY", 0)
             )
@@ -1026,6 +1180,7 @@ if os.name == "nt":
         disposition: int,
         attributes: int,
         options: int,
+        share_access: int = _FILE_SHARE_ALL,
     ) -> int:
         buffer = ctypes.create_unicode_buffer(name)
         name_length = len(name.encode("utf-16-le"))
@@ -1051,7 +1206,7 @@ if os.name == "nt":
             ctypes.byref(io_status),
             None,
             attributes,
-            _FILE_SHARE_ALL,
+            share_access,
             disposition,
             options,
             None,
@@ -1083,6 +1238,155 @@ if os.name == "nt":
         is_directory = bool(information.dwFileAttributes & _FILE_ATTRIBUTE_DIRECTORY)
         if is_directory != directory:
             raise OSError("audit path component has the wrong type")
+
+    def _secure_windows_audit_handle(handle: int) -> None:
+        token = wintypes.HANDLE()
+        if not _open_process_token(_get_current_process(), _TOKEN_QUERY, ctypes.byref(token)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        token_value = int(token.value)
+        try:
+            required = wintypes.DWORD()
+            ctypes.set_last_error(0)
+            if _get_token_information(token, _TOKEN_USER, None, 0, ctypes.byref(required)):
+                raise OSError("token user query returned an invalid size result")
+            error = ctypes.get_last_error()
+            if error != _ERROR_INSUFFICIENT_BUFFER or not required.value:
+                raise ctypes.WinError(error)
+            token_buffer = ctypes.create_string_buffer(required.value)
+            if not _get_token_information(
+                token,
+                _TOKEN_USER,
+                token_buffer,
+                required.value,
+                ctypes.byref(required),
+            ):
+                raise ctypes.WinError(ctypes.get_last_error())
+            token_user = ctypes.cast(token_buffer, ctypes.POINTER(_TokenUser)).contents
+            user_sid = wintypes.LPVOID(token_user.User.Sid)
+            if not user_sid.value or not _is_valid_sid(user_sid):
+                raise OSError("current user has an invalid security identifier")
+            _verify_windows_audit_owner(handle, user_sid)
+            _install_windows_owner_only_dacl(handle, user_sid)
+            _verify_windows_owner_only_dacl(handle, user_sid)
+        finally:
+            _close_windows_handle(token_value)
+
+    def _verify_windows_audit_owner(handle: int, user_sid: wintypes.LPVOID) -> None:
+        owner = wintypes.LPVOID()
+        security_descriptor = wintypes.LPVOID()
+        result = _get_security_info(
+            wintypes.HANDLE(handle),
+            _SE_FILE_OBJECT,
+            _OWNER_SECURITY_INFORMATION,
+            ctypes.byref(owner),
+            None,
+            None,
+            None,
+            ctypes.byref(security_descriptor),
+        )
+        if result:
+            raise OSError(result, "audit owner query failed")
+        try:
+            if not owner.value or not _is_valid_sid(owner) or not _equal_sid(owner, user_sid):
+                raise OSError("audit target has an unsafe owner")
+        finally:
+            if security_descriptor.value:
+                _local_free(security_descriptor)
+
+    def _install_windows_owner_only_dacl(handle: int, user_sid: wintypes.LPVOID) -> None:
+        trustee = _Trustee(
+            pMultipleTrustee=None,
+            MultipleTrusteeOperation=0,
+            TrusteeForm=_TRUSTEE_IS_SID,
+            TrusteeType=_TRUSTEE_IS_USER,
+            ptstrName=ctypes.cast(user_sid, wintypes.LPWSTR),
+        )
+        explicit_access = _ExplicitAccess(
+            grfAccessPermissions=_FILE_ALL_ACCESS,
+            grfAccessMode=_SET_ACCESS,
+            grfInheritance=0,
+            Trustee=trustee,
+        )
+        acl = wintypes.LPVOID()
+        result = _set_entries_in_acl(1, ctypes.byref(explicit_access), None, ctypes.byref(acl))
+        if result:
+            raise OSError(result, "owner-only audit ACL construction failed")
+        try:
+            result = _set_security_info(
+                wintypes.HANDLE(handle),
+                _SE_FILE_OBJECT,
+                _DACL_SECURITY_INFORMATION | _PROTECTED_DACL_SECURITY_INFORMATION,
+                None,
+                None,
+                acl,
+                None,
+            )
+            if result:
+                raise OSError(result, "owner-only audit ACL installation failed")
+        finally:
+            if acl.value:
+                _local_free(acl)
+
+    def _verify_windows_owner_only_dacl(handle: int, user_sid: wintypes.LPVOID) -> None:
+        owner = wintypes.LPVOID()
+        dacl = wintypes.LPVOID()
+        security_descriptor = wintypes.LPVOID()
+        result = _get_security_info(
+            wintypes.HANDLE(handle),
+            _SE_FILE_OBJECT,
+            _OWNER_SECURITY_INFORMATION | _DACL_SECURITY_INFORMATION,
+            ctypes.byref(owner),
+            None,
+            ctypes.byref(dacl),
+            None,
+            ctypes.byref(security_descriptor),
+        )
+        if result:
+            raise OSError(result, "audit ACL verification query failed")
+        try:
+            if (
+                not owner.value
+                or not _is_valid_sid(owner)
+                or not _equal_sid(owner, user_sid)
+                or not dacl.value
+            ):
+                raise OSError("audit target owner or ACL is unsafe")
+            control = wintypes.WORD()
+            revision = wintypes.DWORD()
+            if not _get_security_descriptor_control(
+                security_descriptor, ctypes.byref(control), ctypes.byref(revision)
+            ):
+                raise ctypes.WinError(ctypes.get_last_error())
+            if not control.value & _SE_DACL_PROTECTED:
+                raise OSError("audit target ACL is not protected")
+            information = _AclSizeInformation()
+            if not _get_acl_information(
+                dacl,
+                ctypes.byref(information),
+                ctypes.sizeof(information),
+                _ACL_SIZE_INFORMATION_CLASS,
+            ):
+                raise ctypes.WinError(ctypes.get_last_error())
+            if information.AceCount != 1:
+                raise OSError("audit target ACL is not owner-only")
+            ace_pointer = wintypes.LPVOID()
+            if not _get_ace(dacl, 0, ctypes.byref(ace_pointer)) or not ace_pointer.value:
+                raise ctypes.WinError(ctypes.get_last_error())
+            ace = ctypes.cast(ace_pointer, ctypes.POINTER(_AccessAllowedAce)).contents
+            ace_sid = wintypes.LPVOID(
+                ace_pointer.value + _AccessAllowedAce.SidStart.offset
+            )
+            if (
+                ace.AceType != _ACCESS_ALLOWED_ACE_TYPE
+                or ace.AceFlags != 0
+                or ace.Mask & _FILE_ALL_ACCESS != _FILE_ALL_ACCESS
+                or not _is_valid_sid(ace_sid)
+                or not _equal_sid(ace_sid, user_sid)
+            ):
+                raise OSError("audit target ACL contains an unsafe access entry")
+        finally:
+            if security_descriptor.value:
+                _local_free(security_descriptor)
 
     def _fchmod_windows_handle(handle: int, mode: int) -> None:
         duplicate = wintypes.HANDLE()

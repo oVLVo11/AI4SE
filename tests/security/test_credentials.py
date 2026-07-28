@@ -168,6 +168,47 @@ def test_provider_result_canonicalizes_bounded_decimal_spellings(
         service.get("provider", lambda _, result=result: result)
 
 
+@pytest.mark.parametrize(
+    ("secret", "result"),
+    [
+        ("1e300", "1" + "0" * 300),
+        ("1" + "0" * 300, "1e300"),
+        ("1e257", "10e256"),
+        ("-0001e300", "-10e299"),
+        ("-0e300", "+000.000e-300"),
+        ("+00012300e298", "123e300"),
+    ],
+)
+def test_provider_result_canonicalizes_huge_textual_decimal_spellings(
+    memory_keyring: MemoryKeyring, secret: str, result: str
+) -> None:
+    """Catches bounded numeric text falling back to spelling-sensitive text identities."""
+    service = CredentialService(memory_keyring, service_name="pyquality")
+    service.set("provider", secret)
+
+    with pytest.raises(CredentialProviderError):
+        service.get("provider", lambda _: result)
+
+
+@pytest.mark.parametrize(
+    ("secret", "result"),
+    [
+        ("invoice-1e300", "1" + "0" * 300),
+        ("1e300", "1" + "0" * 299 + "1"),
+        ("1e300units", "10e299"),
+        ("--0001", 1),
+    ],
+)
+def test_provider_result_keeps_nonnumeric_and_nonequivalent_huge_text_distinct(
+    memory_keyring: MemoryKeyring, secret: str, result: object
+) -> None:
+    """Catches huge-number normalization conflating ordinary text or nearby numeric values."""
+    service = CredentialService(memory_keyring, service_name="pyquality")
+    service.set("provider", secret)
+
+    assert service.get("provider", lambda _: result).value == result
+
+
 @pytest.mark.parametrize(("secret", "result"), [("1", True), ("0", False)])
 def test_provider_result_does_not_conflate_boolean_and_numeric_scalars(
     memory_keyring: MemoryKeyring, secret: str, result: bool

@@ -262,6 +262,125 @@ def test_audit_path_creation_uses_only_descriptor_or_handle_relative_operations(
     }
 
 
+def test_posix_audit_never_chmods_an_existing_shared_parent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catches changing the permissions of a pre-existing shared audit parent."""
+    from types import SimpleNamespace
+
+    from pyquality import security
+
+    descriptors = iter((10, 11, 12))
+    chmod_calls: list[tuple[int, int]] = []
+
+    def fake_open(
+        name: object,
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        del name, flags, mode, dir_fd
+        return next(descriptors)
+
+    monkeypatch.setattr(security.os, "O_NOFOLLOW", 0x100, raising=False)
+    monkeypatch.setattr(security.os, "O_DIRECTORY", 0x200, raising=False)
+    monkeypatch.setattr(security.os, "open", fake_open)
+    monkeypatch.setattr(security.os, "close", lambda _: None)
+    monkeypatch.setattr(security.os, "fchmod", lambda fd, mode: chmod_calls.append((fd, mode)))
+    monkeypatch.setattr(
+        security.os,
+        "fstat",
+        lambda _: SimpleNamespace(st_mode=0o100600, st_uid=4242),
+    )
+    monkeypatch.setattr(security.os, "geteuid", lambda: 4242, raising=False)
+
+    descriptor = security._open_posix_audit(Path("/shared/audit.jsonl"))
+
+    assert descriptor == 12
+    assert chmod_calls == [(12, 0o600)]
+
+
+def test_posix_audit_chmods_only_directories_created_by_the_current_open(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catches failing to secure a newly created component while preserving existing parents."""
+    from types import SimpleNamespace
+
+    from pyquality import security
+
+    next_descriptor = iter((20, 21, 22, 23))
+    created: set[tuple[int, str]] = set()
+    chmod_calls: list[tuple[int, int]] = []
+
+    def fake_open(
+        name: object,
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        del flags, mode
+        text = os.fspath(name)
+        if text == "new" and (dir_fd, text) not in created:
+            raise FileNotFoundError
+        return next(next_descriptor)
+
+    def fake_mkdir(name: str, mode: int, *, dir_fd: int) -> None:
+        assert mode == 0o700
+        created.add((dir_fd, name))
+
+    monkeypatch.setattr(security.os, "O_NOFOLLOW", 0x100, raising=False)
+    monkeypatch.setattr(security.os, "O_DIRECTORY", 0x200, raising=False)
+    monkeypatch.setattr(security.os, "open", fake_open)
+    monkeypatch.setattr(security.os, "mkdir", fake_mkdir)
+    monkeypatch.setattr(security.os, "close", lambda _: None)
+    monkeypatch.setattr(security.os, "fchmod", lambda fd, mode: chmod_calls.append((fd, mode)))
+    monkeypatch.setattr(
+        security.os,
+        "fstat",
+        lambda _: SimpleNamespace(st_mode=0o100600, st_uid=4242),
+    )
+    monkeypatch.setattr(security.os, "geteuid", lambda: 4242, raising=False)
+
+    descriptor = security._open_posix_audit(Path("/shared/new/audit.jsonl"))
+
+    assert descriptor == 23
+    assert chmod_calls == [(22, 0o700), (23, 0o600)]
+
+
+def test_posix_audit_refuses_a_final_file_owned_by_another_user(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catches appending to an attacker-owned regular file through an otherwise safe descriptor."""
+    from types import SimpleNamespace
+
+    from pyquality import security
+
+    descriptors = iter((30, 31, 32))
+    closed: list[int] = []
+
+    def fake_open(*_: object, **__: object) -> int:
+        return next(descriptors)
+
+    monkeypatch.setattr(security.os, "O_NOFOLLOW", 0x100, raising=False)
+    monkeypatch.setattr(security.os, "O_DIRECTORY", 0x200, raising=False)
+    monkeypatch.setattr(security.os, "open", fake_open)
+    monkeypatch.setattr(security.os, "close", closed.append)
+    monkeypatch.setattr(security.os, "fchmod", lambda *_: None)
+    monkeypatch.setattr(
+        security.os,
+        "fstat",
+        lambda _: SimpleNamespace(st_mode=0o100600, st_uid=9999),
+    )
+    monkeypatch.setattr(security.os, "geteuid", lambda: 4242, raising=False)
+
+    with pytest.raises(OSError, match="owner"):
+        security._open_posix_audit(Path("/shared/audit.jsonl"))
+
+    assert 32 in closed
+
+
 def test_audit_log_omits_source_and_prompt_by_default(tmp_path: Path) -> None:
     """Catches accepting prompt/source-bearing metadata into a persisted audit record."""
     logger = AuditLogger(tmp_path / "audit.jsonl", secrets={"sk-secret"})
@@ -516,6 +635,125 @@ def test_windows_failed_audit_opens_close_all_native_handles(tmp_path: Path) -> 
         assert raised.value.__cause__ is None
         assert raised.value.__context__ is None
     assert handle_count() <= before + 2
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows handle security APIs are unavailable")
+def test_windows_audit_file_has_one_protected_owner_allow_ace(tmp_path: Path) -> None:
+    """Catches relying on CRT mode bits instead of an owner-only protected file DACL."""
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    class AclSizeInformation(ctypes.Structure):
+        _fields_ = [
+            ("AceCount", wintypes.DWORD),
+            ("AclBytesInUse", wintypes.DWORD),
+            ("AclBytesFree", wintypes.DWORD),
+        ]
+
+    class AccessAllowedAce(ctypes.Structure):
+        _fields_ = [
+            ("AceType", ctypes.c_ubyte),
+            ("AceFlags", ctypes.c_ubyte),
+            ("AceSize", wintypes.WORD),
+            ("Mask", wintypes.DWORD),
+            ("SidStart", wintypes.DWORD),
+        ]
+
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    get_security_info = advapi32.GetSecurityInfo
+    get_security_info.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_int,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.LPVOID),
+        ctypes.POINTER(wintypes.LPVOID),
+        ctypes.POINTER(wintypes.LPVOID),
+        ctypes.POINTER(wintypes.LPVOID),
+        ctypes.POINTER(wintypes.LPVOID),
+    ]
+    get_security_info.restype = wintypes.DWORD
+    get_security_descriptor_control = advapi32.GetSecurityDescriptorControl
+    get_security_descriptor_control.argtypes = [
+        wintypes.LPVOID,
+        ctypes.POINTER(wintypes.WORD),
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    get_security_descriptor_control.restype = wintypes.BOOL
+    get_acl_information = advapi32.GetAclInformation
+    get_acl_information.argtypes = [wintypes.LPVOID, wintypes.LPVOID, wintypes.DWORD, ctypes.c_int]
+    get_acl_information.restype = wintypes.BOOL
+    get_ace = advapi32.GetAce
+    get_ace.argtypes = [wintypes.LPVOID, wintypes.DWORD, ctypes.POINTER(wintypes.LPVOID)]
+    get_ace.restype = wintypes.BOOL
+    equal_sid = advapi32.EqualSid
+    equal_sid.argtypes = [wintypes.LPVOID, wintypes.LPVOID]
+    equal_sid.restype = wintypes.BOOL
+    local_free = kernel32.LocalFree
+    local_free.argtypes = [wintypes.LPVOID]
+    local_free.restype = wintypes.LPVOID
+
+    path = tmp_path / "audit.jsonl"
+    AuditLogger(path).emit(AuditEvent(event_type="transition", metadata={"intent_id": "acl"}))
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_BINARY", 0))
+    security_descriptor = wintypes.LPVOID()
+    owner = wintypes.LPVOID()
+    dacl = wintypes.LPVOID()
+    try:
+        handle = wintypes.HANDLE(msvcrt.get_osfhandle(descriptor))
+        result = get_security_info(
+            handle,
+            1,
+            0x00000001 | 0x00000004,
+            ctypes.byref(owner),
+            None,
+            ctypes.byref(dacl),
+            None,
+            ctypes.byref(security_descriptor),
+        )
+        assert result == 0
+        control = wintypes.WORD()
+        revision = wintypes.DWORD()
+        assert get_security_descriptor_control(
+            security_descriptor, ctypes.byref(control), ctypes.byref(revision)
+        )
+        assert control.value & 0x1000
+        information = AclSizeInformation()
+        assert get_acl_information(dacl, ctypes.byref(information), ctypes.sizeof(information), 2)
+        assert information.AceCount == 1
+        ace_pointer = wintypes.LPVOID()
+        assert get_ace(dacl, 0, ctypes.byref(ace_pointer))
+        ace = ctypes.cast(ace_pointer, ctypes.POINTER(AccessAllowedAce)).contents
+        assert (ace.AceType, ace.AceFlags) == (0, 0)
+        ace_sid = ctypes.c_void_p(ace_pointer.value + AccessAllowedAce.SidStart.offset)
+        assert equal_sid(owner, ace_sid)
+        assert ace.Mask & 0x001F01FF == 0x001F01FF
+    finally:
+        if security_descriptor.value:
+            local_free(security_descriptor)
+        os.close(descriptor)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows delete sharing is unavailable")
+@pytest.mark.parametrize("operation", ["rename", "delete"])
+def test_windows_locked_audit_append_denies_live_rename_and_delete(
+    tmp_path: Path, operation: str
+) -> None:
+    """Catches FILE_SHARE_DELETE allowing the active audit stream to change identity."""
+    from pyquality import security
+
+    path = tmp_path / "audit.jsonl"
+    AuditLogger(path).emit(AuditEvent(event_type="transition", metadata={"intent_id": "seed"}))
+    descriptor = security._open_windows_audit(path)
+    try:
+        with security._audit_file_lock(descriptor), pytest.raises(OSError):
+            if operation == "rename":
+                path.rename(tmp_path / "renamed.jsonl")
+            else:
+                path.unlink()
+    finally:
+        os.close(descriptor)
 
 
 def test_audit_recovers_partial_tail_and_serializes_multi_process_emits(tmp_path: Path) -> None:
