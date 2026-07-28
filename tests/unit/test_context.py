@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
+import pytest
+
 from pyquality.context import ContextBuilder, ContextInput, SourceExcerpt
 from pyquality.domain.models import Finding
 from pyquality.feedback import FeedbackComposer
@@ -99,3 +101,29 @@ def test_context_truncates_utf8_source_with_visible_marker() -> None:
 
     assert "[source truncated]" in "\n".join(message.content for message in messages)
     assert all(len(message.content.encode("utf-8")) <= 1_000 for message in messages)
+
+
+@pytest.mark.parametrize("total_bytes", (1, 10))
+def test_context_replaces_an_impossible_schema_with_a_visible_marker(total_bytes: int) -> None:
+    messages = ContextBuilder(source_bytes=10, total_bytes=total_bytes).build(context_fixture())
+
+    assert [(message.role, message.content) for message in messages] == [("system", "~")]
+    assert sum(len(message.content.encode("utf-8")) for message in messages) <= total_bytes
+
+
+def test_context_marks_aggregate_multibyte_truncation_within_the_total_budget() -> None:
+    fixture = context_fixture().model_copy(update={"task": "修" * 200})
+
+    messages = ContextBuilder(source_bytes=1_000, total_bytes=300).build(fixture)
+    combined_bytes = sum(len(message.content.encode("utf-8")) for message in messages)
+
+    assert messages[0].content.endswith("Arbitrary shell commands are not an allowed action.")
+    assert messages[-1].content.endswith("[context truncated]")
+    assert combined_bytes <= 300
+
+
+def test_context_uses_only_the_marker_when_that_exactly_fills_remaining_budget() -> None:
+    messages = ContextBuilder(source_bytes=1_000, total_bytes=253).build(context_fixture())
+
+    assert messages[-1].content == "[context truncated]"
+    assert sum(len(message.content.encode("utf-8")) for message in messages) == 253

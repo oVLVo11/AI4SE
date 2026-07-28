@@ -45,6 +45,13 @@ def test_action_parser_accepts_exactly_one_json_object() -> None:
         parser.parse('{"kind":"finish","arguments":{},"rationale":"done"}\n{}')
 
 
+def test_action_parser_rejects_duplicate_keys_before_action_validation() -> None:
+    raw = '{"kind":"shell","kind":"finish","arguments":{},"rationale":"done"}'
+
+    with pytest.raises(ActionFormatError, match="duplicate JSON key"):
+        ActionParser().parse(raw)
+
+
 def test_openai_compatible_llm_uses_one_injected_http_response_without_network() -> None:
     received: list[httpx.Request] = []
 
@@ -104,3 +111,5 @@ def test_openai_compatible_llm_hides_credential_callable_failures() -> None:
         llm.complete((Message(role="user", content="choose an action"),))
 
     assert "secret credential detail" not in str(error.value)
+    assert error.value.__cause__ is None
+    assert error.value.__context__ is None

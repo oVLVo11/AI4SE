@@ -13,6 +13,8 @@ from pyquality.llm import Message
 from pyquality.memory import MemoryContext
 
 _TRUNCATION_MARKER = "[source truncated]"
+_CONTEXT_TRUNCATION_MARKER = "[context truncated]"
+_TINY_TRUNCATION_MARKER = "~"
 _ACTION_SCHEMA = """# Allowed action schema
 Return exactly one JSON object with `kind`, `arguments`, and `rationale`.
 Allowed kinds: read_file, search_text, list_files, apply_patch, run_quality, finish.
@@ -53,11 +55,16 @@ class ContextBuilder:
 
     def build(self, context: ContextInput) -> tuple[Message, ...]:
         """Build the schema and current-state messages for exactly one model call."""
-        system = Message(role="system", content=_truncate_utf8(_ACTION_SCHEMA, self.total_bytes))
-        remaining = self.total_bytes - len(system.content.encode("utf-8"))
-        if remaining < 1:
-            return (system,)
-        user = _truncate_utf8(self._render_user(context), remaining)
+        schema_bytes = len(_ACTION_SCHEMA.encode("utf-8"))
+        if schema_bytes + 1 > self.total_bytes:
+            marker = _visible_marker(_CONTEXT_TRUNCATION_MARKER, self.total_bytes)
+            return (Message(role="system", content=marker),)
+
+        system = Message(role="system", content=_ACTION_SCHEMA)
+        remaining = self.total_bytes - schema_bytes
+        user = _truncate_utf8_with_marker(
+            self._render_user(context), remaining, _CONTEXT_TRUNCATION_MARKER
+        )
         return (system, Message(role="user", content=user))
 
     def _render_user(self, context: ContextInput) -> str:
@@ -139,4 +146,22 @@ def _truncate_utf8(value: str, limit: int) -> str:
             return truncated.decode("utf-8")
         except UnicodeDecodeError:
             truncated = truncated[:-1]
-    return "~"
+    return _TINY_TRUNCATION_MARKER
+
+
+def _visible_marker(marker: str, limit: int) -> str:
+    return marker if len(marker.encode("utf-8")) <= limit else _TINY_TRUNCATION_MARKER
+
+
+def _truncate_utf8_with_marker(value: str, limit: int, marker: str) -> str:
+    if len(value.encode("utf-8")) <= limit:
+        return value
+    visible_marker = _visible_marker(marker, limit)
+    if visible_marker == _TINY_TRUNCATION_MARKER:
+        return visible_marker
+    marker_bytes = len(visible_marker.encode("utf-8"))
+    prefix_limit = limit - marker_bytes - 1
+    if prefix_limit < 1:
+        return visible_marker
+    prefix = _truncate_utf8(value, prefix_limit)
+    return f"{prefix}\n{visible_marker}" if prefix else visible_marker

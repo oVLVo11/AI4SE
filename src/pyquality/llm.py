@@ -106,10 +106,18 @@ class OpenAICompatibleLLM:
             "model": self.model,
             "messages": [message.model_dump(mode="json") for message in messages],
         }
+        credential_failed = False
         try:
             # The credential is deliberately fetched directly before the provider call and
             # is neither retained on this instance nor included in exception messages.
             key = self._credential()
+        except Exception:  # noqa: BLE001 - credential backends have no shared error base.
+            credential_failed = True
+        if credential_failed:
+            raise ProviderError("provider request failed") from None
+
+        request_failed = False
+        try:
             response = self._client.post(
                 self.endpoint,
                 headers={"Authorization": f"Bearer {key}"},
@@ -118,8 +126,10 @@ class OpenAICompatibleLLM:
             )
             response.raise_for_status()
             body = response.json()
-        except Exception as error:
-            raise ProviderError("provider request failed") from error
+        except (httpx.HTTPError, ValueError, TypeError, KeyError, IndexError):
+            request_failed = True
+        if request_failed:
+            raise ProviderError("provider request failed") from None
 
         try:
             content = body["choices"][0]["message"]["content"]
@@ -144,7 +154,9 @@ class ActionParser:
         if not isinstance(raw, str):
             raise ActionFormatError("provider response must be text")
         try:
-            decoded = json.loads(raw)
+            decoded = json.loads(raw, object_pairs_hook=_unique_json_object)
+        except _DuplicateJSONKeyError as error:
+            raise ActionFormatError(f"duplicate JSON key: {error.key}") from error
         except json.JSONDecodeError as error:
             raise ActionFormatError("provider response must contain one JSON object") from error
         if not isinstance(decoded, dict):
@@ -154,3 +166,18 @@ class ActionParser:
             return Action.model_validate(decoded, context=context)
         except ValidationError as error:
             raise ActionFormatError("provider response is not an allowed action") from error
+
+
+class _DuplicateJSONKeyError(ValueError):
+    def __init__(self, key: str) -> None:
+        super().__init__(key)
+        self.key = key
+
+
+def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise _DuplicateJSONKeyError(key)
+        result[key] = value
+    return result
