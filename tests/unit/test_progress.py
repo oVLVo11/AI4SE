@@ -94,6 +94,26 @@ def test_fingerprint_only_collapses_drive_qualified_volatile_temp_paths() -> Non
     assert failure_fingerprint((windows,)) != failure_fingerprint((relative,))
 
 
+def test_fingerprint_collapses_only_explicit_platform_temp_roots() -> None:
+    def item(path: str):
+        return SimpleNamespace(
+            category="assertion", path=path, line=1, group_key=f"failed {path}", evidence="x"
+        )
+
+    assert failure_fingerprint((item("/tmp/a.py"),)) == failure_fingerprint(
+        (item("/tmp/b.py"),)
+    )
+    assert failure_fingerprint((item("C:/Temp/a.py"),)) == failure_fingerprint(
+        (item("D:/tmp/b.py"),)
+    )
+    assert failure_fingerprint((item("C:/repo/tmp/a.py"),)) != failure_fingerprint(
+        (item("D:/other/tmp/b.py"),)
+    )
+    assert failure_fingerprint((item("src/tmp/A.py"),)) != failure_fingerprint(
+        (item("src/tmp/a.py"),)
+    )
+
+
 def test_success_has_highest_precedence() -> None:
     history = [entry("abc", success=True, blocked=True, failed=True)]
     assert ProgressTracker().decide(history, 1, NOW - timedelta(seconds=1), NOW) is TaskStatus.SUCCEEDED

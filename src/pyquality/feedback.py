@@ -10,7 +10,7 @@ from datetime import datetime
 from pathlib import PurePosixPath
 from typing import Any, Literal
 
-from pydantic import Field, model_validator
+from pydantic import Field, ValidationInfo, model_validator
 
 from .domain.models import (
     MAX_CONFIG_PATTERN_BYTES,
@@ -33,8 +33,8 @@ _PRIORITY = {
     "runtime": 2,
     "ruff": 3,
 }
-_DRIVE_TEMP_PATH = re.compile(
-    r"(?i)[a-z]:/(?:[^\s:/]+/)*(?:temp|tmp)/[^\s:]+"
+_VOLATILE_TEMP_PATH = re.compile(
+    r"(?i)(?<![A-Za-z0-9_.-])(?:[a-z]:/(?:temp|tmp)|/(?:tmp|var/tmp|private/tmp))/[^\s:]+"
 )
 _TIMING = re.compile(r"(?i)\b\d+(?:\.\d+)?\s*(?:ms|s|sec|secs|seconds)\b")
 
@@ -60,7 +60,7 @@ class FeedbackFinding(PublicModel):
     occurrences: int = Field(ge=1)
 
     @model_validator(mode="after")
-    def validate_finding(self) -> FeedbackFinding:
+    def validate_finding(self, info: ValidationInfo) -> FeedbackFinding:
         if self.path is None and self.line is not None:
             raise ValueError("line requires path")
         if self.path is not None:
@@ -68,14 +68,31 @@ class FeedbackFinding(PublicModel):
             if (
                 not self.path
                 or "\\" in self.path
+                or re.match(r"^[A-Za-z]:/", self.path) is not None
                 or normalized.is_absolute()
                 or ".." in normalized.parts
             ):
                 raise ValueError("path must be repository-relative POSIX text")
-            _require_bytes(self.path, MAX_CONFIG_PATTERN_BYTES, "path")
-        _require_bytes(self.summary, MAX_FINDING_SUMMARY_BYTES, "summary")
-        _require_bytes(self.evidence, MAX_FINDING_EVIDENCE_BYTES, "evidence")
-        _require_bytes(self.group_key, MAX_GROUP_KEY_BYTES, "group_key")
+            _require_bytes(
+                self.path,
+                _effective_limit(info, "max_config_pattern_bytes", MAX_CONFIG_PATTERN_BYTES),
+                "path",
+            )
+        _require_bytes(
+            self.summary,
+            _effective_limit(info, "max_finding_summary_bytes", MAX_FINDING_SUMMARY_BYTES),
+            "summary",
+        )
+        _require_bytes(
+            self.evidence,
+            _effective_limit(info, "max_finding_evidence_bytes", MAX_FINDING_EVIDENCE_BYTES),
+            "evidence",
+        )
+        _require_bytes(
+            self.group_key,
+            _effective_limit(info, "max_group_key_bytes", MAX_GROUP_KEY_BYTES),
+            "group_key",
+        )
         return self
 
 
@@ -277,7 +294,7 @@ def _truncate_utf8(value: str, limit: int) -> str:
 
 def _fingerprint_text(value: object) -> str:
     text = "" if value is None else str(value).replace("\\", "/")
-    text = _DRIVE_TEMP_PATH.sub("<temp>", text)
+    text = _VOLATILE_TEMP_PATH.sub("<temp>", text)
     text = _TIMING.sub("<time>", text)
     return text
 
@@ -285,3 +302,8 @@ def _fingerprint_text(value: object) -> str:
 def _require_bytes(value: str, limit: int, field: str) -> None:
     if len(value.encode("utf-8")) > limit:
         raise ValueError(f"{field} exceeds {limit} UTF-8 bytes")
+
+
+def _effective_limit(info: ValidationInfo, name: str, default: int) -> int:
+    settings = (info.context or {}).get("settings")
+    return getattr(settings, name, default)

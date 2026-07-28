@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pyquality.config import Settings
 from pyquality.domain.models import Finding
 from pyquality.feedback import FeedbackComposer, FeedbackFinding, FeedbackPacket
 
@@ -133,6 +134,8 @@ def test_feedback_public_models_reject_invalid_category_location_and_budget() ->
     with pytest.raises(ValidationError):
         FeedbackFinding(**base, path="../escape.py")
     with pytest.raises(ValidationError):
+        FeedbackFinding(**base, path="C:/repo/file.py")
+    with pytest.raises(ValidationError):
         FeedbackFinding(**base, path="a" * 1_025)
 
     valid = FeedbackFinding(**base)
@@ -144,3 +147,36 @@ def test_feedback_public_models_reject_invalid_category_location_and_budget() ->
         FeedbackPacket(
             findings=(), omitted_count=1, truncated=False, byte_budget=100, text="omitted"
         )
+
+
+def test_feedback_finding_honors_effective_settings_byte_limits() -> None:
+    import pytest
+    from pydantic import ValidationError
+
+    settings = Settings(
+        max_finding_summary_bytes=4,
+        max_finding_evidence_bytes=4,
+        max_group_key_bytes=4,
+        max_config_pattern_bytes=16,
+    )
+    base = {
+        "category": "assertion",
+        "path": "a.py",
+        "line": 1,
+        "summary": "four",
+        "evidence": "four",
+        "group_key": "four",
+        "occurrences": 1,
+    }
+    assert FeedbackFinding.model_validate(base, context={"settings": settings}).summary == "four"
+
+    for field, value in (
+        ("summary", "🚀x"),
+        ("evidence", "🚀x"),
+        ("group_key", "🚀x"),
+        ("path", "a" * 17),
+    ):
+        with pytest.raises(ValidationError, match=field):
+            FeedbackFinding.model_validate(
+                base | {field: value}, context={"settings": settings}
+            )
