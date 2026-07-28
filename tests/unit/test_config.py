@@ -60,3 +60,54 @@ def test_repository_can_add_but_not_replace_exclusions(tmp_path: Path) -> None:
     (tmp_path / "pyquality.toml").write_text('exclusions = ["vendor"]\n', encoding="utf-8")
 
     assert load_settings(tmp_path, user_file).exclusions == (".venv", "vendor")
+
+
+def test_user_configuration_rejects_string_values_for_integer_limits(tmp_path: Path) -> None:
+    """Coercing TOML strings would let malformed user settings silently change execution limits."""
+    user_file = tmp_path / "user.toml"
+    user_file.write_text('round_limit = "4"\n', encoding="utf-8")
+
+    with pytest.raises(ConfigError, match="wrong type"):
+        load_settings(tmp_path, user_file)
+
+
+def test_byte_limit_defaults_are_exact(tmp_path: Path) -> None:
+    """Changing named byte defaults would weaken the reviewed public-input boundaries."""
+    settings = load_settings(tmp_path, None)
+
+    assert (
+        settings.max_rationale_bytes,
+        settings.max_finding_summary_bytes,
+        settings.max_finding_evidence_bytes,
+        settings.max_group_key_bytes,
+        settings.max_action_arguments_bytes,
+        settings.max_tool_output_bytes,
+        settings.max_tool_metadata_bytes,
+        settings.max_config_pattern_bytes,
+        settings.max_config_patterns,
+        settings.source_excerpt_bytes,
+        settings.feedback_total_bytes,
+    ) == (4_096, 1_024, 4_096, 512, 65_536, 65_536, 16_384, 1_024, 128, 8_192, 32_768)
+
+
+def test_user_configuration_rejects_oversized_or_too_many_redaction_patterns(tmp_path: Path) -> None:
+    """Unbounded configuration patterns would exceed the reviewed redaction-input budget."""
+    oversized_file = tmp_path / "oversized.toml"
+    oversized_file.write_text(f'redaction_patterns = ["{"x" * 1_025}"]\n', encoding="utf-8")
+
+    with pytest.raises(ConfigError, match="invalid configuration"):
+        load_settings(tmp_path, oversized_file)
+
+    count_file = tmp_path / "count.toml"
+    count_file.write_text("redaction_patterns = [" + ", ".join('"x"' for _ in range(129)) + "]\n", encoding="utf-8")
+
+    with pytest.raises(ConfigError, match="invalid configuration"):
+        load_settings(tmp_path, count_file)
+
+
+def test_repository_can_only_lower_a_byte_cap(tmp_path: Path) -> None:
+    """A repository must not increase the reviewed action-argument byte cap."""
+    (tmp_path / "pyquality.toml").write_text("max_action_arguments_bytes = 65537\n", encoding="utf-8")
+
+    with pytest.raises(ConfigError, match="cannot widen"):
+        load_settings(tmp_path, None)

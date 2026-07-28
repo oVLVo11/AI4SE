@@ -229,7 +229,7 @@ def test_defaults_are_exact(tmp_path: Path) -> None:
 Run before implementation: `pytest tests/unit/test_config.py -v`
 Expected: FAIL because configuration symbols do not exist.
 
-Implement `Settings` with `extra="forbid"`, round limit, 1–4 concurrency, timeouts, safe pytest/Ruff argument lists, exclusions, and byte budgets. Parse `[tool.pyquality]` from `pyproject.toml` and `pyquality.toml`; merge defaults → optional user file → repository file.
+Implement `Settings` with `extra="forbid"`, round limit, 1–4 concurrency, timeouts, safe pytest/Ruff argument lists, exclusions, and byte budgets. The UTF-8 byte/count defaults are `max_rationale_bytes=4_096`, `max_finding_summary_bytes=1_024`, `max_finding_evidence_bytes=4_096`, `max_group_key_bytes=512`, `max_action_arguments_bytes=65_536`, `max_tool_output_bytes=65_536`, `max_tool_metadata_bytes=16_384`, `max_config_pattern_bytes=1_024`, `max_config_patterns=128`, `source_excerpt_bytes=8_192`, and `feedback_total_bytes=32_768`; repository settings may only lower these caps. Parse only `pyquality.toml` as repository configuration; merge defaults → optional user file → repository file.
 
 - [ ] **Step 5: Verify and commit**
 

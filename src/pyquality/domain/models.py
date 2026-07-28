@@ -2,12 +2,34 @@
 
 from __future__ import annotations
 
+import json
+import re
 from datetime import datetime
 from enum import StrEnum
 from pathlib import PurePosixPath
 from typing import ClassVar, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
+
+MAX_RATIONALE_BYTES = 4_096
+MAX_FINDING_SUMMARY_BYTES = 1_024
+MAX_FINDING_EVIDENCE_BYTES = 4_096
+MAX_GROUP_KEY_BYTES = 512
+MAX_ACTION_ARGUMENTS_BYTES = 65_536
+MAX_TOOL_OUTPUT_BYTES = 65_536
+MAX_TOOL_METADATA_BYTES = 16_384
+MAX_CONFIG_PATTERN_BYTES = 1_024
+
+
+def _bounded(value: str, limit: int, field: str) -> None:
+    if len(value.encode("utf-8")) > limit:
+        raise ValueError(f"{field} exceeds {limit} UTF-8 bytes")
+
+
+def _relative_path(value: str) -> None:
+    path = PurePosixPath(value)
+    if not value or "\\" in value or path.is_absolute() or ".." in path.parts:
+        raise ValueError("path must be repository-relative POSIX text")
 
 
 class PublicModel(BaseModel):
@@ -57,7 +79,10 @@ class Action(PublicModel):
 
     kind: Literal["read_file", "search_text", "list_files", "apply_patch", "run_quality", "finish"]
     arguments: dict[str, JsonValue] = Field(default_factory=dict)
-    rationale: str = Field(min_length=1, max_length=2_000)
+    rationale: str = Field(min_length=1)
+    model_config = ConfigDict(
+        extra="forbid", json_schema_extra={"discriminator": {"propertyName": "kind"}}
+    )
 
     _argument_models: ClassVar[dict[str, type[PublicModel]]] = {
         "read_file": ReadFileArguments,
@@ -72,6 +97,8 @@ class Action(PublicModel):
     def validate_arguments(self) -> Action:
         model = self._argument_models[self.kind]
         self.arguments = model.model_validate(self.arguments).model_dump(exclude_none=True)
+        _bounded(self.rationale, MAX_RATIONALE_BYTES, "rationale")
+        _bounded(json.dumps(self.arguments, ensure_ascii=False, separators=(",", ":")), MAX_ACTION_ARGUMENTS_BYTES, "arguments")
         return self
 
 
@@ -99,9 +126,10 @@ class Finding(PublicModel):
         if self.path is None and self.line is not None:
             raise ValueError("line requires path")
         if self.path is not None:
-            path = PurePosixPath(self.path)
-            if "\\" in self.path or path.is_absolute() or ".." in path.parts:
-                raise ValueError("path must be repository-relative POSIX text")
+            _relative_path(self.path)
+        _bounded(self.summary, MAX_FINDING_SUMMARY_BYTES, "summary")
+        _bounded(self.evidence, MAX_FINDING_EVIDENCE_BYTES, "evidence")
+        _bounded(self.group_key, MAX_GROUP_KEY_BYTES, "group_key")
         return self
 
 
@@ -153,6 +181,13 @@ class PolicyDecision(PublicModel):
     impact_summary: str = Field(min_length=1)
     action_digest: str = Field(min_length=64, max_length=64)
 
+    @model_validator(mode="after")
+    def normalize_digest(self) -> PolicyDecision:
+        if re.fullmatch(r"[0-9a-fA-F]{64}", self.action_digest) is None:
+            raise ValueError("action_digest must be SHA-256 hex")
+        self.action_digest = self.action_digest.lower()
+        return self
+
 
 class ToolResult(PublicModel):
     effect_kind: str = Field(min_length=1)
@@ -166,9 +201,16 @@ class ToolResult(PublicModel):
 
     @model_validator(mode="after")
     def validate_digests(self) -> ToolResult:
+        for path in self.changed_paths:
+            _relative_path(path)
+        for path in (*self.before_digests, *self.after_digests):
+            _relative_path(path)
         changed_paths = set(self.changed_paths)
         if set(self.before_digests) - changed_paths or set(self.after_digests) - changed_paths:
             raise ValueError("content digests must belong to changed paths")
+        if self.evidence is not None:
+            _bounded(self.evidence, MAX_TOOL_OUTPUT_BYTES, "evidence")
+        _bounded(json.dumps(self.normalized_metadata, ensure_ascii=False, separators=(",", ":")), MAX_TOOL_METADATA_BYTES, "normalized_metadata")
         return self
 
 

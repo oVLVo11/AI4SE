@@ -9,7 +9,17 @@ from pathlib import Path, PurePosixPath
 
 from pydantic import ConfigDict, Field, ValidationError, model_validator
 
-from .domain.models import PublicModel
+from .domain.models import (
+    MAX_ACTION_ARGUMENTS_BYTES,
+    MAX_CONFIG_PATTERN_BYTES,
+    MAX_FINDING_EVIDENCE_BYTES,
+    MAX_FINDING_SUMMARY_BYTES,
+    MAX_GROUP_KEY_BYTES,
+    MAX_RATIONALE_BYTES,
+    MAX_TOOL_METADATA_BYTES,
+    MAX_TOOL_OUTPUT_BYTES,
+    PublicModel,
+)
 
 
 class ConfigError(ValueError):
@@ -28,6 +38,10 @@ _LIMIT_FIELDS = frozenset(
         "tool_output_bytes",
         "read_search_result_bytes",
         "source_excerpt_bytes",
+        "feedback_total_bytes",
+        "max_rationale_bytes", "max_finding_summary_bytes", "max_finding_evidence_bytes",
+        "max_group_key_bytes", "max_action_arguments_bytes", "max_tool_output_bytes",
+        "max_tool_metadata_bytes", "max_config_pattern_bytes", "max_config_patterns",
     }
 )
 _REPOSITORY_FIELDS = _LIMIT_FIELDS | {"exclusions"}
@@ -45,9 +59,16 @@ class Settings(PublicModel):
     subprocess_timeout_s: int = Field(default=60, ge=1, le=60)
     provider_timeout_s: int = Field(default=30, ge=1, le=30)
     provider_retries: int = Field(default=2, ge=0, le=2)
-    total_feedback_bytes: int = Field(default=32 * 1024, ge=1, le=32 * 1024)
-    per_finding_evidence_bytes: int = Field(default=4 * 1024, ge=1, le=4 * 1024)
-    tool_output_bytes: int = Field(default=64 * 1024, ge=1, le=64 * 1024)
+    feedback_total_bytes: int = Field(default=32_768, ge=1, le=32_768)
+    max_rationale_bytes: int = Field(default=MAX_RATIONALE_BYTES, ge=1, le=MAX_RATIONALE_BYTES)
+    max_finding_summary_bytes: int = Field(default=MAX_FINDING_SUMMARY_BYTES, ge=1, le=MAX_FINDING_SUMMARY_BYTES)
+    max_finding_evidence_bytes: int = Field(default=MAX_FINDING_EVIDENCE_BYTES, ge=1, le=MAX_FINDING_EVIDENCE_BYTES)
+    max_group_key_bytes: int = Field(default=MAX_GROUP_KEY_BYTES, ge=1, le=MAX_GROUP_KEY_BYTES)
+    max_action_arguments_bytes: int = Field(default=MAX_ACTION_ARGUMENTS_BYTES, ge=1, le=MAX_ACTION_ARGUMENTS_BYTES)
+    max_tool_output_bytes: int = Field(default=MAX_TOOL_OUTPUT_BYTES, ge=1, le=MAX_TOOL_OUTPUT_BYTES)
+    max_tool_metadata_bytes: int = Field(default=MAX_TOOL_METADATA_BYTES, ge=1, le=MAX_TOOL_METADATA_BYTES)
+    max_config_pattern_bytes: int = Field(default=MAX_CONFIG_PATTERN_BYTES, ge=1, le=MAX_CONFIG_PATTERN_BYTES)
+    max_config_patterns: int = Field(default=128, ge=1, le=128)
     read_search_result_bytes: int = Field(default=64 * 1024, ge=1, le=64 * 1024)
     source_excerpt_bytes: int = Field(default=8 * 1024, ge=1, le=8 * 1024)
     pytest_args: tuple[str, ...] = ("-q",)
@@ -64,13 +85,18 @@ class Settings(PublicModel):
             _validate_relative_path(path)
         if not self.denied_actions or not self.redaction_patterns:
             raise ValueError("denied actions and redaction patterns must not be empty")
+        if len(self.redaction_patterns) > self.max_config_patterns:
+            raise ValueError("too many redaction patterns")
+        for pattern in self.redaction_patterns:
+            if len(pattern.encode("utf-8")) > self.max_config_pattern_bytes:
+                raise ValueError("redaction pattern exceeds byte limit")
         return self
 
 
 def load_settings(repo_root: Path, user_file: Path | None) -> Settings:
     """Merge defaults, an explicitly supplied user file, then restrictions from pyquality.toml."""
     root = _validate_root(repo_root)
-    merged = Settings().model_dump()
+    merged = Settings().model_dump(mode="json")
     if user_file is not None:
         merged.update(_read_config(user_file))
     user_settings = _build_settings(merged)
@@ -84,7 +110,7 @@ def load_settings(repo_root: Path, user_file: Path | None) -> Settings:
     if unexpected:
         raise ConfigError(f"repository config cannot change '{min(unexpected)}'")
 
-    narrowed = user_settings.model_dump()
+    narrowed = user_settings.model_dump(mode="json")
     for field in _LIMIT_FIELDS & set(repository):
         requested = repository[field]
         current = narrowed[field]
@@ -97,7 +123,7 @@ def load_settings(repo_root: Path, user_file: Path | None) -> Settings:
         exclusions = repository["exclusions"]
         if not isinstance(exclusions, list) or not all(isinstance(item, str) for item in exclusions):
             raise ConfigError("wrong type for 'exclusions'")
-        narrowed["exclusions"] = tuple(dict.fromkeys((*user_settings.exclusions, *exclusions)))
+        narrowed["exclusions"] = list(dict.fromkeys((*user_settings.exclusions, *exclusions)))
     return _build_settings(narrowed)
 
 
@@ -138,10 +164,21 @@ def _ensure_known_fields(config: Mapping[str, object]) -> None:
 
 def _build_settings(config: Mapping[str, object]) -> Settings:
     _ensure_known_fields(config)
+    for name, field in Settings.model_fields.items():
+        if name in config and not _matches_type(config[name], field.annotation):
+            raise ConfigError(f"wrong type for '{name}'")
     try:
         return Settings.model_validate(config)
     except ValidationError as error:
         raise ConfigError(f"invalid configuration: {error.errors()[0]['msg']}") from error
+
+
+def _matches_type(value: object, annotation: object) -> bool:
+    if annotation is int:
+        return isinstance(value, int) and not isinstance(value, bool)
+    if annotation == tuple[str, ...]:
+        return isinstance(value, list) and all(isinstance(item, str) for item in value)
+    return True
 
 
 def _validate_pytest_args(arguments: tuple[str, ...]) -> None:
