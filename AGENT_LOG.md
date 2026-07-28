@@ -35,3 +35,7 @@ Agent `/root/task2_storage_memory` implemented SQLite task state, leases, recove
 ## 2026-07-28 Task 3 revalidation ruling
 
 The human ruling makes Specification section 14.2 binding for Task 3 revalidation. `PolicyDecision` now records the canonical repository snapshot digest; `revalidate` receives the saved decision, the supplied `Action`, and the caller's current snapshot digest. It denies action-digest mismatch or repository snapshot drift before reevaluating the supplied action against current filesystem policy. This replaces the earlier in-process action-cache interpretation.
+
+## 2026-07-28 Task 3 implementation and fix round 1
+
+Agent `/root/task3_policy` implemented deterministic path confinement and governance policy in `7b570c2`, including canonical path/symlink checks, sensitive-path denial, patch impact approval gates, canonical action digests, and the SPEC §14.2 revalidation ruling. Fix round 1 in `422382f` added component-case-insensitive CI governance, strict contextual unified-diff validation, stable malformed-patch denial, and a symlink helper that skips only `WinError 1314`. RED evidence recorded 7 focused failures before the fix; final verification reported 88 passed, 3 WinError-1314 symlink skips, and Ruff clean. The Task 3 spec and quality review is clean after fix round 1. A threshold-boundary coverage Minor remains deferred by direction.
