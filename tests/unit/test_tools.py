@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -76,6 +77,42 @@ def test_search_returns_bounded_matches_without_a_shell(repo: Path) -> None:
     assert result.ok is True
 
 
+def test_recursive_list_and_search_skip_sensitive_file_names_and_contents(repo: Path) -> None:
+    """Walking every file without policy-sensitive filtering would disclose secrets by discovery."""
+    (repo / ".env").write_text("API_TOKEN=leak\n", encoding="utf-8")
+    (repo / "nested").mkdir()
+    (repo / "nested" / "private.pem").write_text("sensitive-token\n", encoding="utf-8")
+    (repo / "safe.py").write_text("sensitive-token\n", encoding="utf-8")
+    list_action = Action(kind="list_files", arguments={}, rationale="List files.")
+    search_action = Action(kind="search_text", arguments={"pattern": "sensitive-token"}, rationale="Search.")
+    dispatcher, _ = _dispatcher(repo)
+    list_decision = _allowed_decision(repo, list_action)
+    search_decision = _allowed_decision(repo, search_action)
+
+    listed = dispatcher.dispatch(list_action, list_decision, list_decision.repository_snapshot_digest)
+    found = dispatcher.dispatch(search_action, search_decision, search_decision.repository_snapshot_digest)
+
+    assert ".env" not in listed.output
+    assert "private.pem" not in listed.output
+    assert found.output == "safe.py:1:sensitive-token"
+
+
+def test_search_treats_a_regex_shaped_pattern_as_a_literal_on_a_long_line(repo: Path) -> None:
+    """Compiling model-provided regex lets a catastrophic expression consume unbounded CPU."""
+    pattern = "(a+)+$"
+    (repo / "large.txt").write_text("x" * 50_000 + pattern + "\n", encoding="utf-8")
+    action = Action(kind="search_text", arguments={"pattern": pattern}, rationale="Find literal text.")
+    dispatcher, _ = _dispatcher(repo)
+    decision = _allowed_decision(repo, action)
+
+    started = time.monotonic()
+    result = dispatcher.dispatch(action, decision, decision.repository_snapshot_digest)
+
+    assert time.monotonic() - started < 1
+    assert result.output.startswith("large.txt:1:")
+    assert result.truncated is True
+
+
 def test_dispatch_rejects_a_stale_allow_decision_before_reading(repo: Path) -> None:
     """Skipping decision revalidation would execute an action after repository drift."""
     (repo / "safe.py").write_text("first\n", encoding="utf-8")
@@ -128,3 +165,18 @@ def test_process_runner_reports_timeout_and_combined_output_cap(repo: Path) -> N
     assert result.timed_out is True
     assert len(result.output.encode("utf-8")) <= 32
     assert result.truncated is True
+
+
+def test_process_runner_times_out_a_child_that_keeps_inherited_pipes_open(repo: Path) -> None:
+    """Killing only the direct child would let a grandchild hold readers open past the timeout."""
+    runner = SubprocessRunner()
+    script = (
+        "import subprocess,sys,time; "
+        "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(3)']); time.sleep(3)"
+    )
+
+    started = time.monotonic()
+    result = runner.run([sys.executable, "-c", script], repo, timeout_s=1, output_limit=64)
+
+    assert result.timed_out is True
+    assert time.monotonic() - started < 2.5

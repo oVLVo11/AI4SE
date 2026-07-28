@@ -6,7 +6,7 @@ import hashlib
 import json
 import re
 import stat
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from fnmatch import fnmatchcase
 from pathlib import Path, PurePosixPath
 
@@ -58,7 +58,6 @@ class PatchLine:
 
     prefix: str
     text: str
-    no_newline: bool = False
 
 
 @dataclass(frozen=True)
@@ -256,7 +255,7 @@ class PolicyEngine:
         path = _normalized_relative_path(raw_path)
         if path is None:
             return "path_escape"
-        if _is_sensitive(path, self._sensitive_patterns):
+        if is_sensitive_relative_path(path, self._sensitive_patterns):
             return "sensitive_path"
         target = _resolve_target(root, path)
         if target is None or not target.is_relative_to(root):
@@ -337,11 +336,18 @@ def _resolve_target(root: Path, relative_path: PurePosixPath) -> Path | None:
     return resolved_parent.joinpath(*reversed(remaining))
 
 
-def _is_sensitive(path: PurePosixPath, patterns: tuple[str, ...]) -> bool:
+def is_sensitive_relative_path(
+    path: PurePosixPath, patterns: tuple[str, ...] = _DEFAULT_SENSITIVE_PATTERNS
+) -> bool:
+    """Return whether a repository-relative path contains a sensitive component.
+
+    Policy classification and recursive repository discovery share this exact
+    deterministic filename rule so discovery cannot expose a denied read target.
+    """
     return any(
         fnmatchcase(segment.casefold(), pattern)
         for segment in path.parts
-        for pattern in patterns
+        for pattern in (item.casefold() for item in patterns)
     )
 
 
@@ -375,6 +381,8 @@ def parse_validated_patch(patch: str) -> ValidatedPatch | None:
             return None
         path = old_path or new_path
         assert path is not None
+        if path in paths:
+            return None
         paths.add(path)
         deletes_file = deletes_file or new_path is None
         found_hunk = False
@@ -397,11 +405,7 @@ def parse_validated_patch(patch: str) -> ValidatedPatch | None:
             while index < len(lines) and not lines[index].startswith(("@@ ", "--- ")):
                 line = lines[index]
                 if line == r"\ No newline at end of file":
-                    if not body:
-                        return None
-                    body[-1] = replace(body[-1], no_newline=True)
-                    index += 1
-                    continue
+                    return None
                 if not line.startswith((" ", "+", "-")):
                     return None
                 if line.startswith(" "):

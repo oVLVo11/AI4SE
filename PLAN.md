@@ -410,7 +410,7 @@ Expected: FAIL because dispatcher is absent.
 
 - [ ] **Step 2: Implement read, search, and list without shell interpolation**
 
-Use `Path.read_text`, deterministic `Path.walk` ordering, compiled Python regex with a match-count limit, explicit exclusions, and UTF-8 error reporting. Require callers to supply only policy-approved actions.
+Use `Path.read_text`, deterministic `Path.walk` ordering, literal UTF-8 substring search with a match-count limit, explicit exclusions (including every policy-sensitive filename), and UTF-8 error reporting. The first version deliberately does not support regex search. Require callers to supply only policy-approved actions.
 
 - [ ] **Step 3: Write failing contextual patch tests**
 
@@ -432,7 +432,7 @@ Expected: FAIL until patching exists.
 
 - [ ] **Step 4: Implement atomic unified-patch application and process protocol**
 
-Parse unified patches in Python, verify every old hunk against an in-memory file snapshot, write changed files only after all hunks validate, and use replace-through-temporary-file in the same directory. Implement `SubprocessRunner` with `shell=False`, fixed cwd, timeout, combined byte cap, and explicit timeout result.
+Parse unified patches in Python, verify every old hunk against an in-memory file snapshot, write changed files only after all hunks validate, and use replace-through-temporary-file in the same directory. The first version deliberately rejects `\\ No newline at end of file` markers and targets without a final newline while preserving LF or CRLF for valid targets. Implement `SubprocessRunner` with `shell=False`, fixed cwd, timeout, combined byte cap, and explicit timeout result.
 
 - [ ] **Step 5: Verify and commit**
 

@@ -39,3 +39,7 @@ The human ruling makes Specification section 14.2 binding for Task 3 revalidatio
 ## 2026-07-28 Task 3 implementation and fix round 1
 
 Agent `/root/task3_policy` implemented deterministic path confinement and governance policy in `7b570c2`, including canonical path/symlink checks, sensitive-path denial, patch impact approval gates, canonical action digests, and the SPEC §14.2 revalidation ruling. Fix round 1 in `422382f` added component-case-insensitive CI governance, strict contextual unified-diff validation, stable malformed-patch denial, and a symlink helper that skips only `WinError 1314`. RED evidence recorded 7 focused failures before the fix; final verification reported 88 passed, 3 WinError-1314 symlink skips, and Ruff clean. The Task 3 spec and quality review is clean after fix round 1. A threshold-boundary coverage Minor remains deferred by direction.
+
+## 2026-07-28 Task 4 clarified tool restrictions
+
+The initial repository search surface is literal UTF-8 substring search only; model-provided regular expressions are deliberately unsupported. The shared unified-diff grammar also deliberately rejects `\\ No newline at end of file` markers, and the dispatcher rejects a target that lacks a final newline. Valid patch application preserves the target's existing LF or CRLF convention.

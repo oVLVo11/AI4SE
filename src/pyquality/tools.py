@@ -4,17 +4,25 @@ from __future__ import annotations
 
 import hashlib
 import os
-import re
+import signal
 import subprocess
 import tempfile
 import threading
+import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Protocol
+from typing import BinaryIO, Protocol
 
 from pyquality.config import Settings
 from pyquality.domain.models import Action, PolicyDecision, PolicyOutcome, ToolResult
-from pyquality.policy import PatchFile, PolicyEngine, ValidatedPatch, parse_validated_patch
+from pyquality.policy import (
+    PatchFile,
+    PolicyEngine,
+    ValidatedPatch,
+    is_sensitive_relative_path,
+    parse_validated_patch,
+)
 
 _DEFAULT_EXCLUDED_DIRECTORIES = frozenset(
     {".git", ".venv", "__pycache__", ".pytest_cache", ".ruff_cache"}
@@ -59,25 +67,29 @@ class SubprocessRunner:
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            start_new_session=os.name != "nt",
+            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
         )
         captured: dict[str, bytearray] = {"stdout": bytearray(), "stderr": bytearray(), "output": bytearray()}
         lock = threading.Lock()
         truncated = False
 
-        def drain(name: str, stream: object) -> None:
+        def drain(name: str, stream: BinaryIO) -> None:
             nonlocal truncated
-            assert hasattr(stream, "read")
-            while block := stream.read(8_192):
-                with lock:
-                    remaining = output_limit - len(captured["output"])
-                    if remaining <= 0:
-                        truncated = True
-                        continue
-                    kept = block[:remaining]
-                    captured[name].extend(kept)
-                    captured["output"].extend(kept)
-                    if len(kept) != len(block):
-                        truncated = True
+            try:
+                while block := stream.read(8_192):
+                    with lock:
+                        remaining = output_limit - len(captured["output"])
+                        if remaining <= 0:
+                            truncated = True
+                            continue
+                        kept = block[:remaining]
+                        captured[name].extend(kept)
+                        captured["output"].extend(kept)
+                        if len(kept) != len(block):
+                            truncated = True
+            except (OSError, ValueError):
+                return
 
         assert process.stdout is not None and process.stderr is not None
         readers = [
@@ -91,11 +103,17 @@ class SubprocessRunner:
             process.wait(timeout=timeout_s)
         except subprocess.TimeoutExpired:
             timed_out = True
-            process.kill()
-            process.wait()
+            _terminate_process_tree(process)
+            for stream in (process.stdout, process.stderr):
+                threading.Thread(target=_close_pipe, args=(stream,), daemon=True).start()
+            try:
+                process.wait(timeout=0.5)
+            except subprocess.TimeoutExpired:
+                process.kill()
         finally:
+            join_deadline = time.monotonic() + 0.25
             for reader in readers:
-                reader.join()
+                reader.join(timeout=max(0, join_deadline - time.monotonic()))
 
         return ProcessResult(
             returncode=process.returncode,
@@ -111,7 +129,12 @@ class ToolDispatcher:
     """The single effect boundary for policy-approved repository actions."""
 
     def __init__(
-        self, repo_root: Path, policy: PolicyEngine, process_runner: ProcessRunner, settings: Settings
+        self,
+        repo_root: Path,
+        policy: PolicyEngine,
+        process_runner: ProcessRunner,
+        settings: Settings,
+        before_patch_commit: Callable[[], None] | None = None,
     ) -> None:
         self._root = Path(repo_root).resolve(strict=True)
         if not self._root.is_dir():
@@ -119,6 +142,7 @@ class ToolDispatcher:
         self._policy = policy
         self._process_runner = process_runner
         self._settings = settings
+        self._before_patch_commit = before_patch_commit or (lambda: None)
 
     def dispatch(
         self, action: Action, decision: PolicyDecision, current_snapshot_digest: str
@@ -164,6 +188,8 @@ class ToolDispatcher:
                     if candidate.is_symlink() or not candidate.is_file():
                         continue
                     relative = candidate.relative_to(self._root).as_posix()
+                    if is_sensitive_relative_path(PurePosixPath(relative)):
+                        continue
                     paths.append(relative)
         except OSError:
             return _result("list_files", "read_error")
@@ -171,10 +197,6 @@ class ToolDispatcher:
         return _result("list_files", "ok", output=output, truncated=truncated)
 
     def _search_text(self, pattern: str, raw_path: object) -> ToolResult:
-        try:
-            matcher = re.compile(pattern)
-        except re.error:
-            return _result("search_text", "invalid_regex")
         target = self._search_target(raw_path)
         if target is None:
             return _result("search_text", "path_not_found")
@@ -187,7 +209,7 @@ class ToolDispatcher:
                 except UnicodeDecodeError:
                     return _result("search_text", "utf8_decode_error")
                 for line_number, line in enumerate(source.splitlines(), start=1):
-                    if matcher.search(line):
+                    if pattern in line:
                         matches.append(f"{candidate.relative_to(self._root).as_posix()}:{line_number}:{line}")
                         if len(matches) >= _MAX_SEARCH_MATCHES:
                             output, _ = _truncate_text("\n".join(matches), self.output_limit)
@@ -205,6 +227,9 @@ class ToolDispatcher:
         if error is not None:
             return _result("apply_patch", error)
         assert prepared is not None
+        self._before_patch_commit()
+        if not all(_target_state_matches(item) for item in prepared):
+            return _result("apply_patch", "patch_target_changed")
         temporary_paths: list[Path] = []
         try:
             for item in prepared:
@@ -218,6 +243,8 @@ class ToolDispatcher:
             for item, temporary in zip(
                 (item for item in prepared if item.new_content is not None), temporary_paths, strict=True
             ):
+                if not _target_state_matches(item):
+                    return _result("apply_patch", "patch_target_changed")
                 os.replace(temporary, item.target)
             for item in prepared:
                 if item.new_content is None and item.target.exists():
@@ -263,6 +290,8 @@ class ToolDispatcher:
             if file_patch.old_path is None and old_content is not None:
                 return None, "patch_context_mismatch"
             if old_content is not None:
+                if not old_content.endswith(b"\n"):
+                    return None, "patch_target_missing_final_newline"
                 try:
                     current = old_content.decode("utf-8")
                 except UnicodeDecodeError:
@@ -273,7 +302,10 @@ class ToolDispatcher:
             if updated is None:
                 return None, "patch_context_mismatch"
             new_content = None if file_patch.new_path is None else updated.encode("utf-8")
-            prepared.append(_PreparedPatch(file_patch, target, old_content, new_content))
+            state = _capture_target_state(target, old_content, self._root)
+            if state is None:
+                return None, "patch_target_changed"
+            prepared.append(_PreparedPatch(file_patch, target, old_content, new_content, state))
         return prepared, None
 
     def _existing_file(self, raw_path: str) -> Path | None:
@@ -299,7 +331,13 @@ class ToolDispatcher:
         results: list[Path] = []
         for directory, names, files in target.walk():
             names[:] = sorted(name for name in names if name not in excluded)
-            results.extend(directory / name for name in sorted(files) if not (directory / name).is_symlink())
+            results.extend(
+                candidate
+                for name in sorted(files)
+                if not (candidate := directory / name).is_symlink()
+                and is_sensitive_relative_path(PurePosixPath(candidate.relative_to(self._root).as_posix()))
+                is False
+            )
         return results
 
     def _safe_target(self, raw_path: str) -> Path | None:
@@ -331,6 +369,15 @@ class _PreparedPatch:
     target: Path
     old_content: bytes | None
     new_content: bytes | None
+    target_state: _TargetState
+
+
+@dataclass(frozen=True)
+class _TargetState:
+    canonical_parent: Path
+    parent_identity: tuple[int, int]
+    target_identity: tuple[int, int] | None
+    target_digest: str | None
 
 
 def _apply_file_hunks(current: str, patch: PatchFile) -> str | None:
@@ -345,7 +392,7 @@ def _apply_file_hunks(current: str, patch: PatchFile) -> str | None:
         if [_line_text(line) for line in lines[start : start + hunk.old_count]] != expected:
             return None
         replacement = [
-            line.text + ("" if line.no_newline else newline)
+            line.text + newline
             for line in hunk.lines
             if line.prefix in {" ", "+"}
         ]
@@ -381,3 +428,74 @@ def _decode_bounded(value: bytes | bytearray) -> str:
 
 def _digest(content: bytes) -> str:
     return hashlib.sha256(content).hexdigest()
+
+
+def _capture_target_state(target: Path, content: bytes | None, root: Path) -> _TargetState | None:
+    try:
+        parent = target.parent.resolve(strict=True)
+        if not parent.is_relative_to(root):
+            return None
+        parent_stat = parent.lstat()
+        if content is None:
+            if target.exists() or target.is_symlink():
+                return None
+            return _TargetState(parent, _identity(parent_stat), None, None)
+        target_stat = target.lstat()
+    except OSError:
+        return None
+    return _TargetState(parent, _identity(parent_stat), _identity(target_stat), _digest(content))
+
+
+def _target_state_matches(item: _PreparedPatch) -> bool:
+    try:
+        parent = item.target.parent.resolve(strict=True)
+        if parent != item.target_state.canonical_parent or _identity(parent.lstat()) != item.target_state.parent_identity:
+            return False
+        if item.target_state.target_identity is None:
+            return not item.target.exists() and not item.target.is_symlink()
+        return (
+            _identity(item.target.lstat()) == item.target_state.target_identity
+            and _digest(item.target.read_bytes()) == item.target_state.target_digest
+        )
+    except OSError:
+        return False
+
+
+def _identity(details: os.stat_result) -> tuple[int, int]:
+    return details.st_dev, details.st_ino
+
+
+def _terminate_process_tree(process: subprocess.Popen[bytes]) -> None:
+    if os.name == "nt":
+        try:
+            taskkill = subprocess.Popen(
+                ["taskkill.exe", "/PID", str(process.pid), "/T", "/F"],
+                shell=False,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            try:
+                taskkill.wait(timeout=0.25)
+            except subprocess.TimeoutExpired:
+                taskkill.kill()
+        except OSError:
+            pass
+        finally:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+        return
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+
+
+def _close_pipe(stream: BinaryIO | None) -> None:
+    if stream is not None:
+        try:
+            stream.close()
+        except OSError:
+            return
