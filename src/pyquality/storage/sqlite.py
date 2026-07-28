@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import sqlite3
 import uuid
@@ -159,9 +160,14 @@ class SQLiteTaskRepository:
             raise StorageStateError("SQLite URI database paths are not supported")
         else:
             connection_path = db_path.resolve(strict=False)
+            lock_identity_path = (
+                Path(os.path.normcase(str(connection_path)))
+                if os.name == "nt"
+                else connection_path
+            )
             self._lock_root = (
-                connection_path.parent
-                / f".{connection_path.name}.lease-locks"
+                lock_identity_path.parent
+                / f".{lock_identity_path.name}.lease-locks"
             )
         self._held_leases: dict[str, tuple[str, str, LocalProjectLock]] = {}
         self._connection = sqlite3.connect(connection_path, isolation_level=None)

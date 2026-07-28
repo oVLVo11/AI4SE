@@ -1114,10 +1114,12 @@ class AgentLoop:
             and (
                 kind != "dispatch"
                 or repository_snapshot_digest is None
-                or (intent.result_payload or {}).get(
+                or "repository_snapshot_digest"
+                not in (intent.result_payload or {})
+                or (intent.result_payload or {})[
                     "repository_snapshot_digest"
-                )
-                in (None, repository_snapshot_digest)
+                ]
+                == repository_snapshot_digest
             )
         )
 

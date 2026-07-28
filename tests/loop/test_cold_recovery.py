@@ -437,6 +437,79 @@ def test_recovery_drains_all_legacy_and_exact_snapshot_dispatches_atomically(
     assert seeded_after[other_action_dispatch.id].consumed_at is None
 
 
+@pytest.mark.parametrize(
+    "invalid_snapshot_digest",
+    [pytest.param(None, id="null"), pytest.param("not-a-sha256", id="malformed")],
+)
+def test_present_invalid_snapshot_digest_is_not_recovered_as_legacy(
+    loop_fixture, invalid_snapshot_digest: object,
+) -> None:
+    """Treating an annotated invalid digest as absent could replay another snapshot."""
+    raw_action = ordinary_patch_json()
+    harness = loop_fixture(
+        responses=[raw_action, finish_json()],
+        reports=[successful_report(), successful_report()],
+    )
+    action = ActionParser().parse(raw_action)
+    decision = harness.loop._policy.evaluate(action)
+    assert harness.repository.set_status(
+        harness.task_id, TaskStatus.CREATED, TaskStatus.RUNNING
+    ) is True
+    assert harness.repository.acquire_project_lease(
+        harness.task_id, owner_token="seed-owner"
+    ) is True
+    applied = ToolResult(
+        effect_kind="apply_patch",
+        code_changed=True,
+        changed_paths=("src/calc.py",),
+        before_digests={"src/calc.py": "c" * 64},
+        after_digests={"src/calc.py": "d" * 64},
+        normalized_metadata={"code": "ok"},
+    )
+    invalid_dispatch = harness.repository.record_transition_intent(
+        harness.task_id,
+        kind="dispatch",
+        evidence_digest=decision.action_digest,
+        summary="dispatch authorized",
+        owner_token="seed-owner",
+    )
+    harness.repository.complete_transition_intent(
+        invalid_dispatch.id,
+        result_digest="e" * 64,
+        summary="tool result persisted",
+        result_payload={
+            "tool_result": applied.model_dump(mode="json"),
+            "repository_snapshot_digest": invalid_snapshot_digest,
+        },
+        owner_token="seed-owner",
+    )
+    harness.repository.release_project_lease(
+        harness.task_id, owner_token="seed-owner"
+    )
+
+    persisted_before = next(
+        intent
+        for intent in harness.repository.resume_snapshot(
+            harness.task_id
+        ).transition_intents
+        if intent.id == invalid_dispatch.id
+    )
+    assert "repository_snapshot_digest" in (persisted_before.result_payload or {})
+
+    result = harness.loop.resume(harness.task_id)
+
+    assert result.status is TaskStatus.SUCCEEDED
+    assert harness.dispatcher.dispatch_count(raw_action) == 1
+    persisted_after = next(
+        intent
+        for intent in harness.repository.resume_snapshot(
+            harness.task_id
+        ).transition_intents
+        if intent.id == invalid_dispatch.id
+    )
+    assert persisted_after.consumed_at is None
+
+
 def test_schema_repair_cap_survives_cold_reopen(loop_fixture) -> None:
     class CrashBeforeSecondRound(ScriptedLLM):
         def complete(self, messages: tuple[Message, ...]) -> str:

@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import errno
 import os
+import sqlite3
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Barrier, Event
 
 import pytest
 
@@ -132,6 +135,80 @@ def test_relative_absolute_and_dot_database_paths_share_one_live_lock(
     absolute.close()
     if case_alias is not None:
         case_alias.close()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows lock identity semantics")
+def test_nonexistent_mixed_case_database_aliases_share_one_lock_identity(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """Case-sensitive lock identities would let first-open aliases bypass fencing."""
+    owner_path = tmp_path / "State.SQLite"
+    contender_path = tmp_path / "sTATE.sQLITE"
+    real_connect = sqlite3.connect
+    both_paths_resolved = Barrier(2)
+    owner_constructed = Event()
+    owner_acquired = Event()
+    release_owner = Event()
+    missing_before_connect: list[bool] = []
+    task_ids: list[str] = []
+
+    def gated_connect(database, *args, **kwargs):
+        missing_before_connect.append(not Path(database).exists())
+        both_paths_resolved.wait(timeout=5)
+        if Path(database).name == contender_path.name:
+            assert owner_constructed.wait(timeout=5)
+        return real_connect(database, *args, **kwargs)
+
+    monkeypatch.setattr(sqlite3, "connect", gated_connect)
+
+    def own_lease() -> tuple[str, bool]:
+        repository = None
+        try:
+            repository = SQLiteTaskRepository(owner_path)
+            owner_constructed.set()
+            task = repository.create_task("C:/work/demo", "fix sum", round_limit=8)
+            assert repository.set_status(
+                task.id, TaskStatus.CREATED, TaskStatus.RUNNING
+            ) is True
+            task_ids.append(task.id)
+            lease_result = repository.acquire_project_lease(
+                task.id, owner_token="owner"
+            )
+            owner_acquired.set()
+            assert release_owner.wait(timeout=10)
+            return str(repository._lock_root), lease_result
+        finally:
+            owner_constructed.set()
+            owner_acquired.set()
+            if repository is not None:
+                repository.close()
+
+    def contend_for_lease() -> tuple[str, bool]:
+        repository = None
+        try:
+            repository = SQLiteTaskRepository(contender_path)
+            assert owner_acquired.wait(timeout=10)
+            lease_result = repository.acquire_project_lease(
+                task_ids[0], owner_token="contender"
+            )
+            return str(repository._lock_root), lease_result
+        finally:
+            if repository is not None:
+                repository.close()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        owner_future = executor.submit(own_lease)
+        contender_future = executor.submit(contend_for_lease)
+        try:
+            contender_lock_root, contender_result = contender_future.result(timeout=15)
+        finally:
+            release_owner.set()
+        owner_lock_root, owner_result = owner_future.result(timeout=15)
+
+    assert missing_before_connect == [True, True]
+    assert owner_lock_root == contender_lock_root
+    assert owner_result is True
+    assert contender_result is False
 
 
 def test_database_file_alias_cannot_steal_a_live_lease(tmp_path: Path) -> None:
