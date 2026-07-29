@@ -7,4 +7,5 @@ Ruff and diff-check clean. Frozen cumulative review package generated after repo
 Formal review round 1: addressed 2 Critical and 6 Important findings in d60a8bc and
 10339c0. Core crash/drift, approved-pass recovery, atomic rollback, deadline, typed context,
 packaged resource, derived evidence, and sanitized CLI/demo regressions are GREEN. Final
-round-1 verification: 482 passed, 9 skipped; Ruff/diff clean.
+round-1 verification: 484 passed, 8 skipped; clean wheel install, bounded-context regression,
+Ruff, and diff-check clean. Additional regression commit: 7c21ce6.

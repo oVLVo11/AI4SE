@@ -79,7 +79,8 @@ RED/GREEN mapping:
 - Forced demo and outer CLI temp setup failures RED leaked `OSError`; GREEN returns nonzero
   stable path-free JSON without traceback.
 
-Round-1 verification collected 491 tests: 482 passed and 9 skipped. The new clean-wheel
-installation test is skipped only when the offline `hatchling` backend is unavailable; it
-builds, inspects, installs, and runs the wheel when that backend exists. Ruff and cumulative
-diff-check passed.
+After `hatchling` became available, the clean-wheel test built the distribution, inspected
+the packaged resources, installed into a clean target, and ran `demo --json` outside the
+source checkout. A dedicated 360-byte post-green context regression also proves truncation
+and absolute-path exclusion. Final round-1 verification collected 492 tests: 484 passed and
+8 skipped. Ruff and cumulative diff-check passed.
