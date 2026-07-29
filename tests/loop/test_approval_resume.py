@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
-from threading import Barrier
+from threading import Barrier, Event
 
 import pytest
 from conftest import (
@@ -14,6 +14,7 @@ from conftest import (
     finish_json,
     successful_report,
 )
+from fastapi.testclient import TestClient
 
 from pyquality.config import Settings
 from pyquality.domain.models import (
@@ -26,8 +27,9 @@ from pyquality.domain.models import (
 from pyquality.llm import Message, ScriptedLLM
 from pyquality.loop import ApprovalStateError
 from pyquality.policy import PolicyEngine
-from pyquality.service import HarnessService
+from pyquality.service import HarnessService, PreflightError
 from pyquality.storage.sqlite import StorageStateError
+from pyquality.web.app import create_app
 
 
 @pytest.mark.parametrize("decision", [ApprovalDecision.APPROVE, ApprovalDecision.REJECT])
@@ -55,6 +57,96 @@ def test_service_approval_decision_resumes_real_loop_to_terminal(
     )
 
     assert future.result(timeout=2).status is TaskStatus.SUCCEEDED
+
+
+def test_waiting_future_is_not_published_until_capacity_allows_approval(
+    loop_fixture,
+) -> None:
+    harness = loop_fixture(
+        responses=[dependency_patch_json(), finish_json()],
+        reports=[successful_report(), successful_report()],
+    )
+    service = HarnessService(
+        repository=harness.repository,
+        loop=harness.loop,
+        settings=Settings(global_concurrency=1),
+        verifier_finder=lambda name: name,
+    )
+    cleanup_entered = Event()
+    allow_cleanup = Event()
+    original_owns = harness.repository.owns_project_lease
+
+    def block_waiting_cleanup(task_id: str, *, owner_token: str) -> bool:
+        if harness.repository.resume_snapshot(task_id).task.status is TaskStatus.WAITING_APPROVAL:
+            cleanup_entered.set()
+            assert allow_cleanup.wait(2)
+        return original_owns(task_id, owner_token=owner_token)
+
+    harness.repository.owns_project_lease = block_waiting_cleanup
+    task = service.create_task(harness.repo_root, "repair")
+    future = service.start_task(task.id)
+    assert cleanup_entered.wait(1)
+    approval = harness.loop.pending_approval(task.id)
+
+    published_before_cleanup = future.done()
+    capacity_available_before_cleanup = True
+    try:
+        service.approve(approval.id)
+    except PreflightError:
+        capacity_available_before_cleanup = False
+    allow_cleanup.set()
+    assert not published_before_cleanup
+    assert not capacity_available_before_cleanup
+    assert future.result(timeout=2).status is TaskStatus.WAITING_APPROVAL
+    assert service.approve(approval.id).result(timeout=2).status is TaskStatus.SUCCEEDED
+
+
+@pytest.mark.parametrize("decision", [ApprovalDecision.APPROVE, ApprovalDecision.REJECT])
+def test_web_can_retry_recoverable_approval_dispatch_with_csrf(
+    loop_fixture, decision: ApprovalDecision
+) -> None:
+    harness = loop_fixture(
+        responses=[dependency_patch_json(), finish_json()],
+        reports=[successful_report(), successful_report()],
+    )
+    service = HarnessService(
+        repository=harness.repository,
+        loop=harness.loop,
+        settings=Settings(global_concurrency=1),
+        verifier_finder=lambda name: name,
+    )
+    task = service.create_task(harness.repo_root, "repair")
+    assert service.start_task(task.id).result(timeout=2).status is TaskStatus.WAITING_APPROVAL
+    approval = harness.loop.pending_approval(task.id)
+
+    class FailingExecutor:
+        def submit(self, *args, **kwargs):
+            raise RuntimeError("submit failed")
+
+    service._executor = FailingExecutor()
+    client = TestClient(create_app(service, mode="local"))
+    page = client.get(f"/tasks/{task.id}")
+    token = page.text.split('name="csrf_token" value="', 1)[1].split('"', 1)[0]
+    failed = client.post(
+        f"/approvals/{approval.id}/{decision.value}",
+        data={"csrf_token": token},
+        follow_redirects=False,
+    )
+    assert failed.status_code == 409
+
+    recovery_page = client.get(f"/tasks/{task.id}")
+    assert f'/tasks/{task.id}/resume' in recovery_page.text
+    assert client.post(f"/tasks/{task.id}/resume").status_code == 403
+    token = recovery_page.text.split('name="csrf_token" value="', 1)[1].split('"', 1)[0]
+    service._executor = ThreadPoolExecutor(max_workers=1)
+    retried = client.post(
+        f"/tasks/{task.id}/resume",
+        data={"csrf_token": token},
+        follow_redirects=False,
+    )
+    assert retried.status_code == 303
+    assert retried.headers["location"] == f"/tasks/{task.id}"
+    assert service.start_task(task.id).result(timeout=2).status is TaskStatus.SUCCEEDED
 
 
 @pytest.mark.parametrize("decision", [ApprovalDecision.APPROVE, ApprovalDecision.REJECT])

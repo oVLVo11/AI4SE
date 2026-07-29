@@ -26,6 +26,8 @@ class WebService(Protocol):
 
     def reject(self, approval_id: str) -> None: ...
 
+    def resume_task(self, task_id: str) -> object: ...
+
 
 _TEMPLATES = Jinja2Templates(directory=str(Path(__file__).with_name("templates")))
 _BUNDLED_SCENARIO = "broken_calculator"
@@ -158,6 +160,17 @@ def create_app(
         return RedirectResponse("/tasks/new", status_code=303)
 
     if mode == "local":
+        @app.post("/tasks/{task_id}/resume")
+        async def resume_task(request: Request, task_id: str):
+            form = await require_csrf(request)
+            if isinstance(form, HTMLResponse):
+                return form
+            try:
+                service.resume_task(task_id)
+            except (PreflightError, RuntimeError) as error:
+                return HTMLResponse(str(error), status_code=409)
+            return RedirectResponse(f"/tasks/{task_id}", status_code=303)
+
         @app.get("/settings", response_class=HTMLResponse)
         async def settings(request: Request) -> HTMLResponse:
             return _TEMPLATES.TemplateResponse(

@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import shutil
 from collections.abc import Callable
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future, InvalidStateError, ThreadPoolExecutor
 from pathlib import Path
 from threading import BoundedSemaphore, Lock
 from typing import Protocol
@@ -63,6 +63,7 @@ class TaskView(PublicModel):
     verification_summary: str | None = None
     changed_paths: tuple[str, ...] = ()
     pending_approval_id: str | None = None
+    resume_available: bool = False
 
 
 _TERMINAL = frozenset(
@@ -156,8 +157,7 @@ class HarnessService:
             if snapshot.task.result is None:
                 raise PreflightError("saved task result is unavailable")
             completed.set_result(snapshot.task.result)
-            with self._lock:
-                return self._futures.setdefault(task_id, completed)
+            return completed
         if not self._capacity.acquire(blocking=False):
             raise PreflightError("global execution capacity is exhausted")
         placeholder: Future[TaskResult] = Future()
@@ -189,6 +189,13 @@ class HarnessService:
 
     def reject(self, approval_id: str) -> Future[TaskResult]:
         return self._decide_and_resume(approval_id, ApprovalDecision.REJECT)
+
+    def resume_task(self, task_id: str) -> Future[TaskResult]:
+        """Retry only a dispatch whose approval decision already owns a lease."""
+        with self._lock:
+            if task_id not in self._pending_owners or task_id in self._futures:
+                raise PreflightError("task is not awaiting dispatch recovery")
+        return self.start_task(task_id, resume=True)
 
     def cancel_task(self, task_id: str) -> None:
         with self._lock:
@@ -368,25 +375,46 @@ class HarnessService:
         worker: Future[TaskResult],
     ) -> None:
         result: TaskResult | None = None
+        error: BaseException | None = None
         try:
             result = worker.result()
-            placeholder.set_result(result)
-        except Exception as error:  # noqa: BLE001 - preserve injected loop failure.
-            placeholder.set_exception(error)
-        finally:
-            if self._repository.owns_project_lease(
-                task_id, owner_token=owner_token
-            ):
-                self._repository.release_project_lease(
-                    task_id, owner_token=owner_token
-                )
+        except BaseException as caught:  # noqa: BLE001 - preserve injected loop failure.
+            error = caught
+        cleanup_error: BaseException | None = None
+        try:
+            if self._repository.owns_project_lease(task_id, owner_token=owner_token):
+                self._repository.release_project_lease(task_id, owner_token=owner_token)
+        except BaseException as caught:  # noqa: BLE001 - publish cleanup failure.
+            cleanup_error = caught
+        try:
             with self._lock:
                 self._pending_owners.pop(task_id, None)
                 if result is None or result.status in _TERMINAL:
                     canonical = self._task_repositories.pop(task_id, None)
-                    if canonical is not None and self._active_repositories.get(canonical) == task_id:
+                    if (
+                        canonical is not None
+                        and self._active_repositories.get(canonical) == task_id
+                    ):
                         self._active_repositories.pop(canonical, None)
+        except BaseException as caught:  # noqa: BLE001 - continue mandatory cleanup.
+            cleanup_error = cleanup_error or caught
+        try:
             self._capacity.release()
+        except BaseException as caught:  # noqa: BLE001 - publish cleanup failure.
+            cleanup_error = cleanup_error or caught
+        published_error = error or cleanup_error
+        try:
+            if published_error is None:
+                assert result is not None
+                placeholder.set_result(result)
+            else:
+                placeholder.set_exception(published_error)
+        except InvalidStateError:
+            pass
+        finally:
+            with self._lock:
+                if self._futures.get(task_id) is placeholder:
+                    self._futures.pop(task_id)
 
     def _remove_submission(self, task_id: str) -> None:
         with self._lock:
@@ -400,6 +428,12 @@ class HarnessService:
         iterations = getattr(snapshot, "iterations", ())
         pending = getattr(snapshot, "pending_approval", None)
         result = task.result
+        with self._lock:
+            resume_available = (
+                task.status is TaskStatus.RUNNING
+                and task.id in self._pending_owners
+                and task.id not in self._futures
+            )
         return TaskView(
             id=task.id,
             status=task.status,
@@ -408,6 +442,7 @@ class HarnessService:
             verification_summary=result.verification_summary if result else None,
             changed_paths=result.changed_paths if result else (),
             pending_approval_id=pending.id if pending else None,
+            resume_available=resume_available,
         )
 
     def _decode_audit(self, line: str) -> AuditEvent:

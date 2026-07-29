@@ -147,6 +147,101 @@ def test_bounded_submission_releases_capacity_and_repository_on_terminal_result(
     assert service.start_task(second.id).result(timeout=2).status is TaskStatus.SUCCEEDED
 
 
+def test_terminal_future_is_not_published_until_cleanup_allows_new_task(
+    repository: SQLiteTaskRepository, repo: Path
+) -> None:
+    cleanup_entered = Event()
+    allow_cleanup = Event()
+    original_owns = repository.owns_project_lease
+
+    def block_terminal_cleanup(task_id: str, *, owner_token: str) -> bool:
+        snapshot = repository.resume_snapshot(task_id)
+        if snapshot.task.status in {
+            TaskStatus.SUCCEEDED,
+            TaskStatus.STALLED,
+            TaskStatus.BUDGET_EXHAUSTED,
+            TaskStatus.BLOCKED,
+            TaskStatus.FAILED,
+        }:
+            cleanup_entered.set()
+            assert allow_cleanup.wait(2)
+        return original_owns(task_id, owner_token=owner_token)
+
+    repository.owns_project_lease = block_terminal_cleanup
+    service = make_service(repository)
+    task = service.create_task(repo, "first")
+    future = service.start_task(task.id)
+    assert cleanup_entered.wait(1)
+
+    published_before_cleanup = future.done()
+    capacity_available_before_cleanup = True
+    try:
+        service.create_task(repo, "too early")
+    except PreflightError:
+        capacity_available_before_cleanup = False
+    allow_cleanup.set()
+    assert not published_before_cleanup
+    assert not capacity_available_before_cleanup
+    assert future.result(timeout=2).status is TaskStatus.SUCCEEDED
+    replacement = service.create_task(repo, "after cleanup")
+    assert service.start_task(replacement.id).result(timeout=2).status is TaskStatus.SUCCEEDED
+
+
+def test_completed_submissions_are_evicted_and_terminal_start_is_reconstructed(
+    repository: SQLiteTaskRepository, repo: Path
+) -> None:
+    service = make_service(repository)
+    task_ids: list[str] = []
+
+    for sequence in range(20):
+        task = service.create_task(repo, f"task {sequence}")
+        task_ids.append(task.id)
+        assert service.start_task(task.id).result(timeout=2).status is TaskStatus.SUCCEEDED
+
+    assert service._futures == {}
+    reconstructed = service.start_task(task_ids[-1])
+    duplicate = service.start_task(task_ids[-1])
+    assert reconstructed.result(timeout=2).status is TaskStatus.SUCCEEDED
+    assert duplicate.result(timeout=2) == reconstructed.result(timeout=2)
+    assert service._futures == {}
+
+
+def test_cleanup_exception_is_published_after_remaining_resources_are_released(
+    repository: SQLiteTaskRepository, tmp_path: Path
+) -> None:
+    first_repo = tmp_path / "cleanup-error"
+    second_repo = tmp_path / "after-cleanup-error"
+    first_repo.mkdir()
+    second_repo.mkdir()
+    original_release = repository.release_project_lease
+    original_owns = repository.owns_project_lease
+    failed_once = False
+
+    def own_terminal_cleanup(task_id: str, *, owner_token: str) -> bool:
+        if repository.resume_snapshot(task_id).task.status is TaskStatus.SUCCEEDED:
+            return True
+        return original_owns(task_id, owner_token=owner_token)
+
+    def release_then_fail(task_id: str, *, owner_token: str) -> None:
+        nonlocal failed_once
+        original_release(task_id, owner_token=owner_token)
+        if not failed_once:
+            failed_once = True
+            raise RuntimeError("cleanup failed")
+
+    repository.owns_project_lease = own_terminal_cleanup
+    repository.release_project_lease = release_then_fail
+    service = make_service(repository)
+    task = service.create_task(first_repo, "first")
+
+    with pytest.raises(RuntimeError, match="cleanup failed"):
+        service.start_task(task.id).result(timeout=2)
+
+    assert service._futures == {}
+    replacement = service.create_task(second_repo, "capacity was released")
+    assert service.start_task(replacement.id).result(timeout=2).status is TaskStatus.SUCCEEDED
+
+
 def test_submission_queue_is_bounded_by_global_concurrency(
     repository: SQLiteTaskRepository, tmp_path: Path
 ) -> None:
