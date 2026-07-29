@@ -65,6 +65,10 @@ def finish_json() -> str:
     return action_json("finish", rationale="verify completion")
 
 
+def quality_json() -> str:
+    return action_json("run_quality", rationale="establish green completion evidence")
+
+
 def failed_report(category: str = "assertion") -> QualityReport:
     finding = Finding(
         source="pytest",

@@ -16,6 +16,7 @@ from conftest import (
     failed_report,
     finish_json,
     ordinary_patch_json,
+    quality_json,
     successful_report,
 )
 
@@ -84,7 +85,8 @@ def test_completed_model_response_cold_reopen_does_not_call_provider_again(
     loop_fixture, monkeypatch
 ) -> None:
     harness = loop_fixture(
-        responses=[finish_json()], reports=[successful_report()]
+        responses=[quality_json(), finish_json()],
+        reports=[successful_report(), successful_report()],
     )
     crash_after_completed_transition(harness, monkeypatch, "model_call")
 
@@ -93,14 +95,16 @@ def test_completed_model_response_cold_reopen_does_not_call_provider_again(
     assert len(harness.llm.calls) == 1
     assert harness.repository.resume_snapshot(harness.task_id).iterations == ()
 
-    restarted_llm = ScriptedLLM([])
-    restarted_pipeline = ScriptedPipeline([successful_report()])
+    restarted_llm = ScriptedLLM([finish_json()])
+    restarted_pipeline = ScriptedPipeline(
+        [successful_report(), successful_report()]
+    )
     harness.restart(restarted_llm, restarted_pipeline)
     result = harness.loop.resume(harness.task_id)
 
     assert result.status is TaskStatus.SUCCEEDED
-    assert restarted_llm.calls == []
-    assert len(restarted_pipeline.calls) == 1
+    assert len(restarted_llm.calls) == 1
+    assert len(restarted_pipeline.calls) == 2
 
 
 def test_completed_rejection_cold_reopen_restores_feedback_once(
@@ -122,8 +126,11 @@ def test_completed_rejection_cold_reopen_restores_feedback_once(
     with pytest.raises(SimulatedCrash):
         harness.loop.resume(harness.task_id)
 
-    restarted_llm = ScriptedLLM([finish_json()])
-    harness.restart(restarted_llm, ScriptedPipeline([successful_report()]))
+    restarted_llm = ScriptedLLM([quality_json(), finish_json()])
+    harness.restart(
+        restarted_llm,
+        ScriptedPipeline([successful_report(), successful_report()]),
+    )
     result = harness.loop.resume(harness.task_id)
 
     assert result.status is TaskStatus.SUCCEEDED
@@ -147,14 +154,16 @@ def test_completed_verifier_report_cold_reopen_is_not_rerun(
     assert len(harness.dispatcher.actions) == 1
     assert len(harness.pipeline.calls) == 1
 
-    restarted_llm = ScriptedLLM([finish_json()])
-    restarted_pipeline = ScriptedPipeline([successful_report()])
+    restarted_llm = ScriptedLLM([quality_json(), finish_json()])
+    restarted_pipeline = ScriptedPipeline(
+        [successful_report(), successful_report()]
+    )
     harness.restart(restarted_llm, restarted_pipeline)
     result = harness.loop.resume(harness.task_id)
 
     assert result.status is TaskStatus.SUCCEEDED
     assert len(harness.dispatcher.actions) == 1
-    assert len(restarted_pipeline.calls) == 1
+    assert len(restarted_pipeline.calls) == 2
     assert "assertion" in restarted_llm.calls[0][-1].content
 
 
@@ -172,14 +181,16 @@ def test_approved_completed_verifier_cold_reopen_is_not_rerun(
     with pytest.raises(SimulatedCrash):
         harness.loop.resume(harness.task_id)
 
-    restarted_llm = ScriptedLLM([finish_json()])
-    restarted_pipeline = ScriptedPipeline([successful_report()])
+    restarted_llm = ScriptedLLM([quality_json(), finish_json()])
+    restarted_pipeline = ScriptedPipeline(
+        [successful_report(), successful_report()]
+    )
     harness.restart(restarted_llm, restarted_pipeline)
     result = harness.loop.resume(harness.task_id)
 
     assert result.status is TaskStatus.SUCCEEDED
     assert len(harness.dispatcher.actions) == 1
-    assert len(restarted_pipeline.calls) == 1
+    assert len(restarted_pipeline.calls) == 2
     assert "assertion" in restarted_llm.calls[0][-1].content
 
 
@@ -202,14 +213,16 @@ def test_approved_failed_report_persisted_before_completion_recovers_as_feedback
     with pytest.raises(SimulatedCrash):
         harness.loop.resume(harness.task_id)
 
-    restarted_llm = ScriptedLLM([finish_json()])
-    restarted_pipeline = ScriptedPipeline([successful_report()])
+    restarted_llm = ScriptedLLM([quality_json(), finish_json()])
+    restarted_pipeline = ScriptedPipeline(
+        [successful_report(), successful_report()]
+    )
     harness.restart(restarted_llm, restarted_pipeline)
     result = harness.loop.resume(harness.task_id)
 
     assert result.status is TaskStatus.SUCCEEDED
     assert len(harness.dispatcher.actions) == 1
-    assert len(restarted_pipeline.calls) == 1
+    assert len(restarted_pipeline.calls) == 2
     assert "assertion" in restarted_llm.calls[0][-1].content
 
 
@@ -269,8 +282,10 @@ def test_already_applied_recovery_atomically_consumes_dispatch_with_verifier(
     policy.allow_same_action = True
     harness.dispatcher.effect_already_matches = True
     harness.restart(
-        ScriptedLLM([action_json]),
-        ScriptedPipeline([failed_report(), successful_report()]),
+        ScriptedLLM([action_json, finish_json()]),
+        ScriptedPipeline(
+            [failed_report(), successful_report(), successful_report()]
+        ),
         policy=policy,
     )
 
@@ -284,7 +299,7 @@ def test_already_applied_recovery_atomically_consumes_dispatch_with_verifier(
     seeded = next(item for item in transitions if item.id == dispatch_intent.id)
     verifiers = [item for item in transitions if item.kind == "verifier"]
     assert seeded.consumed_at is not None
-    assert len(verifiers) == 2
+    assert len(verifiers) == 3
     assert seeded.consumed_at == verifiers[0].consumed_at
 
 
@@ -408,8 +423,8 @@ def test_recovery_drains_all_legacy_and_exact_snapshot_dispatches_atomically(
     assert policy is not None
     policy.allow_same_action = True
     harness.restart(
-        ScriptedLLM([raw_action]),
-        ScriptedPipeline([successful_report()]),
+        ScriptedLLM([raw_action, finish_json()]),
+        ScriptedPipeline([successful_report(), successful_report()]),
         policy=policy,
     )
 
@@ -548,8 +563,11 @@ def test_non_mutating_tool_feedback_survives_exact_dispatch_crash(
     with pytest.raises(SimulatedCrash):
         harness.loop.run(harness.task_id)
 
-    restarted_llm = ScriptedLLM([finish_json()])
-    harness.restart(restarted_llm, ScriptedPipeline([successful_report()]))
+    restarted_llm = ScriptedLLM([quality_json(), finish_json()])
+    harness.restart(
+        restarted_llm,
+        ScriptedPipeline([successful_report(), successful_report()]),
+    )
     result = harness.loop.resume(harness.task_id)
 
     assert result.status is TaskStatus.SUCCEEDED
@@ -582,8 +600,11 @@ def test_non_mutating_tool_feedback_survives_crash_after_iteration_commit(
     with pytest.raises(SimulatedCrash):
         harness.loop.run(harness.task_id)
 
-    restarted_llm = ScriptedLLM([finish_json()])
-    harness.restart(restarted_llm, ScriptedPipeline([successful_report()]))
+    restarted_llm = ScriptedLLM([quality_json(), finish_json()])
+    harness.restart(
+        restarted_llm,
+        ScriptedPipeline([successful_report(), successful_report()]),
+    )
     result = harness.loop.resume(harness.task_id)
 
     assert result.status is TaskStatus.SUCCEEDED
@@ -605,7 +626,8 @@ def test_cumulative_changed_paths_survive_cold_reopen(loop_fixture) -> None:
         harness.loop.run(harness.task_id)
 
     harness.restart(
-        ScriptedLLM([finish_json()]), ScriptedPipeline([successful_report()])
+        ScriptedLLM([quality_json(), finish_json()]),
+        ScriptedPipeline([successful_report(), successful_report()]),
     )
     result = harness.loop.resume(harness.task_id)
 
@@ -646,14 +668,14 @@ def test_two_independent_loops_cannot_enter_drive_for_same_task(loop_fixture) ->
             return super().complete(messages)
 
     harness = loop_fixture(responses=[], reports=[])
-    first_client = BlockingLLM([finish_json()])
+    first_client = BlockingLLM([quality_json(), finish_json()])
     second_repo = SQLiteTaskRepository(harness.db_path)
     second_client = ScriptedLLM([finish_json()])
     second_loop = AgentLoop(
         repository=second_repo,
         policy=PolicyEngine(harness.repo_root),
         dispatcher=RecordingDispatcher(),
-        pipeline=ScriptedPipeline([successful_report()]),
+        pipeline=ScriptedPipeline([successful_report(), successful_report()]),
         parser=ActionParser(),
         llm=second_client,
         context_builder=ContextBuilder(),
@@ -668,7 +690,7 @@ def test_two_independent_loops_cannot_enter_drive_for_same_task(loop_fixture) ->
             repository=SQLiteTaskRepository(harness.db_path),
             policy=PolicyEngine(harness.repo_root),
             dispatcher=RecordingDispatcher(),
-            pipeline=ScriptedPipeline([successful_report()]),
+            pipeline=ScriptedPipeline([successful_report(), successful_report()]),
             parser=ActionParser(),
             llm=first_client,
             context_builder=ContextBuilder(),

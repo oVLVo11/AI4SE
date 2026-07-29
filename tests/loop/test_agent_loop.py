@@ -13,6 +13,7 @@ from conftest import (
     failed_report,
     finish_json,
     ordinary_patch_json,
+    quality_json,
     successful_report,
 )
 
@@ -154,7 +155,10 @@ def test_green_and_finish_audit_events_are_bounded_and_path_free(loop_fixture) -
 
 
 def test_loop_adopts_service_lease_without_reacquiring(loop_fixture) -> None:
-    harness = loop_fixture(responses=[finish_json()], reports=[successful_report()])
+    harness = loop_fixture(
+        responses=[quality_json(), finish_json()],
+        reports=[successful_report(), successful_report()],
+    )
     assert harness.repository.set_status(
         harness.task_id, TaskStatus.CREATED, TaskStatus.RUNNING
     )
@@ -194,8 +198,8 @@ def test_waiting_transients_survive_and_terminal_resume_evicts_them(
     loop_fixture,
 ) -> None:
     harness = loop_fixture(
-        responses=[dependency_patch_json(), finish_json()],
-        reports=[successful_report(), successful_report()],
+        responses=[dependency_patch_json(), quality_json(), finish_json()],
+        reports=[successful_report(), successful_report(), successful_report()],
     )
     feedback = FeedbackPacket(
         findings=(),
@@ -256,7 +260,7 @@ def test_failed_patch_feedback_changes_next_action(loop_fixture) -> None:
     corrected_patch = ordinary_patch_json("2")
     harness = loop_fixture(
         responses=[bad_patch, corrected_patch, finish_json()],
-        reports=[failed_report(), failed_report(), successful_report()],
+        reports=[failed_report(), successful_report(), successful_report()],
     )
 
     result = harness.loop.run(harness.task_id)
@@ -345,14 +349,14 @@ def test_expired_deadline_stops_before_first_model_call(loop_fixture) -> None:
 
 def test_failed_finish_returns_feedback_and_verifies_again(loop_fixture) -> None:
     harness = loop_fixture(
-        responses=[finish_json(), finish_json()],
-        reports=[failed_report(), successful_report()],
+        responses=[quality_json(), quality_json(), finish_json()],
+        reports=[failed_report(), successful_report(), successful_report()],
     )
 
     result = harness.loop.run(harness.task_id)
 
     assert result.status is TaskStatus.SUCCEEDED
-    assert result.iterations == 2
+    assert result.iterations == 3
     assert "assertion" in harness.llm.calls[1][-1].content
 
 
@@ -367,31 +371,30 @@ def test_terminal_resume_is_idempotent_and_never_calls_model(loop_fixture) -> No
     assert len(harness.llm.calls) == calls
 
 
-def test_resume_recovers_persisted_passing_verifier_transition_without_model_call(
+def test_resume_recovers_persisted_passing_verifier_transition_before_finish(
     loop_fixture,
 ) -> None:
-    harness = loop_fixture(responses=[])
-    assert harness.repository.set_status(
-        harness.task_id, TaskStatus.CREATED, TaskStatus.RUNNING
-    ) is True
-    assert harness.repository.acquire_project_lease(
-        harness.task_id, owner_token="seed-owner"
-    ) is True
-    harness.repository.append_iteration(
-        harness.task_id,
-        sequence=1,
-        context_digest="a" * 64,
-        quality_outcome="passed",
+    class CrashAfterGreen(BaseException):
+        pass
+
+    class CrashingClient(ScriptedLLM):
+        def complete(self, messages):
+            if self.calls:
+                raise CrashAfterGreen
+            return super().complete(messages)
+
+    harness = loop_fixture(
+        llm=CrashingClient([quality_json()]), reports=[successful_report()]
     )
-    harness.repository.release_project_lease(
-        harness.task_id, owner_token="seed-owner"
-    )
+    with pytest.raises(CrashAfterGreen):
+        harness.loop.run(harness.task_id)
+    harness.restart(ScriptedLLM([finish_json()]), type(harness.pipeline)([successful_report()]))
 
     result = harness.loop.resume(harness.task_id)
 
     assert result.status is TaskStatus.SUCCEEDED
-    assert result.iterations == 1
-    assert harness.llm.calls == []
+    assert result.iterations == 2
+    assert len(harness.llm.calls) == 1
 
 
 def test_audit_metadata_contains_digests_not_full_model_content(loop_fixture) -> None:
@@ -421,7 +424,7 @@ def test_repeated_failure_without_relevant_change_stalls(loop_fixture) -> None:
 
 def test_missing_verifier_blocks_after_persisting_the_model_round(loop_fixture) -> None:
     harness = loop_fixture(
-        responses=[finish_json()],
+        responses=[quality_json()],
         reports=[FileNotFoundError("pytest missing")],
     )
 
@@ -463,9 +466,10 @@ def test_provider_internal_retries_remain_one_persisted_model_round(loop_fixture
         attempts.append(request)
         if len(attempts) < 3:
             raise httpx.ConnectError("temporary failure", request=request)
+        content = quality_json() if len(attempts) == 3 else finish_json()
         return httpx.Response(
             200,
-            json={"choices": [{"message": {"content": finish_json()}}]},
+            json={"choices": [{"message": {"content": content}}]},
         )
 
     client = OpenAICompatibleLLM(
@@ -477,14 +481,14 @@ def test_provider_internal_retries_remain_one_persisted_model_round(loop_fixture
     )
     harness = loop_fixture(
         llm=client,
-        reports=[successful_report()],
+        reports=[successful_report(), successful_report()],
     )
 
     result = harness.loop.run(harness.task_id)
 
     assert result.status is TaskStatus.SUCCEEDED
-    assert result.iterations == 1
-    assert len(attempts) == 3
+    assert result.iterations == 2
+    assert len(attempts) == 4
 
 
 def test_deletion_changes_relevant_digest_and_avoids_false_stall(loop_fixture) -> None:
@@ -506,7 +510,7 @@ def test_deletion_changes_relevant_digest_and_avoids_false_stall(loop_fixture) -
     )
     harness = loop_fixture(
         responses=[ordinary_patch_json("1"), ordinary_patch_json("2"), finish_json()],
-        reports=[failed_report(), failed_report(), successful_report()],
+        reports=[failed_report(), successful_report(), successful_report()],
         dispatch_results=[changed, deleted],
     )
 
