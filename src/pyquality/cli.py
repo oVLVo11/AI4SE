@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import json
 from collections.abc import Callable, Sequence
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Protocol
 
 import uvicorn
@@ -37,7 +39,8 @@ def _parser() -> argparse.ArgumentParser:
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", default=8000, type=int)
     serve.add_argument("--repo", type=Path, default=Path.cwd())
-    commands.add_parser("demo")
+    demo = commands.add_parser("demo")
+    demo.add_argument("--json", action="store_true", dest="as_json")
     credential = commands.add_parser("credential")
     credential_commands = credential.add_subparsers(
         dest="credential_command", required=True
@@ -108,9 +111,18 @@ def main(
         result = service.start_task(task.id).result()
         print(result.model_dump_json())
         return 0 if result.status.value == "succeeded" else 1
-    if demo_runner is None:
-        raise RuntimeError("demo is not available until the deterministic demo is configured")
-    return demo_runner()
+    if demo_runner is not None:
+        return demo_runner()
+    from .demo import DemoError, run_demo
+
+    try:
+        with TemporaryDirectory(prefix="pyquality-demo-cli-") as directory:
+            report = run_demo(Path(directory))
+    except DemoError as error:
+        print(json.dumps({"error": str(error)}, sort_keys=True))
+        return 1
+    print(report.model_dump_json() if args.as_json else "deterministic demo succeeded")
+    return 0
 
 
 if __name__ == "__main__":
