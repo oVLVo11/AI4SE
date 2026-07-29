@@ -100,6 +100,59 @@ def test_repository_drift_rejects_stale_finish_until_quality_runs_again(
     ] == ["apply_patch", "finish", "run_quality", "finish"]
 
 
+def test_green_candidate_survives_crash_and_resume_consumes_finish(loop_fixture) -> None:
+    """Keeping the candidate only in loop memory would strand a verified task after restart."""
+
+    class PlannedCrash(BaseException):
+        pass
+
+    class CrashAfterGreen(ScriptedLLM):
+        def complete(self, messages):
+            if self.calls:
+                raise PlannedCrash
+            return super().complete(messages)
+
+    harness = loop_fixture(
+        llm=CrashAfterGreen([ordinary_patch_json("1")]),
+        reports=[successful_report()],
+    )
+    with pytest.raises(PlannedCrash):
+        harness.loop.run(harness.task_id)
+    candidate = harness.repository.green_candidate(harness.task_id)
+    assert candidate is not None
+
+    resumed = ScriptedLLM([finish_json()])
+    harness.restart(resumed, type(harness.pipeline)([successful_report()]))
+    result = harness.loop.resume(harness.task_id)
+
+    assert result.status is TaskStatus.SUCCEEDED
+    assert "quality is green" in resumed.calls[0][-1].content.casefold()
+    assert harness.repository.green_candidate(harness.task_id) is None
+
+
+def test_green_and_finish_audit_events_are_bounded_and_path_free(loop_fixture) -> None:
+    """Candidate telemetry must not expose repository paths or raw verifier output."""
+    harness = loop_fixture(
+        responses=[ordinary_patch_json("1"), finish_json()],
+        reports=[successful_report(), successful_report()],
+    )
+
+    assert harness.loop.run(harness.task_id).status is TaskStatus.SUCCEEDED
+
+    events = [
+        event
+        for event in harness.audit.events
+        if event.event_type in {"quality_candidate_ready", "finish_verification"}
+    ]
+    assert [event.event_type for event in events] == [
+        "quality_candidate_ready",
+        "finish_verification",
+    ]
+    encoded = "".join(event.model_dump_json() for event in events)
+    assert str(harness.repo_root) not in encoded
+    assert "assert 0 == 1" not in encoded
+
+
 def test_loop_adopts_service_lease_without_reacquiring(loop_fixture) -> None:
     harness = loop_fixture(responses=[finish_json()], reports=[successful_report()])
     assert harness.repository.set_status(

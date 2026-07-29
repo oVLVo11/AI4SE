@@ -1196,13 +1196,18 @@ class AgentLoop:
         )
         feedback = self._feedback.get(snapshot.task.id)
         if feedback is None:
+            candidate = self._repository.green_candidate(snapshot.task.id)
+            if candidate is not None:
+                feedback = _text_feedback(
+                    "Quality is green. Full pytest and Ruff passed; finish is permitted."
+                )
             latest = snapshot.iterations[-1].id if snapshot.iterations else None
             findings = tuple(
                 record.finding for record in snapshot.findings if record.iteration_id == latest
             )
-            if findings:
+            if feedback is None and findings:
                 feedback = self._compose(findings)
-            elif snapshot.iterations:
+            elif feedback is None and snapshot.iterations:
                 tool_digest = snapshot.iterations[-1].tool_result_digest
                 recovered_tool = next(
                     (
