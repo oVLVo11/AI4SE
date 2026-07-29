@@ -118,8 +118,13 @@ def main(
     try:
         with TemporaryDirectory(prefix="pyquality-demo-cli-") as directory:
             report = run_demo(Path(directory))
-    except DemoError as error:
-        print(json.dumps({"error": str(error)}, sort_keys=True))
+    except BaseException as error:  # noqa: BLE001 - sanitize the complete CLI lifecycle.
+        message = (
+            str(error)
+            if isinstance(error, DemoError)
+            else f"deterministic demo failed: {type(error).__name__}"
+        )
+        print(json.dumps({"error": message}, sort_keys=True))
         return 1
     print(report.model_dump_json() if args.as_json else "deterministic demo succeeded")
     return 0

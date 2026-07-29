@@ -6,6 +6,7 @@ import hashlib
 import json
 import sys
 from datetime import UTC, datetime
+from importlib import resources
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -22,22 +23,6 @@ from .service import HarnessService
 from .storage.sqlite import SQLiteTaskRepository
 from .tools import SubprocessRunner, ToolDispatcher
 from .validators import QualityPipeline
-
-_CALCULATOR = """def add(left: int, right: int) -> int:
-    return left - right
-"""
-_TEST = """from calculator import add
-
-
-def test_adds_two_numbers() -> None:
-    assert add(2, 3) == 5
-"""
-_PROJECT = """[tool.pytest.ini_options]
-testpaths = ["tests"]
-
-[tool.ruff]
-target-version = "py312"
-"""
 
 
 class DeniedActionEvidence(PublicModel):
@@ -125,14 +110,32 @@ def _patch(before: str, after: str) -> str:
 
 
 def _write_fixture(root: Path) -> None:
+    fixture = resources.files("pyquality.demo_fixture")
     (root / "tests").mkdir(parents=True)
-    (root / "calculator.py").write_text(_CALCULATOR, encoding="utf-8")
-    (root / "tests" / "test_calculator.py").write_text(_TEST, encoding="utf-8")
-    (root / "pyproject.toml").write_text(_PROJECT, encoding="utf-8")
+    (root / "calculator.py").write_text(
+        fixture.joinpath("calculator.py").read_text(encoding="utf-8"), encoding="utf-8"
+    )
+    (root / "tests" / "test_calculator.py").write_text(
+        fixture.joinpath("test_calculator.py").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    (root / "pyproject.toml").write_text(
+        fixture.joinpath("pyproject.toml").read_text(encoding="utf-8"), encoding="utf-8"
+    )
 
 
 def run_demo(work_dir: Path) -> DemoReport:
     """Run the fixed offline scenario and return path/timestamp-free evidence."""
+    try:
+        return _run_demo(Path(work_dir))
+    except DemoError:
+        raise
+    except BaseException as error:  # noqa: BLE001 - sanitize the complete demo lifecycle.
+        raise DemoError(f"deterministic demo failed: {type(error).__name__}") from None
+
+
+def _run_demo(work_dir: Path) -> DemoReport:
+    """Compose and execute the demo inside the sanitized public boundary."""
     base = Path(work_dir)
     base.mkdir(parents=True, exist_ok=True)
     with TemporaryDirectory(prefix="pyquality-demo-", dir=base) as temporary:
@@ -194,6 +197,16 @@ def run_demo(work_dir: Path) -> DemoReport:
             for item in snapshot.iterations
             if item.action_json is not None
         )
+        persisted_actions = [
+            json.loads(item.action_json)
+            for item in snapshot.iterations
+            if item.action_json is not None
+        ]
+        persisted_patches = [
+            action["arguments"]["patch"]
+            for action in persisted_actions
+            if action["kind"] == "apply_patch"
+        ]
         events = tuple(
             MechanismEvent(
                 action=json.loads(item.action_json)["kind"],
@@ -226,14 +239,18 @@ def run_demo(work_dir: Path) -> DemoReport:
         )
         return DemoReport(
             denied_action=DeniedActionEvidence(
-                attempted=True,
+                attempted=any(action["kind"] == "read_file" for action in persisted_actions),
                 dispatch_count=sum(action == "read_file" for action in dispatcher.actions),
             ),
             action_order=action_order,
             first_failure_category=findings[0].category,
             model_saw_first_failure=model_saw_feedback,
-            first_patch_digest=hashlib.sha256(first_patch.encode("utf-8")).hexdigest(),
-            second_patch_digest=hashlib.sha256(second_patch.encode("utf-8")).hexdigest(),
+            first_patch_digest=hashlib.sha256(
+                persisted_patches[0].encode("utf-8")
+            ).hexdigest(),
+            second_patch_digest=hashlib.sha256(
+                persisted_patches[1].encode("utf-8")
+            ).hexdigest(),
             first_fingerprint=fingerprints[0],
             second_fingerprint=fingerprints[1],
             normalized_events=events,
