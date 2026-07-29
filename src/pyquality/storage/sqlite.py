@@ -15,7 +15,7 @@ from tempfile import TemporaryDirectory
 from threading import RLock
 from typing import Literal
 
-from pydantic import ConfigDict
+from pydantic import ConfigDict, Field, model_validator
 
 from pyquality.domain.models import (
     MAX_ACTION_ARGUMENTS_BYTES,
@@ -59,6 +59,35 @@ class TaskRecord(_StorageRecord):
     round_limit: int
     deadline: datetime | None
     result: TaskResult | None
+
+
+class GreenCandidate(_StorageRecord):
+    """Bounded durable evidence that the latest repository state verified green."""
+
+    task_id: str = Field(min_length=1)
+    iteration: int = Field(ge=1)
+    report_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    repository_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    summary: str = Field(min_length=1)
+    changed_paths: tuple[str, ...] = ()
+
+    @model_validator(mode="after")
+    def validate_bounded_evidence(self) -> GreenCandidate:
+        if len(self.summary.encode("utf-8")) > 1_024:
+            raise ValueError("summary exceeds 1024 UTF-8 bytes")
+        for value in self.changed_paths:
+            path = PurePosixPath(value)
+            if (
+                not value
+                or "\\" in value
+                or path.is_absolute()
+                or ".." in path.parts
+                or re.match(r"^[A-Za-z]:", value) is not None
+            ):
+                raise ValueError("changed paths must be repository-relative POSIX text")
+            if len(value.encode("utf-8")) > MAX_CONFIG_PATTERN_BYTES:
+                raise ValueError("changed path exceeds configured bound")
+        return self
 
 
 class IterationRecord(_StorageRecord):
@@ -466,12 +495,64 @@ class SQLiteTaskRepository:
                 )
                 release_local = owner_token is not None
             if new in _TERMINAL_STATUSES:
+                connection.execute(
+                    "DELETE FROM green_candidates WHERE task_id = ?", (task_id,)
+                )
                 self._release_or_transfer_project_reservation(
                     connection, task_id
                 )
         if release_local:
             self._release_local_lease(owner_token)
         return True
+
+    def save_green_candidate(self, candidate: GreenCandidate) -> None:
+        """Atomically replace the bounded green evidence for one task."""
+        with self._transaction() as connection:
+            self._require_task(connection, candidate.task_id)
+            connection.execute(
+                """INSERT INTO green_candidates
+                   (task_id, iteration, report_digest, repository_digest, summary,
+                    changed_paths_json)
+                   VALUES (?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(task_id) DO UPDATE SET
+                     iteration = excluded.iteration,
+                     report_digest = excluded.report_digest,
+                     repository_digest = excluded.repository_digest,
+                     summary = excluded.summary,
+                     changed_paths_json = excluded.changed_paths_json""",
+                (
+                    candidate.task_id,
+                    candidate.iteration,
+                    candidate.report_digest,
+                    candidate.repository_digest,
+                    candidate.summary,
+                    _canonical_json(candidate.changed_paths),
+                ),
+            )
+
+    def green_candidate(self, task_id: str) -> GreenCandidate | None:
+        with self._read_transaction() as connection:
+            self._require_task(connection, task_id)
+            row = connection.execute(
+                "SELECT * FROM green_candidates WHERE task_id = ?", (task_id,)
+            ).fetchone()
+        if row is None:
+            return None
+        return GreenCandidate(
+            task_id=row["task_id"],
+            iteration=row["iteration"],
+            report_digest=row["report_digest"],
+            repository_digest=row["repository_digest"],
+            summary=row["summary"],
+            changed_paths=tuple(json.loads(row["changed_paths_json"])),
+        )
+
+    def clear_green_candidate(self, task_id: str) -> None:
+        with self._transaction() as connection:
+            self._require_task(connection, task_id)
+            connection.execute(
+                "DELETE FROM green_candidates WHERE task_id = ?", (task_id,)
+            )
 
     def complete_iteration_outcome(
         self,
@@ -1705,6 +1786,14 @@ class SQLiteTaskRepository:
                 created_at TEXT NOT NULL,
                 completed_at TEXT,
                 consumed_at TEXT
+            );
+            CREATE TABLE IF NOT EXISTS green_candidates (
+                task_id TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
+                iteration INTEGER NOT NULL,
+                report_digest TEXT NOT NULL,
+                repository_digest TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                changed_paths_json TEXT NOT NULL
             );
             """
         )

@@ -16,12 +16,103 @@ from pyquality.domain.models import (
     TaskStatus,
 )
 from pyquality.storage.sqlite import (
+    GreenCandidate,
     LeaseRecoveryBlocked,
     ProjectReservationError,
     SQLiteTaskRepository,
     StorageStateError,
     TaskCreationConflictError,
 )
+
+
+def _candidate(task_id: str, *, iteration: int = 1, suffix: str = "a") -> GreenCandidate:
+    return GreenCandidate(
+        task_id=task_id,
+        iteration=iteration,
+        report_digest=suffix * 64,
+        repository_digest=("b" if suffix == "a" else "c") * 64,
+        summary="Full pytest and Ruff passed.",
+        changed_paths=("calculator.py",),
+    )
+
+
+def test_green_candidate_save_read_replace_clear_and_task_isolation(
+    repo: SQLiteTaskRepository,
+) -> None:
+    """A process-only or append-only candidate could finish the wrong verification state."""
+    first = repo.create_task("C:/work/green-one", "fix", round_limit=8)
+    second = repo.create_task("C:/work/green-two", "fix", round_limit=8)
+
+    repo.save_green_candidate(_candidate(first.id))
+    assert repo.green_candidate(first.id) == _candidate(first.id)
+    assert repo.green_candidate(second.id) is None
+
+    replacement = _candidate(first.id, iteration=2, suffix="d")
+    repo.save_green_candidate(replacement)
+    assert repo.green_candidate(first.id) == replacement
+    repo.clear_green_candidate(first.id)
+    assert repo.green_candidate(first.id) is None
+
+
+def test_green_candidate_survives_repository_reopen(tmp_path: Path) -> None:
+    """Losing green evidence on close would make crash recovery unable to finish."""
+    database = tmp_path / "green.sqlite"
+    first = SQLiteTaskRepository(database)
+    task = first.create_task("C:/work/green-reopen", "fix", round_limit=8)
+    first.save_green_candidate(_candidate(task.id))
+    first.close()
+
+    reopened = SQLiteTaskRepository(database)
+    try:
+        assert reopened.green_candidate(task.id) == _candidate(task.id)
+    finally:
+        reopened.close()
+
+
+def test_green_candidate_rejects_unbounded_or_absolute_public_fields() -> None:
+    """Persisting raw verifier output or host paths would violate the bounded evidence contract."""
+    with pytest.raises(ValueError, match="summary"):
+        GreenCandidate(
+            task_id="task",
+            iteration=1,
+            report_digest="a" * 64,
+            repository_digest="b" * 64,
+            summary="x" * 1025,
+        )
+    with pytest.raises(ValueError, match="relative"):
+        GreenCandidate(
+            task_id="task",
+            iteration=1,
+            report_digest="a" * 64,
+            repository_digest="b" * 64,
+            summary="passed",
+            changed_paths=("C:/private/calculator.py",),
+        )
+
+
+def test_terminal_transition_clears_green_candidate_transactionally(
+    repo: SQLiteTaskRepository,
+) -> None:
+    """Terminal tasks retaining consumable candidates could replay stale success evidence."""
+    task = repo.create_task("C:/work/green-terminal", "fix", round_limit=8)
+    _start(repo, task.id)
+    assert repo.acquire_project_lease(task.id, owner_token=OWNER_A)
+    repo.save_green_candidate(_candidate(task.id))
+    result = TaskResult(
+        task_id=task.id,
+        status=TaskStatus.SUCCEEDED,
+        iterations=1,
+        verification_summary="passed",
+    )
+
+    assert repo.set_status(
+        task.id,
+        TaskStatus.RUNNING,
+        TaskStatus.SUCCEEDED,
+        result,
+        owner_token=OWNER_A,
+    )
+    assert repo.green_candidate(task.id) is None
 
 
 @pytest.fixture
