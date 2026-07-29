@@ -1872,6 +1872,7 @@ def _load_completed_r4_v1_migration_state(
     if size == 0 or size > _R4_MIGRATION_V1_SLOT.size * 2:
         raise AuditRecoveryRequired
     candidates: list[_R4MigrationState] = []
+    future_format = False
     for slot in range(2):
         encoded = _read_at(
             descriptor, slot * _R4_MIGRATION_V1_SLOT.size, _R4_MIGRATION_V1_SLOT.size
@@ -1889,6 +1890,8 @@ def _load_completed_r4_v1_migration_state(
             completed,
             digest,
         ) = _R4_MIGRATION_V1_SLOT.unpack(encoded)
+        if magic.startswith(b"PQAMIG") and magic != _R4_MIGRATION_V1_MAGIC:
+            future_format = True
         identity_bytes = encoded_identity.rstrip(b"\0")
         try:
             decoded_identity = identity_bytes.decode("ascii")
@@ -1930,7 +1933,7 @@ def _load_completed_r4_v1_migration_state(
                     "",
                 )
             )
-    if not candidates:
+    if future_format or not candidates:
         raise AuditRecoveryRequired
     return max(candidates, key=lambda state: state.generation)
 
@@ -2575,11 +2578,43 @@ def _migrate_released_r4_audit_index(
     source_identity = _audit_stream_identity(audit_descriptor)
     audit_size = os.lseek(audit_descriptor, 0, os.SEEK_END)
     marker_path = index_root / "migration"
+    upgrade_path = index_root / "migration-v2"
     marker_descriptor = _open_existing_migration_target(marker_path)
+    upgrade_descriptor = _open_existing_migration_target(upgrade_path)
     state: _R4MigrationState | None = None
     torn_marker = False
+    torn_upgrade = False
     legacy_completed_marker = False
     try:
+        if upgrade_descriptor is not None:
+            try:
+                upgrade_state = _load_r4_migration_state(
+                    upgrade_descriptor,
+                    source_identity=source_identity,
+                    audit_size=audit_size,
+                )
+            except AuditRecoveryRequired:
+                torn_upgrade = True
+                upgrade_state = None
+            if upgrade_state is None:
+                pass
+            elif not upgrade_state.completed:
+                raise AuditRecoveryRequired
+            else:
+                _verify_target_migration_checkpoint(index_root, upgrade_state, audit_size)
+                if marker_descriptor is None:
+                    marker_descriptor = _open_audit(marker_path, append=False)
+                _store_r4_migration_state(
+                    marker_descriptor,
+                    None,
+                    source_identity=source_identity,
+                    next_cursor=upgrade_state.receipt_count,
+                    receipt_count=upgrade_state.receipt_count,
+                    indexed_size=upgrade_state.indexed_size,
+                    completed=True,
+                    source_root=Path(upgrade_state.source_root),
+                )
+                return
         if marker_descriptor is not None:
             try:
                 state = _load_r4_migration_state(
@@ -2609,13 +2644,43 @@ def _migrate_released_r4_audit_index(
                         audit_path.absolute().parent
                         / f".pyquality-audit-index-{source_identity}"
                     )
-                    _store_r4_migration_state(
-                        marker_descriptor,
+                    if torn_upgrade and upgrade_descriptor is not None:
+                        expected_upgrade = _encode_r4_migration_state(
+                            1,
+                            source_identity=source_identity,
+                            next_cursor=state.receipt_count,
+                            receipt_count=state.receipt_count,
+                            indexed_size=state.indexed_size,
+                            completed=True,
+                            source_root=source_root,
+                        )
+                        if not _exact_torn_prefix(
+                            upgrade_descriptor, 0, expected_upgrade
+                        ):
+                            raise AuditRecoveryRequired
+                        _remove_open_audit(upgrade_path, upgrade_descriptor)
+                        os.close(upgrade_descriptor)
+                        upgrade_descriptor = None
+                    if upgrade_descriptor is None:
+                        upgrade_descriptor = _open_audit(upgrade_path, append=False)
+                    upgrade_state = _store_r4_migration_state(
+                        upgrade_descriptor,
                         None,
                         source_identity=source_identity,
                         next_cursor=state.receipt_count,
                         receipt_count=state.receipt_count,
                         indexed_size=state.indexed_size,
+                        completed=True,
+                        source_root=source_root,
+                    )
+                    _sync_audit_directory_chain(index_root, index_root)
+                    _store_r4_migration_state(
+                        marker_descriptor,
+                        None,
+                        source_identity=source_identity,
+                        next_cursor=upgrade_state.receipt_count,
+                        receipt_count=upgrade_state.receipt_count,
+                        indexed_size=upgrade_state.indexed_size,
                         completed=True,
                         source_root=source_root,
                     )
@@ -2709,6 +2774,8 @@ def _migrate_released_r4_audit_index(
     finally:
         if marker_descriptor is not None:
             os.close(marker_descriptor)
+        if upgrade_descriptor is not None:
+            os.close(upgrade_descriptor)
 
 
 if os.name == "nt":
@@ -2750,7 +2817,6 @@ if os.name == "nt":
     _TOKEN_QUERY = 0x00000008
     _TOKEN_USER = 1
     _TOKEN_GROUPS = 2
-    _TOKEN_RESTRICTED_SIDS = 11
     _TOKEN_OWNER = 4
     _ERROR_INSUFFICIENT_BUFFER = 122
     _SE_FILE_OBJECT = 1
@@ -2767,6 +2833,12 @@ if os.name == "nt":
     _SHARING_VIOLATION = 32
     _EXCLUSIVE_OPEN_TIMEOUT_SECONDS = 2.0
     _EXCLUSIVE_OPEN_RETRY_SECONDS = 0.01
+
+    def _windows_group_attributes_allow_trust(attributes: int) -> bool:
+        return bool(attributes & 0x4) and not bool(attributes & 0x10)
+
+    def _windows_parent_ace_can_propagate(flags: int) -> bool:
+        return flags & 0x3 == 0x3 and not bool(flags & 0x4)
 
     class _UnicodeString(ctypes.Structure):
         _fields_ = [
@@ -3661,28 +3733,17 @@ if os.name == "nt":
             ).contents
             first_group = ctypes.addressof(groups) + _TokenGroups.Groups.offset
             group_sids = tuple(
-                ctypes.cast(
+                entry.Sid
+                for index in range(groups.GroupCount)
+                if (
+                    _windows_group_attributes_allow_trust((entry := ctypes.cast(
                     first_group + index * ctypes.sizeof(_SidAndAttributes),
                     ctypes.POINTER(_SidAndAttributes),
-                ).contents.Sid
-                for index in range(groups.GroupCount)
-            )
-            restricted_buffer = query(_TOKEN_RESTRICTED_SIDS)
-            restricted = ctypes.cast(
-                restricted_buffer, ctypes.POINTER(_TokenGroups)
-            ).contents
-            first_restricted = (
-                ctypes.addressof(restricted) + _TokenGroups.Groups.offset
-            )
-            restricted_sids = tuple(
-                ctypes.cast(
-                    first_restricted + index * ctypes.sizeof(_SidAndAttributes),
-                    ctypes.POINTER(_SidAndAttributes),
-                ).contents.Sid
-                for index in range(restricted.GroupCount)
+                    ).contents).Attributes)
+                )
             )
             yield (wintypes.LPVOID(user.User.Sid),) + tuple(
-                wintypes.LPVOID(sid) for sid in group_sids + restricted_sids
+                wintypes.LPVOID(sid) for sid in group_sids
             )
         finally:
             del buffers
@@ -3802,6 +3863,9 @@ if os.name == "nt":
                         if (
                             parent_ace.AceType == ace.AceType
                             and parent_ace.Mask == ace.Mask
+                            and _windows_parent_ace_can_propagate(
+                                parent_ace.AceFlags
+                            )
                             and _equal_sid(parent_sid, ace_sid)
                         ):
                             inherited_from_parent = True

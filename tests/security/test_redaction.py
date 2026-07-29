@@ -1956,8 +1956,13 @@ def test_completed_r4_marker_allows_live_checkpoint_to_advance(
     ]
 
 
+@pytest.mark.parametrize(
+    "scenario", ["torn_upgrade", "torn_sidecar", "mixed_future"]
+)
 def test_completed_pqamig1_marker_replays_and_upgrades_in_place(
     r4_tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    scenario: str,
 ) -> None:
     """A committed marker from 63b08cf remains authoritative after the format upgrade."""
     from pyquality import security
@@ -2009,9 +2014,51 @@ def test_completed_pqamig1_marker_replays_and_upgrades_in_place(
     finally:
         os.close(descriptor)
 
+    if scenario == "mixed_future":
+        future_payload = b"PQAMIG9\0" + legacy_payload[8:]
+        _write_secure_test_file(marker_path, [(0, legacy_payload), (legacy_slot.size, future_payload)])
+        with pytest.raises(security.AuditRecoveryRequired):
+            AuditLogger(path, index_root=index_base).emit(events[-1])
+        return
+
+    real_write = security._write_all
+    v2_writes = 0
+
+    def tear_main_upgrade(descriptor: int, payload: bytes) -> None:
+        nonlocal v2_writes
+        if payload.startswith(security._R4_MIGRATION_MAGIC):
+            v2_writes += 1
+            target_write = 1 if scenario == "torn_sidecar" else 2
+            if v2_writes == target_write:
+                real_write(descriptor, payload[: len(payload) // 2])
+                os.fsync(descriptor)
+                raise OSError("simulated torn main-marker upgrade")
+        real_write(descriptor, payload)
+
+    with monkeypatch.context() as fault:
+        fault.setattr(security, "_write_all", tear_main_upgrade)
+        with pytest.raises(AuditWriteError):
+            AuditLogger(path, index_root=index_base).emit(events[-1])
+
     AuditLogger(path, index_root=index_base).emit(events[-1])
 
     assert marker_path.read_bytes().startswith(security._R4_MIGRATION_MAGIC)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows token ACL semantics")
+@pytest.mark.parametrize("attributes", [0, 0x10])
+def test_disabled_or_deny_only_token_group_is_not_acl_trusted(attributes: int) -> None:
+    from pyquality import security
+
+    assert not security._windows_group_attributes_allow_trust(attributes)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows inherited ACL semantics")
+@pytest.mark.parametrize("flags", [0, 0x1, 0x2, 0x7])
+def test_parent_ace_must_propagate_to_bless_inherited_child(flags: int) -> None:
+    from pyquality import security
+
+    assert not security._windows_parent_ace_can_propagate(flags)
 
 
 def test_completed_r4_marker_allows_pending_r5_recovery(
