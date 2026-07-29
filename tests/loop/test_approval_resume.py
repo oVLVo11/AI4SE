@@ -44,7 +44,7 @@ def test_service_approval_decision_resumes_real_loop_to_terminal(
     )
     harness = loop_fixture(
         responses=[dependency_patch_json(), *continuation],
-        reports=[successful_report(), successful_report()],
+        reports=[successful_report(), successful_report(), successful_report()],
     )
     service = HarnessService(
         repository=harness.repository,
@@ -366,7 +366,7 @@ def test_approval_pauses_and_executes_once(loop_fixture) -> None:
     action = dependency_patch_json()
     harness = loop_fixture(
         responses=[action, finish_json()],
-        reports=[successful_report(), successful_report()],
+        reports=[successful_report(), successful_report(), successful_report()],
     )
 
     assert harness.loop.run(harness.task_id).status is TaskStatus.WAITING_APPROVAL
@@ -717,6 +717,31 @@ def test_passing_approved_verification_crash_recovers_candidate_then_finishes(
     assert snapshot.decided_approval.execution_state == "completed"
     assert harness.repository.green_candidate(harness.task_id) is not None
     monkeypatch.setattr(harness.repository, "complete_iteration_outcome", complete)
+
+    harness.repository._connection.execute(
+        "DELETE FROM green_candidates WHERE task_id = ?", (harness.task_id,)
+    )
+    harness.repository._connection.execute(
+        "UPDATE approvals SET execution_state = 'intent_recorded' WHERE id = ?",
+        (approval.id,),
+    )
+    harness.repository._connection.commit()
+    class CrashBeforeFinish(ScriptedLLM):
+        def complete(self, messages):
+            raise CrashAfterApprovedPass
+
+    harness.llm = CrashBeforeFinish([])
+    harness.loop._llm = harness.llm
+    with pytest.raises(CrashAfterApprovedPass):
+        harness.loop.resume(harness.task_id)
+    candidate = harness.repository.green_candidate(harness.task_id)
+    assert candidate is not None
+    from pyquality.loop import _digest_model
+
+    assert candidate.report_digest == _digest_model(successful_report())
+    assert candidate.report_digest != snapshot.iterations[0].tool_result_digest
+    harness.llm = ScriptedLLM([finish_json()])
+    harness.loop._llm = harness.llm
 
     result = harness.loop.resume(harness.task_id)
 

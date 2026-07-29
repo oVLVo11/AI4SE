@@ -84,3 +84,15 @@ the packaged resources, installed into a clean target, and ran `demo --json` out
 source checkout. A dedicated 360-byte post-green context regression also proves truncation
 and absolute-path exclusion. Final round-1 verification collected 492 tests: 484 passed and
 8 skipped. Ruff and cumulative diff-check passed.
+
+## R2 evidence correction chronology
+
+The atomic-finish implementation preceded two dedicated regression tests, so this is
+recorded as a transparent post-implementation evidence correction, not original TDD.
+The same three tests were run in an isolated detached worktree at `22ddadd` with its
+`src` directory explicitly first on `PYTHONPATH`: all three failed behaviorally
+(stale candidate cleared before round persistence, late report committed before
+terminal cleanup, and approved candidate bound to the tool/approval digest rather
+than the actual `QualityReport` digest). On the corrected branch the exact three
+tests passed. Fresh final verification reported 487 passed, 8 environment skips;
+Ruff and `git diff --check` passed.

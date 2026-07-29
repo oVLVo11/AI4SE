@@ -104,6 +104,35 @@ def test_repository_drift_rejects_stale_finish_until_quality_runs_again(
     ] == ["apply_patch", "finish", "run_quality", "finish"]
 
 
+def test_stale_finish_rejection_crash_keeps_candidate_and_iteration_atomic(
+    loop_fixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A crash persisting stale-finish feedback cannot split candidate cleanup from its round."""
+    class PersistCrash(BaseException):
+        pass
+
+    class DriftingLLM(ScriptedLLM):
+        def complete(self, messages):
+            if len(self.calls) == 1:
+                (harness.repo_root / "drift.txt").write_text("drift\n", encoding="utf-8")
+                monkeypatch.setattr(
+                    harness.repository,
+                    "append_iteration",
+                    lambda *args, **kwargs: (_ for _ in ()).throw(PersistCrash()),
+                )
+            return super().complete(messages)
+
+    harness = loop_fixture(
+        llm=DriftingLLM([ordinary_patch_json("1"), finish_json()]),
+        reports=[successful_report()],
+    )
+    with pytest.raises(PersistCrash):
+        harness.loop.run(harness.task_id)
+
+    assert len(harness.repository.resume_snapshot(harness.task_id).iterations) == 1
+    assert harness.repository.green_candidate(harness.task_id) is not None
+
+
 def test_green_candidate_survives_crash_and_resume_consumes_finish(loop_fixture) -> None:
     """Keeping the candidate only in loop memory would strand a verified task after restart."""
 
@@ -234,6 +263,43 @@ def test_finish_rechecks_deadline_after_final_verifier(loop_fixture) -> None:
     result = harness.loop.run(harness.task_id)
 
     assert result.status is TaskStatus.BUDGET_EXHAUSTED
+
+
+def test_late_finish_terminal_crash_rolls_back_report_candidate_and_status(
+    loop_fixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Late verifier evidence, candidate cleanup, and budget terminalization are one commit."""
+    clock = FixedClock(NOW)
+
+    class AdvancingPipeline:
+        def __init__(self) -> None:
+            self.calls = []
+
+        def run(self, changed_paths):
+            self.calls.append(changed_paths)
+            if len(self.calls) == 2:
+                clock.value = NOW + timedelta(seconds=2)
+            return successful_report()
+
+    harness = loop_fixture(
+        responses=[quality_json(), finish_json()], reports=[], clock=clock,
+        deadline=NOW + timedelta(seconds=1),
+    )
+    harness.pipeline = AdvancingPipeline()
+    harness.loop._pipeline = harness.pipeline
+    monkeypatch.setattr(
+        harness.repository,
+        "_release_or_transfer_project_reservation",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("terminal crash")),
+    )
+
+    with pytest.raises(RuntimeError, match="terminal crash"):
+        harness.loop.run(harness.task_id)
+
+    snapshot = harness.repository.resume_snapshot(harness.task_id)
+    assert snapshot.task.status is TaskStatus.RUNNING
+    assert len(snapshot.iterations) == 1
+    assert harness.repository.green_candidate(harness.task_id) is not None
 
 
 def test_recovered_finish_verifier_is_rejected_after_repository_drift(

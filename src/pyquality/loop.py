@@ -636,6 +636,11 @@ class AgentLoop:
                         ),
                         owner_token=self._owner(),
                     )
+                if (
+                    iteration.quality_outcome == "passed"
+                    and self._repository.green_candidate(task_id) is None
+                ):
+                    return self._recover_approved_candidate(task_id, approval, action)
                 return None
             if not self._dispatcher.matches_expected_after_digests(
                 approval.expected_after_digests
@@ -675,11 +680,7 @@ class AgentLoop:
                 )
             if iteration.quality_outcome == "passed":
                 if self._repository.green_candidate(task_id) is None:
-                    recovered = _recovered_tool_result(action, approval.expected_after_digests)
-                    self._changed(task_id).update(recovered.changed_paths)
-                    return self._verify_approved_effect(
-                        task_id, approval, recovered, already_completed=True
-                    )
+                    return self._recover_approved_candidate(task_id, approval, action)
                 return None
             findings = tuple(
                 item.finding
@@ -868,6 +869,40 @@ class AgentLoop:
         if status is not None:
             return self._terminal(task_id, status, _summary(status))
         self._feedback[task_id] = self._compose(report.findings)
+        return None
+
+    def _recover_approved_candidate(
+        self, task_id: str, approval: ApprovalRecord, action: Action
+    ) -> TaskResult | None:
+        tool_result = _recovered_tool_result(action, approval.expected_after_digests)
+        self._changed(task_id).update(tool_result.changed_paths)
+        report = self._run_quality(
+            task_id, {Path(path) for path in tool_result.changed_paths}
+        )
+        if not report.succeeded:
+            self._feedback[task_id] = self._compose(report.findings)
+            return None
+        iteration = next(
+            item
+            for item in self._repository.resume_snapshot(task_id).iterations
+            if item.id == approval.iteration_id
+        )
+        current = self._policy.evaluate(
+            Action(kind="finish", arguments={}, rationale="Confirm verified completion.")
+        )
+        candidate = GreenCandidate(
+            task_id=task_id,
+            iteration=iteration.sequence,
+            report_digest=_digest_model(report),
+            repository_digest=current.repository_snapshot_digest,
+            summary="Full pytest and Ruff passed; finish is permitted.",
+            changed_paths=tool_result.changed_paths,
+        )
+        self._repository.save_green_candidate(candidate, owner_token=self._owner())
+        self._feedback[task_id] = self._candidate_feedback(task_id, candidate)
+        self._audit_after_commit(
+            "quality_candidate_ready", task_id, {"digest": candidate.report_digest}
+        )
         return None
 
     def _persist_approved_outcome(
