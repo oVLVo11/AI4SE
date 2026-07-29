@@ -169,7 +169,6 @@ def _build_released_r4_audit_index(
     finally:
         os.close(audit_descriptor)
     legacy_root = path.absolute().parent / f".pyquality-audit-index-{identity}"
-    security._ensure_secure_audit_directory(legacy_root)
     offsets: list[int] = []
     position = 0
     for record in records:
@@ -194,11 +193,6 @@ def _build_released_r4_audit_index(
             ((generation % 2) * security._CHECKPOINT_SLOT.size, payload)
         )
     _write_secure_test_file(legacy_root / "checkpoint", checkpoint_payloads)
-    security._ensure_secure_audit_directory(legacy_root / "receipts")
-    for shard in {event.event_id[:2] for event in events}:
-        security._ensure_secure_audit_directory(
-            legacy_root / "receipts" / shard
-        )
     for event, record, offset in zip(events, records, offsets, strict=True):
         receipt = (
             json.dumps(
@@ -1665,7 +1659,7 @@ def test_invalid_released_r4_index_fails_closed_without_copying(
         else:
             os.chmod(checkpoint_path, 0o644)
     elif defect == "foreign_owner":
-        real_validate = security._validate_existing_secure_audit_directory
+        real_validate = security._validate_existing_r4_audit_directory
 
         def reject_foreign_owner(candidate: Path) -> None:
             if candidate == legacy_root.absolute():
@@ -1674,7 +1668,7 @@ def test_invalid_released_r4_index_fails_closed_without_copying(
 
         monkeypatch.setattr(
             security,
-            "_validate_existing_secure_audit_directory",
+            "_validate_existing_r4_audit_directory",
             reject_foreign_owner,
         )
     elif defect == "corrupt_checkpoint":
@@ -1888,6 +1882,167 @@ def test_r4_migration_interruption_resumes_and_hardlink_alias_converges(
     assert process.exitcode == 0
     assert path.read_bytes() == before
     assert (new_root / "migration").is_file()
+
+
+def test_completed_r4_marker_allows_live_checkpoint_to_advance(
+    r4_tmp_path: Path,
+) -> None:
+    """A frozen migration frontier must not reject later committed R5 appends."""
+    tmp_path = r4_tmp_path
+    path = tmp_path / "completed" / "audit.jsonl"
+    index_base = tmp_path / "completed-index"
+    legacy, _, _, _ = _build_released_r4_audit_index(
+        path,
+        index_base,
+        event_count=2,
+    )
+    first_live = AuditEvent(event_id="f" * 64, event_type="transition")
+    second_live = AuditEvent(event_id="e" * 64, event_type="transition")
+    logger = AuditLogger(path, index_root=index_base)
+
+    logger.emit(legacy[0])
+    logger.emit(first_live)
+    logger.emit(second_live)
+    logger.emit(first_live)
+
+    event_ids = [json.loads(line)["event_id"] for line in path.read_bytes().splitlines()]
+    assert event_ids == [event.event_id for event in legacy] + [
+        first_live.event_id,
+        second_live.event_id,
+    ]
+
+
+def test_completed_r4_marker_allows_pending_r5_recovery(
+    r4_tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A post-migration pending append must recover beyond the immutable frontier."""
+    from pyquality import security
+
+    tmp_path = r4_tmp_path
+    path = tmp_path / "pending-live" / "audit.jsonl"
+    index_base = tmp_path / "pending-live-index"
+    legacy, _, _, _ = _build_released_r4_audit_index(
+        path,
+        index_base,
+        event_count=2,
+    )
+    logger = AuditLogger(path, index_root=index_base)
+    logger.emit(legacy[0])
+    live = AuditEvent(event_id="d" * 64, event_type="transition")
+    real_commit = security._commit_audit_receipt
+
+    def fail_before_receipt_commit(
+        descriptor: int,
+        event_id: str,
+        offset: int,
+        encoded: bytes,
+    ) -> None:
+        if event_id == live.event_id:
+            raise OSError("simulated post-migration receipt crash")
+        real_commit(descriptor, event_id, offset, encoded)
+
+    with monkeypatch.context() as fault:
+        fault.setattr(security, "_commit_audit_receipt", fail_before_receipt_commit)
+        with pytest.raises(AuditWriteError):
+            logger.emit(live)
+
+    AuditLogger(path, index_root=index_base).emit(live)
+
+    event_ids = [json.loads(line)["event_id"] for line in path.read_bytes().splitlines()]
+    assert event_ids.count(live.event_id) == 1
+
+
+def test_incomplete_r4_migration_resumes_first_through_hardlink_alias(
+    r4_tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The durable marker must reopen its source when the current alias has no R4 root."""
+    from pyquality import security
+
+    tmp_path = r4_tmp_path
+    left = tmp_path / "alias-source"
+    right = tmp_path / "alias-resume"
+    left.mkdir()
+    right.mkdir()
+    path = left / "audit.jsonl"
+    alias = right / "audit.jsonl"
+    index_base = tmp_path / "alias-index"
+    events, _, _, _ = _build_released_r4_audit_index(
+        path,
+        index_base,
+        event_count=4,
+    )
+    before = path.read_bytes()
+    try:
+        os.link(path, alias)
+    except OSError as error:
+        pytest.skip(f"hardlink creation unavailable: {error.__class__.__name__}")
+    faulted = False
+
+    def fault_after_first_receipt(stage: str) -> None:
+        nonlocal faulted
+        if stage == "after_receipt_fsync" and not faulted:
+            faulted = True
+            raise OSError("simulated first-receipt crash")
+
+    with monkeypatch.context() as fault:
+        fault.setattr(security, "_audit_migration_fault", fault_after_first_receipt)
+        with pytest.raises(AuditWriteError):
+            AuditLogger(path, index_root=index_base).emit(events[0])
+    assert faulted
+
+    AuditLogger(alias, index_root=index_base).emit(events[-1])
+
+    assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize("torn_write", ["marker", "checkpoint"])
+def test_first_r4_migration_write_can_tear_twice_and_reinitialize(
+    r4_tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    torn_write: str,
+) -> None:
+    """No valid first slot must be safely reconstructible without blessing conflicts."""
+    from pyquality import security
+
+    tmp_path = r4_tmp_path
+    path = tmp_path / f"torn-{torn_write}" / "audit.jsonl"
+    index_base = tmp_path / f"torn-{torn_write}-index"
+    events, _, _, _ = _build_released_r4_audit_index(
+        path,
+        index_base,
+        event_count=3,
+    )
+    before = path.read_bytes()
+    real_write = security._write_all
+    magic = (
+        security._R4_MIGRATION_MAGIC
+        if torn_write == "marker"
+        else security._CHECKPOINT_V2_MAGIC
+    )
+
+    for _ in range(2):
+        faulted = False
+
+        def tear_first_slot(descriptor: int, data: bytes) -> None:
+            nonlocal faulted
+            if data.startswith(magic) and not faulted:
+                real_write(descriptor, data[: len(data) // 2])
+                os.fsync(descriptor)
+                faulted = True
+                raise OSError("simulated torn first slot")
+            real_write(descriptor, data)
+
+        with monkeypatch.context() as fault:
+            fault.setattr(security, "_write_all", tear_first_slot)
+            with pytest.raises(AuditWriteError):
+                AuditLogger(path, index_root=index_base).emit(events[0])
+        assert faulted
+
+    AuditLogger(path, index_root=index_base).emit(events[0])
+
+    assert path.read_bytes() == before
 
 
 def test_configured_index_namespace_rejects_directory_link(
