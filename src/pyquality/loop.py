@@ -36,6 +36,7 @@ from pyquality.llm import ActionFormatError, ActionParser, LLMClient, Message, P
 from pyquality.memory import MemoryContext
 from pyquality.storage.sqlite import (
     ApprovalRecord,
+    GreenCandidate,
     LeaseRecoveryBlocked,
     RecoverySnapshot,
     SQLiteTaskRepository,
@@ -399,7 +400,29 @@ class AgentLoop:
             )
             return waiting
 
-        if action.kind in {"finish", "run_quality"}:
+        if action.kind == "finish":
+            candidate = self._repository.green_candidate(task_id)
+            if candidate is None:
+                return self._reject_finish(
+                    task_id,
+                    sequence,
+                    context_digest,
+                    action_json,
+                    decision,
+                    "Finish requires a current green quality candidate.",
+                    "finish:missing_candidate",
+                )
+            if candidate.repository_digest != decision.repository_snapshot_digest:
+                self._repository.clear_green_candidate(task_id)
+                return self._reject_finish(
+                    task_id,
+                    sequence,
+                    context_digest,
+                    action_json,
+                    decision,
+                    "Repository changed after quality passed; run quality again.",
+                    "finish:stale_candidate",
+                )
             quality = self._quality_for_cycle(
                 task_id,
                 sequence,
@@ -417,7 +440,27 @@ class AgentLoop:
                 action_json,
                 decision,
                 quality,
-                finish=action.kind == "finish",
+                finish=True,
+            )
+
+        if action.kind == "run_quality":
+            quality = self._quality_for_cycle(
+                task_id,
+                sequence,
+                context_digest,
+                action_json,
+                decision,
+                {Path(path) for path in self._changed(task_id)},
+            )
+            if isinstance(quality, TaskResult):
+                return quality
+            return self._record_quality_cycle(
+                task_id,
+                sequence,
+                context_digest,
+                action_json,
+                decision,
+                quality,
             )
 
         try:
@@ -899,7 +942,7 @@ class AgentLoop:
         previous = self._last_relevant_digest(task_id)
         relevant = _relevant_digest(tool_result, report, previous)
         fingerprint = failure_fingerprint(report.findings) if report.findings else None
-        self._append_cycle(
+        iteration = self._append_cycle(
             task_id,
             sequence,
             context_digest,
@@ -910,24 +953,82 @@ class AgentLoop:
             fingerprint=fingerprint,
             relevant_digest=relevant,
         )
+        if finish:
+            self._repository.clear_green_candidate(task_id)
+            self._audit_after_commit(
+                "finish_verification",
+                task_id,
+                {"outcome": "passed" if report.succeeded else "failed"},
+            )
+            if report.succeeded:
+                return self._terminal(
+                    task_id, TaskStatus.SUCCEEDED, "Full verification passed."
+                )
+
         blocked = any(
             finding.category in {"missing_tool_dependency", "infrastructure"}
             for finding in report.findings
         )
         history = self._progress_history(task_id)
-        history[-1] = history[-1].model_copy(update={"report": report, "blocked": blocked})
+        history[-1] = history[-1].model_copy(
+            update={"report": None if report.succeeded else report, "blocked": blocked}
+        )
         snapshot = self._repository.resume_snapshot(task_id)
         stop = self._progress_tracker.decide(
             history, snapshot.task.round_limit, snapshot.task.deadline, self._clock.now()
         )
         if stop is not None:
-            summary = "Full verification passed." if stop is TaskStatus.SUCCEEDED else _summary(stop)
+            summary = _summary(stop)
             return self._terminal(task_id, stop, summary)
+        if report.succeeded:
+            current = self._policy.evaluate(
+                Action(kind="finish", arguments={}, rationale="Confirm verified completion.")
+            )
+            candidate = GreenCandidate(
+                task_id=task_id,
+                iteration=iteration.sequence,
+                report_digest=_digest_model(report),
+                repository_digest=current.repository_snapshot_digest,
+                summary="Full pytest and Ruff passed; finish is permitted.",
+                changed_paths=report.changed_paths,
+            )
+            self._repository.save_green_candidate(candidate)
+            self._feedback[task_id] = _text_feedback(
+                "Quality is green. Full pytest and Ruff passed; finish is permitted."
+            )
+            self._audit_after_commit(
+                "quality_candidate_ready",
+                task_id,
+                {"digest": candidate.report_digest},
+            )
+            return None
         if report.findings:
             self._feedback[task_id] = self._compose(report.findings)
         elif finish:
             self._feedback[task_id] = _text_feedback("Verification did not pass.")
         return None
+
+    def _reject_finish(
+        self,
+        task_id: str,
+        sequence: int,
+        context_digest: str,
+        action_json: str,
+        decision: PolicyDecision,
+        message: str,
+        group_key: str,
+    ) -> TaskResult | None:
+        finding = _harness_finding("finish rejected", message, group_key)
+        self._append_cycle(
+            task_id,
+            sequence,
+            context_digest,
+            action_json,
+            decision,
+            findings=(finding,),
+        )
+        self._feedback[task_id] = self._compose((finding,))
+        return self._stop_after_cycle(task_id)
 
     def _policy_decision(
         self, task_id: str, action_json: str, action: Action
@@ -1073,7 +1174,11 @@ class AgentLoop:
             ProgressEntry(
                 fingerprint=iteration.fingerprint,
                 relevant_digest=iteration.relevant_digest,
-                report=_recovered_report(iteration.quality_outcome),
+                report=(
+                    None
+                    if iteration.quality_outcome == "passed"
+                    else _recovered_report(iteration.quality_outcome)
+                ),
                 blocked=iteration.quality_outcome == "blocked",
             )
             for iteration in snapshot.iterations

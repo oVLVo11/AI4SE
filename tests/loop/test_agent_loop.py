@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import timedelta
 
 import httpx
@@ -18,6 +19,85 @@ from conftest import (
 from pyquality.domain.models import ApprovalDecision, TaskStatus, ToolResult
 from pyquality.feedback import FeedbackPacket
 from pyquality.llm import Message, OpenAICompatibleLLM, ScriptedLLM
+
+
+def test_passing_patch_requires_finish_and_exposes_green_context(loop_fixture) -> None:
+    """Implicit success after a patch would skip the model's explicit completion decision."""
+    client = ScriptedLLM([ordinary_patch_json("1"), finish_json()])
+    harness = loop_fixture(
+        llm=client,
+        reports=[successful_report(), successful_report()],
+    )
+
+    result = harness.loop.run(harness.task_id)
+
+    assert result.status is TaskStatus.SUCCEEDED
+    assert len(client.calls) == 2
+    assert "quality is green" in client.calls[1][-1].content.casefold()
+    assert "finish" in client.calls[1][-1].content.casefold()
+    snapshot = harness.repository.resume_snapshot(harness.task_id)
+    assert [json.loads(item.action_json)["kind"] for item in snapshot.iterations] == [
+        "apply_patch",
+        "finish",
+    ]
+
+
+def test_finish_without_green_candidate_cannot_succeed(loop_fixture) -> None:
+    """Accepting an unsupported finish would bypass action-triggered verification evidence."""
+    harness = loop_fixture(responses=[finish_json()], round_limit=1)
+
+    result = harness.loop.run(harness.task_id)
+
+    assert result.status is TaskStatus.BUDGET_EXHAUSTED
+    assert harness.pipeline.calls == []
+
+
+def test_failing_final_verification_cannot_consume_green_candidate(loop_fixture) -> None:
+    """Trusting the earlier candidate would hide a failure at the final verification boundary."""
+    harness = loop_fixture(
+        responses=[ordinary_patch_json("1"), finish_json()],
+        reports=[successful_report(), failed_report()],
+        round_limit=2,
+    )
+
+    result = harness.loop.run(harness.task_id)
+
+    assert result.status is TaskStatus.BUDGET_EXHAUSTED
+    assert len(harness.pipeline.calls) == 2
+    assert harness.repository.green_candidate(harness.task_id) is None
+
+
+def test_repository_drift_rejects_stale_finish_until_quality_runs_again(
+    loop_fixture,
+) -> None:
+    """Digest-free finish acceptance would certify repository bytes never verified green."""
+    responses = [
+        ordinary_patch_json("1"),
+        finish_json(),
+        action_json("run_quality", rationale="verify drifted state"),
+        finish_json(),
+    ]
+
+    class DriftingLLM(ScriptedLLM):
+        def complete(self, messages):
+            if len(self.calls) == 1:
+                (harness.repo_root / "drift.txt").write_text("drift\n", encoding="utf-8")
+            return super().complete(messages)
+
+    client = DriftingLLM(responses)
+    harness = loop_fixture(
+        llm=client,
+        reports=[successful_report(), successful_report(), successful_report()],
+    )
+
+    result = harness.loop.run(harness.task_id)
+
+    assert result.status is TaskStatus.SUCCEEDED
+    assert len(harness.pipeline.calls) == 3
+    assert [
+        json.loads(item.action_json)["kind"]
+        for item in harness.repository.resume_snapshot(harness.task_id).iterations
+    ] == ["apply_patch", "finish", "run_quality", "finish"]
 
 
 def test_loop_adopts_service_lease_without_reacquiring(loop_fixture) -> None:
