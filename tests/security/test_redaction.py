@@ -2046,8 +2046,12 @@ def test_completed_pqamig1_marker_replays_and_upgrades_in_place(
     assert marker_path.read_bytes().startswith(security._R4_MIGRATION_MAGIC)
 
 
-def test_future_staging_marker_fails_closed_with_valid_completed_main(
+@pytest.mark.parametrize(
+    "staging_kind", ["zero", "partial", "random", "corrupt_current", "future"]
+)
+def test_invalid_staging_fails_closed_with_valid_completed_v2_main(
     r4_tmp_path: Path,
+    staging_kind: str,
 ) -> None:
     from pyquality import security
 
@@ -2059,8 +2063,26 @@ def test_future_staging_marker_fails_closed_with_valid_completed_main(
     AuditLogger(path, index_root=index_base).emit(events[0])
     marker = (new_root / "migration").read_bytes()
     assert marker.startswith(security._R4_MIGRATION_MAGIC)
-    future = b"PQAMIG9\0" + marker[8:]
-    _write_secure_test_file(new_root / "migration-v2", [(0, future)])
+    if staging_kind == "zero":
+        staging = b""
+    elif staging_kind == "partial":
+        staging = marker[: security._R4_MIGRATION_SLOT.size // 2]
+    elif staging_kind == "random":
+        staging = b"not-a-marker"
+    elif staging_kind == "future":
+        staging = b"PQAMIG9\0" + marker[8:]
+    else:
+        damaged = bytearray(marker)
+        for slot in range(2):
+            digest_offset = (
+                slot * security._R4_MIGRATION_SLOT.size
+                + security._R4_MIGRATION_SLOT.size
+                - 141
+            )
+            if digest_offset < len(damaged):
+                damaged[digest_offset] ^= 0xFF
+        staging = bytes(damaged)
+    _write_secure_test_file(new_root / "migration-v2", [(0, staging)])
 
     with pytest.raises(security.AuditRecoveryRequired):
         AuditLogger(path, index_root=index_base).emit(events[-1])

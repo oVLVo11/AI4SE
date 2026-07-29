@@ -2694,6 +2694,8 @@ def _migrate_released_r4_audit_index(
                         source_root=source_root,
                     )
                 else:
+                    if torn_upgrade:
+                        raise AuditRecoveryRequired
                     _verify_target_migration_checkpoint(
                         index_root,
                         state,
