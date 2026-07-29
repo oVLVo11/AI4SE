@@ -102,7 +102,7 @@ def test_waiting_future_is_not_published_until_capacity_allows_approval(
 
 
 @pytest.mark.parametrize("decision", [ApprovalDecision.APPROVE, ApprovalDecision.REJECT])
-def test_web_can_retry_recoverable_approval_dispatch_with_csrf(
+def test_web_recovers_approval_dispatch_after_service_and_repository_restart(
     loop_fixture, decision: ApprovalDecision
 ) -> None:
     harness = loop_fixture(
@@ -120,10 +120,16 @@ def test_web_can_retry_recoverable_approval_dispatch_with_csrf(
     approval = harness.loop.pending_approval(task.id)
 
     class FailingExecutor:
+        def __init__(self, delegate: ThreadPoolExecutor) -> None:
+            self._delegate = delegate
+
         def submit(self, *args, **kwargs):
             raise RuntimeError("submit failed")
 
-    service._executor = FailingExecutor()
+        def shutdown(self, *, wait: bool, cancel_futures: bool) -> None:
+            self._delegate.shutdown(wait=wait, cancel_futures=cancel_futures)
+
+    service._executor = FailingExecutor(service._executor)
     client = TestClient(create_app(service, mode="local"))
     page = client.get(f"/tasks/{task.id}")
     token = page.text.split('name="csrf_token" value="', 1)[1].split('"', 1)[0]
@@ -134,19 +140,135 @@ def test_web_can_retry_recoverable_approval_dispatch_with_csrf(
     )
     assert failed.status_code == 409
 
-    recovery_page = client.get(f"/tasks/{task.id}")
-    assert f'/tasks/{task.id}/resume' in recovery_page.text
-    assert client.post(f"/tasks/{task.id}/resume").status_code == 403
-    token = recovery_page.text.split('name="csrf_token" value="', 1)[1].split('"', 1)[0]
-    service._executor = ThreadPoolExecutor(max_workers=1)
-    retried = client.post(
+    snapshot = harness.repository.resume_snapshot(task.id)
+    assert snapshot.task.status is TaskStatus.RUNNING
+    assert snapshot.decided_approval is not None
+    assert snapshot.decided_approval.decision is decision
+
+    contender_repository = type(harness.repository)(harness.db_path)
+    contender = HarnessService(
+        repository=contender_repository,
+        loop=harness.loop,
+        settings=Settings(global_concurrency=1),
+        verifier_finder=lambda name: name,
+    )
+    contender_client = TestClient(create_app(contender, mode="local"))
+    contender_page = contender_client.get(f"/tasks/{task.id}")
+    assert f'/tasks/{task.id}/resume' in contender_page.text
+    contender_token = contender_page.text.split(
+        'name="csrf_token" value="', 1
+    )[1].split('"', 1)[0]
+    refused = contender_client.post(
         f"/tasks/{task.id}/resume",
-        data={"csrf_token": token},
+        data={"csrf_token": contender_token},
+        follow_redirects=False,
+    )
+    assert refused.status_code == 409
+    assert "busy" in refused.text
+    contender.close()
+    contender_repository.close()
+
+    service.close()
+    harness.restart(
+        ScriptedLLM([finish_json()]),
+        ScriptedPipeline([successful_report(), successful_report()]),
+    )
+    restarted = HarnessService(
+        repository=harness.repository,
+        loop=harness.loop,
+        settings=Settings(global_concurrency=1),
+        verifier_finder=lambda name: name,
+    )
+    restarted_client = TestClient(create_app(restarted, mode="local"))
+    recovery_page = restarted_client.get(f"/tasks/{task.id}")
+    assert f'/tasks/{task.id}/resume' in recovery_page.text
+    assert restarted_client.post(f"/tasks/{task.id}/resume").status_code == 403
+    restart_token = recovery_page.text.split(
+        'name="csrf_token" value="', 1
+    )[1].split('"', 1)[0]
+    retried = restarted_client.post(
+        f"/tasks/{task.id}/resume",
+        data={"csrf_token": restart_token},
         follow_redirects=False,
     )
     assert retried.status_code == 303
     assert retried.headers["location"] == f"/tasks/{task.id}"
-    assert service.start_task(task.id).result(timeout=2).status is TaskStatus.SUCCEEDED
+    assert restarted.start_task(task.id).result(timeout=2).status is TaskStatus.SUCCEEDED
+    restarted.close()
+
+
+def test_web_recovers_running_task_after_worker_and_pre_release_cleanup_failures(
+    loop_fixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    harness = loop_fixture(
+        responses=[finish_json()],
+        reports=[successful_report()],
+    )
+    original_run_leased = harness.loop.run_leased
+    run_count = 0
+
+    def fail_worker_once(
+        task_id: str, owner_token: str, *, resume: bool
+    ):
+        nonlocal run_count
+        run_count += 1
+        if run_count == 1:
+            raise RuntimeError("worker failed before terminal state")
+        return original_run_leased(task_id, owner_token, resume=resume)
+
+    original_release = harness.repository.release_project_lease
+    release_count = 0
+
+    def fail_before_release(task_id: str, *, owner_token: str) -> None:
+        nonlocal release_count
+        release_count += 1
+        if release_count == 1:
+            raise RuntimeError("cleanup failed before lease release")
+        original_release(task_id, owner_token=owner_token)
+
+    monkeypatch.setattr(harness.loop, "run_leased", fail_worker_once)
+    monkeypatch.setattr(
+        harness.repository, "release_project_lease", fail_before_release
+    )
+    service = HarnessService(
+        repository=harness.repository,
+        loop=harness.loop,
+        settings=Settings(global_concurrency=1),
+        verifier_finder=lambda name: name,
+    )
+    cleanup_complete = Event()
+    original_complete = service._complete_submission
+
+    def signal_cleanup(*args, **kwargs) -> None:
+        try:
+            original_complete(*args, **kwargs)
+        finally:
+            cleanup_complete.set()
+
+    monkeypatch.setattr(service, "_complete_submission", signal_cleanup)
+
+    failed = service.start_task(harness.task_id)
+    with pytest.raises(RuntimeError, match="worker failed before terminal"):
+        failed.result(timeout=2)
+    assert cleanup_complete.wait(1)
+    assert harness.repository.resume_snapshot(harness.task_id).task.status is TaskStatus.RUNNING
+    assert harness.repository._held_leases
+
+    client = TestClient(create_app(service, mode="local"))
+    recovery_page = client.get(f"/tasks/{harness.task_id}")
+    assert f'/tasks/{harness.task_id}/resume' in recovery_page.text
+    token = recovery_page.text.split('name="csrf_token" value="', 1)[1].split(
+        '"', 1
+    )[0]
+    retried = client.post(
+        f"/tasks/{harness.task_id}/resume",
+        data={"csrf_token": token},
+        follow_redirects=False,
+    )
+
+    assert retried.status_code == 303
+    assert service.start_task(harness.task_id).result(timeout=2).status is TaskStatus.SUCCEEDED
+    service.close()
 
 
 @pytest.mark.parametrize("decision", [ApprovalDecision.APPROVE, ApprovalDecision.REJECT])

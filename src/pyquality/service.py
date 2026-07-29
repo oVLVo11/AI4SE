@@ -191,9 +191,12 @@ class HarnessService:
         return self._decide_and_resume(approval_id, ApprovalDecision.REJECT)
 
     def resume_task(self, task_id: str) -> Future[TaskResult]:
-        """Retry only a dispatch whose approval decision already owns a lease."""
+        """Attempt recovery for durable RUNNING work through the lease protocol."""
+        snapshot = self._snapshot(task_id)
+        if snapshot.task.status is not TaskStatus.RUNNING:
+            raise PreflightError("task is not awaiting dispatch recovery")
         with self._lock:
-            if task_id not in self._pending_owners or task_id in self._futures:
+            if task_id in self._futures:
                 raise PreflightError("task is not awaiting dispatch recovery")
         return self.start_task(task_id, resume=True)
 
@@ -386,10 +389,16 @@ class HarnessService:
                 self._repository.release_project_lease(task_id, owner_token=owner_token)
         except BaseException as caught:  # noqa: BLE001 - publish cleanup failure.
             cleanup_error = caught
+        durable_status: TaskStatus | None = None
+        try:
+            durable_status = self._repository.resume_snapshot(task_id).task.status
+        except BaseException as caught:  # noqa: BLE001 - retain ownership fail-closed.
+            cleanup_error = cleanup_error or caught
         try:
             with self._lock:
-                self._pending_owners.pop(task_id, None)
-                if result is None or result.status in _TERMINAL:
+                if durable_status is not TaskStatus.RUNNING:
+                    self._pending_owners.pop(task_id, None)
+                if durable_status in _TERMINAL:
                     canonical = self._task_repositories.pop(task_id, None)
                     if (
                         canonical is not None
@@ -431,7 +440,6 @@ class HarnessService:
         with self._lock:
             resume_available = (
                 task.status is TaskStatus.RUNNING
-                and task.id in self._pending_owners
                 and task.id not in self._futures
             )
         return TaskView(
