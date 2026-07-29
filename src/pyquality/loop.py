@@ -216,6 +216,7 @@ class AgentLoop:
                     _ = release_error
             self._cycle_intents.reset(cycle_token)
             self._owner_context.reset(context_token)
+            self._evict_terminal_transients(task_id)
 
     def pending_approval(self, task_id: str) -> Approval:
         approval = self._repository.pending_approval(task_id)
@@ -1272,6 +1273,15 @@ class AgentLoop:
                     continue
             self._changed_paths[task_id] = recovered
         return self._changed_paths[task_id]
+
+    def _evict_terminal_transients(self, task_id: str) -> None:
+        try:
+            status = self._repository.resume_snapshot(task_id).task.status
+        except Exception:  # noqa: BLE001 - unreadable durable state stays fail-closed.
+            return
+        if status in _TERMINAL:
+            self._feedback.pop(task_id, None)
+            self._changed_paths.pop(task_id, None)
 
     def _owner(self) -> str:
         owner_token = self._owner_context.get()

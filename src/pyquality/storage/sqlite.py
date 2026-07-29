@@ -35,6 +35,10 @@ class StorageStateError(RuntimeError):
     """Raised when persisted state cannot make the requested transition."""
 
 
+class ProjectReservationError(StorageStateError):
+    """Raised when durable non-terminal work already reserves a project."""
+
+
 class LeaseRecoveryBlocked(StorageStateError):
     """Raised when durable lease evidence predates the safe lock protocol."""
 
@@ -137,6 +141,10 @@ _TERMINAL_STATUSES = frozenset(
         TaskStatus.FAILED,
     }
 )
+_RESERVED_STATUSES = frozenset(
+    {TaskStatus.CREATED, TaskStatus.RUNNING, TaskStatus.WAITING_APPROVAL}
+)
+_PROJECT_RESERVATION_MIGRATION = "project-reservations-v1"
 _ALLOWED_TRANSITIONS = {
     TaskStatus.CREATED: frozenset({TaskStatus.RUNNING}),
     TaskStatus.RUNNING: frozenset({TaskStatus.WAITING_APPROVAL, *_TERMINAL_STATUSES}),
@@ -188,6 +196,39 @@ class SQLiteTaskRepository:
         round_limit: int,
         deadline: datetime | None = None,
     ) -> TaskRecord:
+        return self._create_task(
+            canonical_path,
+            request,
+            round_limit,
+            deadline,
+            reserve_project=False,
+        )
+
+    def create_task_with_project_reservation(
+        self,
+        canonical_path: str,
+        request: str,
+        round_limit: int,
+        deadline: datetime | None = None,
+    ) -> TaskRecord:
+        """Atomically create work only when the project has no non-terminal task."""
+        return self._create_task(
+            canonical_path,
+            request,
+            round_limit,
+            deadline,
+            reserve_project=True,
+        )
+
+    def _create_task(
+        self,
+        canonical_path: str,
+        request: str,
+        round_limit: int,
+        deadline: datetime | None,
+        *,
+        reserve_project: bool,
+    ) -> TaskRecord:
         project_id = _new_id()
         task_id = _new_id()
         created_at = _utc_now()
@@ -197,6 +238,37 @@ class SQLiteTaskRepository:
             ).fetchone()
             if row is not None:
                 project_id = row["id"]
+                if reserve_project:
+                    reservation = connection.execute(
+                        """SELECT project_reservations.task_id,
+                                  project_reservations.migrated, tasks.status
+                           FROM project_reservations
+                           LEFT JOIN tasks ON tasks.id = project_reservations.task_id
+                           WHERE project_reservations.project_id = ?""",
+                        (project_id,),
+                    ).fetchone()
+                    if reservation is not None and reservation["status"] is not None:
+                        if TaskStatus(reservation["status"]) in _RESERVED_STATUSES:
+                            raise ProjectReservationError(
+                                "repository already has active work"
+                            )
+                        self._release_or_transfer_project_reservation(
+                            connection, reservation["task_id"]
+                        )
+                        reservation = connection.execute(
+                            "SELECT 1 FROM project_reservations WHERE project_id = ?",
+                            (project_id,),
+                        ).fetchone()
+                    elif reservation is not None:
+                        connection.execute(
+                            "DELETE FROM project_reservations WHERE project_id = ?",
+                            (project_id,),
+                        )
+                        reservation = None
+                    if reservation is not None:
+                        raise ProjectReservationError(
+                            "repository already has active work"
+                        )
             else:
                 connection.execute(
                     "INSERT INTO projects (id, canonical_path, created_at) VALUES (?, ?, ?)",
@@ -216,6 +288,13 @@ class SQLiteTaskRepository:
                     _dump_datetime(created_at),
                 ),
             )
+            if reserve_project:
+                connection.execute(
+                    """INSERT INTO project_reservations
+                       (project_id, task_id, acquired_at, migrated)
+                       VALUES (?, ?, ?, 0)""",
+                    (project_id, task_id, _dump_datetime(created_at)),
+                )
         return TaskRecord(
             id=task_id,
             project_id=project_id,
@@ -338,6 +417,10 @@ class SQLiteTaskRepository:
                     (task_id, owner_token),
                 )
                 release_local = owner_token is not None
+            if new in _TERMINAL_STATUSES:
+                self._release_or_transfer_project_reservation(
+                    connection, task_id
+                )
         if release_local:
             self._release_local_lease(owner_token)
         return True
@@ -1029,6 +1112,7 @@ class SQLiteTaskRepository:
                 ),
             )
             connection.execute("DELETE FROM project_leases WHERE task_id = ?", (task_id,))
+            self._release_or_transfer_project_reservation(connection, task_id)
         self._release_local_leases_for_task(task_id)
         return result
 
@@ -1045,6 +1129,7 @@ class SQLiteTaskRepository:
             if evidence["iterations"] or evidence["approvals"]:
                 raise StorageStateError("task already has durable execution evidence")
             connection.execute("DELETE FROM project_leases WHERE task_id = ?", (task_id,))
+            self._release_or_transfer_project_reservation(connection, task_id)
             connection.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
             connection.execute(
                 """DELETE FROM projects WHERE id = ?
@@ -1309,6 +1394,13 @@ class SQLiteTaskRepository:
                 transition_intents=transition_intents,
             )
 
+    def task_exists(self, task_id: str) -> bool:
+        """Return whether a durable task row still exists."""
+        with self._read_transaction() as connection:
+            return connection.execute(
+                "SELECT 1 FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone() is not None
+
     @contextmanager
     def _transaction(self) -> Iterator[sqlite3.Connection]:
         with self._connection_lock:
@@ -1412,6 +1504,16 @@ class SQLiteTaskRepository:
                 acquired_at TEXT NOT NULL,
                 protocol TEXT
             );
+            CREATE TABLE IF NOT EXISTS project_reservations (
+                project_id TEXT PRIMARY KEY REFERENCES projects(id),
+                task_id TEXT NOT NULL UNIQUE REFERENCES tasks(id) ON DELETE CASCADE,
+                acquired_at TEXT NOT NULL,
+                migrated INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS schema_migrations (
+                name TEXT PRIMARY KEY,
+                completed_at TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS transition_intents (
                 id TEXT PRIMARY KEY,
                 task_id TEXT NOT NULL REFERENCES tasks(id),
@@ -1438,6 +1540,55 @@ class SQLiteTaskRepository:
         self._ensure_column("project_leases", "protocol", "TEXT")
         self._ensure_column("transition_intents", "result_payload_json", "TEXT")
         self._ensure_column("transition_intents", "consumed_at", "TEXT")
+        self._ensure_column(
+            "project_reservations", "migrated", "INTEGER NOT NULL DEFAULT 0"
+        )
+        self._migrate_project_reservations()
+
+    def _migrate_project_reservations(self) -> None:
+        """Atomically backfill reservations and record durable completion."""
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            completed = self._connection.execute(
+                "SELECT 1 FROM schema_migrations WHERE name = ?",
+                (_PROJECT_RESERVATION_MIGRATION,),
+            ).fetchone()
+            if completed is None:
+                self._backfill_project_reservations()
+                self._connection.execute(
+                    "INSERT INTO schema_migrations (name, completed_at) VALUES (?, ?)",
+                    (_PROJECT_RESERVATION_MIGRATION, _dump_datetime(_utc_now())),
+                )
+        except Exception:
+            self._connection.rollback()
+            raise
+        else:
+            self._connection.commit()
+
+    def _backfill_project_reservations(self) -> None:
+        """Claim one legacy non-terminal task per project on first schema upgrade."""
+        self._connection.execute(
+            """INSERT OR IGNORE INTO project_reservations
+               (project_id, task_id, acquired_at, migrated)
+               SELECT tasks.project_id, tasks.id, tasks.created_at, 1
+               FROM tasks
+               WHERE tasks.status IN (?, ?, ?)
+                 AND tasks.id = (
+                     SELECT candidate.id FROM tasks AS candidate
+                     WHERE candidate.project_id = tasks.project_id
+                       AND candidate.status IN (?, ?, ?)
+                     ORDER BY candidate.created_at, candidate.id
+                     LIMIT 1
+                 )""",
+            (
+                TaskStatus.CREATED.value,
+                TaskStatus.RUNNING.value,
+                TaskStatus.WAITING_APPROVAL.value,
+                TaskStatus.CREATED.value,
+                TaskStatus.RUNNING.value,
+                TaskStatus.WAITING_APPROVAL.value,
+            ),
+        )
 
     def _ensure_column(self, table: str, column: str, declaration: str) -> None:
         columns = {
@@ -1516,6 +1667,45 @@ class SQLiteTaskRepository:
             held = self._held_leases.pop(owner_token, None)
         if held is not None:
             held[2].release()
+
+    @staticmethod
+    def _release_or_transfer_project_reservation(
+        connection: sqlite3.Connection, task_id: str
+    ) -> None:
+        reservation = connection.execute(
+            """SELECT project_id, migrated FROM project_reservations
+               WHERE task_id = ?""",
+            (task_id,),
+        ).fetchone()
+        if reservation is None:
+            return
+        if not reservation["migrated"]:
+            connection.execute(
+                "DELETE FROM project_reservations WHERE task_id = ?", (task_id,)
+            )
+            return
+        replacement = connection.execute(
+            """SELECT id FROM tasks
+               WHERE project_id = ? AND id != ? AND status IN (?, ?, ?)
+               ORDER BY created_at, id LIMIT 1""",
+            (
+                reservation["project_id"],
+                task_id,
+                TaskStatus.CREATED.value,
+                TaskStatus.RUNNING.value,
+                TaskStatus.WAITING_APPROVAL.value,
+            ),
+        ).fetchone()
+        if replacement is None:
+            connection.execute(
+                "DELETE FROM project_reservations WHERE task_id = ?", (task_id,)
+            )
+        else:
+            connection.execute(
+                """UPDATE project_reservations SET task_id = ?, acquired_at = ?
+                   WHERE task_id = ?""",
+                (replacement["id"], _dump_datetime(_utc_now()), task_id),
+            )
 
     def _release_local_leases_for_task(self, task_id: str) -> None:
         with self._connection_lock:

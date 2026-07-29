@@ -9,7 +9,7 @@ from fastapi.testclient import TestClient
 from pyquality.cli import _default_app_factory
 from pyquality.domain.models import TaskStatus
 from pyquality.service import TaskView
-from pyquality.web.app import PublicDemoService, create_app
+from pyquality.web.app import PublicDemoService, _SessionCodec, create_app
 
 pytestmark = pytest.mark.filterwarnings(
     "ignore:Using `httpx` with `starlette.testclient` is deprecated:DeprecationWarning"
@@ -44,6 +44,105 @@ class PublicService:
 def csrf(client: TestClient) -> str:
     text = client.get("/tasks/new").text
     return re.search(r'name="csrf_token" value="([^"]+)"', text).group(1)  # type: ignore[union-attr]
+
+
+def _retained_session_entries(app: object) -> int:
+    retained = 0
+    for middleware in app.user_middleware:  # type: ignore[attr-defined]
+        dispatch = middleware.kwargs.get("dispatch")
+        for cell in getattr(dispatch, "__closure__", ()) or ():
+            try:
+                value = cell.cell_contents
+            except ValueError:
+                continue
+            if isinstance(value, dict):
+                retained += len(value)
+    return retained
+
+
+def test_public_unknown_cookie_and_404_flood_retains_no_server_sessions() -> None:
+    app = create_app(
+        PublicDemoService({"broken_calculator": "demo-task"}), mode="public_mock"
+    )
+    client = TestClient(app)
+
+    for sequence in range(256):
+        client.cookies.clear()
+        headers = (
+            {"cookie": f"pyquality_session=attacker-{sequence}"}
+            if sequence % 2
+            else {}
+        )
+        response = client.get(f"/missing-{sequence}", headers=headers)
+        assert response.status_code == 404
+
+    assert _retained_session_entries(app) == 0
+
+
+def test_public_session_rejects_cookie_tampering_and_attacker_fixation() -> None:
+    app = create_app(
+        PublicDemoService({"broken_calculator": "demo-task"}), mode="public_mock"
+    )
+    client = TestClient(app)
+    page = client.get("/tasks/new")
+    token = re.search(r'name="csrf_token" value="([^"]+)"', page.text).group(1)  # type: ignore[union-attr]
+    cookie = client.cookies.get("pyquality_session")
+    assert cookie is not None
+    tampered = f"{cookie[:-1]}{'A' if cookie[-1] != 'A' else 'B'}"
+
+    client.cookies.clear()
+    rejected = client.post(
+        "/tasks",
+        data={"scenario": "broken_calculator", "csrf_token": token},
+        headers={"cookie": f"pyquality_session={tampered}"},
+    )
+    assert rejected.status_code == 403
+
+    client.cookies.clear()
+    fixed = client.get(
+        "/tasks/new", headers={"cookie": "pyquality_session=attacker-fixed"}
+    )
+    replacement = fixed.cookies.get("pyquality_session")
+    fixed_token = re.search(
+        r'name="csrf_token" value="([^"]+)"', fixed.text
+    ).group(1)  # type: ignore[union-attr]
+    assert replacement not in {None, "attacker-fixed"}
+    assert fixed_token != "attacker-fixed"
+
+
+def test_shared_session_secret_allows_multi_worker_cookie_verification() -> None:
+    shared_secret = b"s" * 32
+    first_app = create_app(
+        PublicDemoService({"broken_calculator": "demo-task"}),
+        mode="public_mock",
+        session_secret=shared_secret,
+    )
+    second_app = create_app(
+        PublicDemoService({"broken_calculator": "demo-task"}),
+        mode="public_mock",
+        session_secret=shared_secret,
+    )
+    first_worker = TestClient(first_app)
+    page = first_worker.get("/tasks/new")
+    token = re.search(r'name="csrf_token" value="([^"]+)"', page.text).group(1)  # type: ignore[union-attr]
+    cookie = first_worker.cookies.get("pyquality_session")
+    assert cookie is not None
+
+    second_worker = TestClient(second_app)
+    accepted = second_worker.post(
+        "/tasks",
+        data={"scenario": "broken_calculator", "csrf_token": token},
+        headers={"cookie": f"pyquality_session={cookie}"},
+        follow_redirects=False,
+    )
+
+    assert accepted.status_code == 303
+
+
+def test_session_codec_rejects_non_ascii_cookie_without_raising() -> None:
+    codec = _SessionCodec(b"s" * 32)
+
+    assert codec.verify(f"é.{'0' * 64}") is None
 
 
 def test_public_mock_rejects_paths_provider_changes_and_credentials() -> None:

@@ -3,17 +3,20 @@ from __future__ import annotations
 from datetime import timedelta
 
 import httpx
+import pytest
 from conftest import (
     NOW,
     FixedClock,
     action_json,
+    dependency_patch_json,
     failed_report,
     finish_json,
     ordinary_patch_json,
     successful_report,
 )
 
-from pyquality.domain.models import TaskStatus, ToolResult
+from pyquality.domain.models import ApprovalDecision, TaskStatus, ToolResult
+from pyquality.feedback import FeedbackPacket
 from pyquality.llm import Message, OpenAICompatibleLLM, ScriptedLLM
 
 
@@ -32,6 +35,87 @@ def test_loop_adopts_service_lease_without_reacquiring(loop_fixture) -> None:
 
     assert result.status is TaskStatus.SUCCEEDED
     assert harness.repository._held_leases == {}
+
+
+def test_many_terminal_tasks_evict_per_task_transient_loop_state(loop_fixture) -> None:
+    denied = action_json("read_file", {"path": ".env"}, "inspect secret")
+    harness = loop_fixture(responses=[denied] * 24, round_limit=1)
+    task_ids = [harness.task_id]
+    for sequence in range(1, 24):
+        task_ids.append(
+            harness.repository.create_task(
+                str(harness.repo_root.resolve()),
+                f"terminal task {sequence}",
+                round_limit=1,
+            ).id
+        )
+
+    for task_id in task_ids:
+        assert harness.loop.run(task_id).status is TaskStatus.BUDGET_EXHAUSTED
+
+    assert harness.loop._feedback == {}
+    assert harness.loop._changed_paths == {}
+
+
+def test_waiting_transients_survive_and_terminal_resume_evicts_them(
+    loop_fixture,
+) -> None:
+    harness = loop_fixture(
+        responses=[dependency_patch_json(), finish_json()],
+        reports=[successful_report(), successful_report()],
+    )
+    feedback = FeedbackPacket(
+        findings=(),
+        omitted_count=0,
+        truncated=False,
+        byte_budget=64,
+        text="preserve across approval",
+    )
+    harness.loop._feedback[harness.task_id] = feedback
+    harness.loop._changed_paths[harness.task_id] = {"src/preserved.py"}
+
+    waiting = harness.loop.run(harness.task_id)
+
+    assert waiting.status is TaskStatus.WAITING_APPROVAL
+    assert harness.loop._feedback[harness.task_id] == feedback
+    assert harness.loop._changed_paths[harness.task_id] == {"src/preserved.py"}
+    approval = harness.loop.pending_approval(harness.task_id)
+    harness.loop.decide_approval(approval.id, ApprovalDecision.APPROVE)
+
+    completed = harness.loop.resume(harness.task_id)
+
+    assert completed.status is TaskStatus.SUCCEEDED
+    assert "src/preserved.py" in completed.changed_paths
+    assert harness.task_id not in harness.loop._feedback
+    assert harness.task_id not in harness.loop._changed_paths
+
+
+def test_running_recovery_retains_transient_loop_state(loop_fixture) -> None:
+    class SimulatedCrash(BaseException):
+        pass
+
+    class CrashingLLM:
+        def complete(self, messages: tuple[Message, ...]) -> str:
+            del messages
+            raise SimulatedCrash
+
+    harness = loop_fixture(llm=CrashingLLM())
+    feedback = FeedbackPacket(
+        findings=(),
+        omitted_count=0,
+        truncated=False,
+        byte_budget=64,
+        text="preserve for recovery",
+    )
+    harness.loop._feedback[harness.task_id] = feedback
+    harness.loop._changed_paths[harness.task_id] = {"src/recovery.py"}
+
+    with pytest.raises(SimulatedCrash):
+        harness.loop.run(harness.task_id)
+
+    assert harness.repository.resume_snapshot(harness.task_id).task.status is TaskStatus.RUNNING
+    assert harness.loop._feedback[harness.task_id] == feedback
+    assert harness.loop._changed_paths[harness.task_id] == {"src/recovery.py"}
 
 
 def test_failed_patch_feedback_changes_next_action(loop_fixture) -> None:

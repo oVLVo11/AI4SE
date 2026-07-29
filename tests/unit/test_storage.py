@@ -3,6 +3,7 @@ from __future__ import annotations
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Barrier
 
 import pytest
 
@@ -16,6 +17,7 @@ from pyquality.domain.models import (
 )
 from pyquality.storage.sqlite import (
     LeaseRecoveryBlocked,
+    ProjectReservationError,
     SQLiteTaskRepository,
     StorageStateError,
 )
@@ -42,6 +44,191 @@ def _approval_decision() -> PolicyDecision:
 
 OWNER_A = "runner-a"
 OWNER_B = "runner-b"
+
+
+def test_nonterminal_project_reservation_is_atomic_across_repository_instances(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "state.sqlite"
+    first = SQLiteTaskRepository(db_path)
+    second = SQLiteTaskRepository(db_path)
+    barrier = Barrier(2)
+
+    def claim(repository: SQLiteTaskRepository, request: str) -> str:
+        barrier.wait()
+        try:
+            repository.create_task_with_project_reservation(
+                "C:/work/reserved", request, round_limit=8
+            )
+        except ProjectReservationError:
+            return "busy"
+        return "created"
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        outcomes = tuple(
+            future.result()
+            for future in (
+                pool.submit(claim, first, "first"),
+                pool.submit(claim, second, "second"),
+            )
+        )
+
+    assert sorted(outcomes) == ["busy", "created"]
+    with first._connection_lock:
+        count = first._connection.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+    assert count == 1
+
+
+def test_terminal_task_does_not_leave_a_stale_project_reservation(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "state.sqlite"
+    first = SQLiteTaskRepository(db_path)
+    task = first.create_task_with_project_reservation(
+        "C:/work/reserved", "first", round_limit=8
+    )
+    _start(first, task.id)
+    assert first.acquire_project_lease(task.id, owner_token=OWNER_A)
+    result = TaskResult(
+        task_id=task.id,
+        status=TaskStatus.SUCCEEDED,
+        iterations=0,
+        verification_summary="done",
+    )
+    assert first.set_status(
+        task.id,
+        TaskStatus.RUNNING,
+        TaskStatus.SUCCEEDED,
+        result,
+        owner_token=OWNER_A,
+    )
+    first.close()
+
+    reopened = SQLiteTaskRepository(db_path)
+    replacement = reopened.create_task_with_project_reservation(
+        "C:/work/reserved", "second", round_limit=8
+    )
+
+    assert replacement.status is TaskStatus.CREATED
+
+
+def test_terminal_service_reservation_does_not_transfer_to_unreserved_task(
+    repo: SQLiteTaskRepository,
+) -> None:
+    repo.create_task("C:/work/reserved", "low-level", round_limit=8)
+    reserved = repo.create_task_with_project_reservation(
+        "C:/work/reserved", "service", round_limit=8
+    )
+    _start(repo, reserved.id)
+    assert repo.acquire_project_lease(reserved.id, owner_token=OWNER_A)
+    result = TaskResult(
+        task_id=reserved.id,
+        status=TaskStatus.SUCCEEDED,
+        iterations=0,
+        verification_summary="done",
+    )
+    assert repo.set_status(
+        reserved.id,
+        TaskStatus.RUNNING,
+        TaskStatus.SUCCEEDED,
+        result,
+        owner_token=OWNER_A,
+    )
+
+    replacement = repo.create_task_with_project_reservation(
+        "C:/work/reserved", "next service", round_limit=8
+    )
+
+    assert replacement.status is TaskStatus.CREATED
+
+
+def test_legacy_database_open_backfills_nonterminal_project_reservation(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "legacy.sqlite"
+    connection = sqlite3.connect(db_path)
+    connection.executescript(
+        """
+        CREATE TABLE projects (
+            id TEXT PRIMARY KEY,
+            canonical_path TEXT NOT NULL UNIQUE,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE tasks (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL REFERENCES projects(id),
+            request TEXT NOT NULL,
+            status TEXT NOT NULL,
+            round_limit INTEGER NOT NULL,
+            deadline TEXT,
+            result_json TEXT,
+            created_at TEXT NOT NULL
+        );
+        INSERT INTO projects VALUES ('legacy-project', 'C:/work/legacy', '2026-07-29T00:00:00+00:00');
+        INSERT INTO tasks VALUES (
+            'legacy-task', 'legacy-project', 'repair', 'waiting_approval', 8,
+            NULL, NULL, '2026-07-29T00:00:00+00:00'
+        );
+        """
+    )
+    connection.close()
+
+    reopened = SQLiteTaskRepository(db_path)
+
+    with reopened._connection_lock:
+        reservation = reopened._connection.execute(
+            "SELECT task_id, migrated FROM project_reservations"
+        ).fetchone()
+    assert tuple(reservation) == ("legacy-task", 1)
+    with pytest.raises(ProjectReservationError, match="active work"):
+        reopened.create_task_with_project_reservation(
+            "C:/work/legacy", "second", round_limit=8
+        )
+
+
+def test_interrupted_reservation_migration_is_retried_on_reopen(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "interrupted.sqlite"
+    connection = sqlite3.connect(db_path)
+    connection.executescript(
+        """
+        CREATE TABLE projects (
+            id TEXT PRIMARY KEY,
+            canonical_path TEXT NOT NULL UNIQUE,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE tasks (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL REFERENCES projects(id),
+            request TEXT NOT NULL,
+            status TEXT NOT NULL,
+            round_limit INTEGER NOT NULL,
+            deadline TEXT,
+            result_json TEXT,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE project_reservations (
+            project_id TEXT PRIMARY KEY REFERENCES projects(id),
+            task_id TEXT NOT NULL UNIQUE REFERENCES tasks(id) ON DELETE CASCADE,
+            acquired_at TEXT NOT NULL,
+            migrated INTEGER NOT NULL DEFAULT 0
+        );
+        INSERT INTO projects VALUES ('legacy-project', 'C:/work/legacy', '2026-07-29T00:00:00+00:00');
+        INSERT INTO tasks VALUES (
+            'legacy-task', 'legacy-project', 'repair', 'waiting_approval', 8,
+            NULL, NULL, '2026-07-29T00:00:00+00:00'
+        );
+        """
+    )
+    connection.close()
+
+    reopened = SQLiteTaskRepository(db_path)
+
+    with pytest.raises(ProjectReservationError, match="active work"):
+        reopened.create_task_with_project_reservation(
+            "C:/work/legacy", "second", round_limit=8
+        )
 
 
 def test_second_active_task_cannot_lease_same_project(repo: SQLiteTaskRepository) -> None:

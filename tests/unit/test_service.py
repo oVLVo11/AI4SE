@@ -60,6 +60,21 @@ class CredentialProbe:
         return CredentialStatus(present=self.present, source="keyring")
 
 
+class FailOnceExecutor:
+    def __init__(self, delegate: ThreadPoolExecutor) -> None:
+        self._delegate = delegate
+        self._failed = False
+
+    def submit(self, *args, **kwargs):
+        if not self._failed:
+            self._failed = True
+            raise RuntimeError("submit failed")
+        return self._delegate.submit(*args, **kwargs)
+
+    def shutdown(self, *, wait: bool, cancel_futures: bool) -> None:
+        self._delegate.shutdown(wait=wait, cancel_futures=cancel_futures)
+
+
 @pytest.fixture
 def repository(tmp_path: Path) -> SQLiteTaskRepository:
     return SQLiteTaskRepository(tmp_path / "state.sqlite")
@@ -106,6 +121,62 @@ def test_service_rejects_second_active_task_for_same_repository(
     with pytest.raises(ProjectBusyError, match="already has active work"):
         service.create_task(repo, "second")
     release.set()
+
+
+def test_fresh_service_rejects_same_repository_while_first_task_waits(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "state.sqlite"
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    first_repository = SQLiteTaskRepository(db_path)
+
+    class WaitingLoop(StubLoop):
+        def run_leased(
+            self, task_id: str, owner_token: str, *, resume: bool
+        ) -> TaskResult:
+            assert self.repository.acquire_project_lease(
+                task_id, owner_token=owner_token
+            )
+            result = TaskResult(
+                task_id=task_id,
+                status=TaskStatus.WAITING_APPROVAL,
+                iterations=1,
+                verification_summary="Waiting for approval.",
+            )
+            assert self.repository.set_status(
+                task_id,
+                TaskStatus.RUNNING,
+                TaskStatus.WAITING_APPROVAL,
+                result,
+                owner_token=owner_token,
+            )
+            return result
+
+    first = HarnessService(
+        repository=first_repository,
+        loop=WaitingLoop(first_repository),
+        settings=Settings(global_concurrency=1),
+        verifier_finder=lambda name: name,
+    )
+    waiting = first.create_task(repo, "first")
+    assert first.start_task(waiting.id).result(timeout=2).status is TaskStatus.WAITING_APPROVAL
+    first.close()
+    first_repository.close()
+
+    reopened_repository = SQLiteTaskRepository(db_path)
+    reopened = HarnessService(
+        repository=reopened_repository,
+        loop=StubLoop(reopened_repository),
+        settings=Settings(global_concurrency=1),
+        verifier_finder=lambda name: name,
+    )
+    try:
+        with pytest.raises(ProjectBusyError, match="active work"):
+            reopened.create_task(repo, "second")
+    finally:
+        reopened.close()
+        reopened_repository.close()
 
 
 def test_preflight_reports_missing_verifier_and_invalid_repository(
@@ -240,6 +311,133 @@ def test_cleanup_exception_is_published_after_remaining_resources_are_released(
     assert service._futures == {}
     replacement = service.create_task(second_repo, "capacity was released")
     assert service.start_task(replacement.id).result(timeout=2).status is TaskStatus.SUCCEEDED
+
+
+def test_create_submit_failure_completes_cleanup_when_lease_release_raises(
+    repository: SQLiteTaskRepository,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    failed_repo = tmp_path / "failed-submit"
+    replacement_repo = tmp_path / "replacement"
+    failed_repo.mkdir()
+    replacement_repo.mkdir()
+    service = make_service(repository)
+    service._executor = FailOnceExecutor(service._executor)
+    original_release = repository.release_project_lease
+    release_calls = 0
+
+    def fail_release_once(task_id: str, *, owner_token: str) -> None:
+        nonlocal release_calls
+        release_calls += 1
+        if release_calls == 1:
+            raise RuntimeError("release failed")
+        original_release(task_id, owner_token=owner_token)
+
+    monkeypatch.setattr(repository, "release_project_lease", fail_release_once)
+
+    with pytest.raises(RuntimeError, match="submit failed"):
+        service.create_task(failed_repo, "first")
+
+    with repository._connection_lock:
+        task_count = repository._connection.execute(
+            "SELECT COUNT(*) FROM tasks"
+        ).fetchone()[0]
+    assert task_count == 0
+    assert service._futures == {}
+    assert service._pending_owners == {}
+    assert service._active_repositories == {}
+    replacement = service.create_task(replacement_repo, "capacity is reusable")
+    assert service.start_task(replacement.id).result(timeout=2).status is TaskStatus.SUCCEEDED
+    service.close()
+
+
+def test_incomplete_create_rollback_keeps_running_task_recoverable_and_frees_capacity(
+    repository: SQLiteTaskRepository,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    failed_repo = tmp_path / "recoverable-submit"
+    other_repo = tmp_path / "other"
+    failed_repo.mkdir()
+    other_repo.mkdir()
+    service = make_service(repository)
+    service._executor = FailOnceExecutor(service._executor)
+    original_release = repository.release_project_lease
+    original_discard = repository.discard_unstarted_task
+    release_calls = 0
+    discard_calls = 0
+
+    def fail_release_once(task_id: str, *, owner_token: str) -> None:
+        nonlocal release_calls
+        release_calls += 1
+        if release_calls == 1:
+            raise RuntimeError("release failed")
+        original_release(task_id, owner_token=owner_token)
+
+    def fail_discard_once(task_id: str) -> None:
+        nonlocal discard_calls
+        discard_calls += 1
+        if discard_calls == 1:
+            raise RuntimeError("discard failed")
+        original_discard(task_id)
+
+    monkeypatch.setattr(repository, "release_project_lease", fail_release_once)
+    monkeypatch.setattr(repository, "discard_unstarted_task", fail_discard_once)
+
+    with pytest.raises(RuntimeError, match="submit failed"):
+        service.create_task(failed_repo, "first")
+
+    with repository._connection_lock:
+        row = repository._connection.execute(
+            "SELECT id, status FROM tasks"
+        ).fetchone()
+    task_id = row["id"]
+    assert row["status"] == TaskStatus.RUNNING.value
+    assert task_id not in service._futures
+    assert task_id in service._pending_owners
+    assert service._active_repositories[str(failed_repo.resolve())] == task_id
+    assert service.get_task(task_id).resume_available
+
+    replacement = service.create_task(other_repo, "capacity is reusable")
+    assert service.start_task(replacement.id).result(timeout=2).status is TaskStatus.SUCCEEDED
+    assert service.resume_task(task_id).result(timeout=2).status is TaskStatus.SUCCEEDED
+    service.close()
+
+
+def test_create_rollback_recognizes_discard_committed_before_cleanup_error(
+    repository: SQLiteTaskRepository,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    failed_repo = tmp_path / "committed-discard"
+    replacement_repo = tmp_path / "after-committed-discard"
+    failed_repo.mkdir()
+    replacement_repo.mkdir()
+    service = make_service(repository)
+    service._executor = FailOnceExecutor(service._executor)
+    original_discard = repository.discard_unstarted_task
+
+    def discard_then_fail(task_id: str) -> None:
+        original_discard(task_id)
+        raise RuntimeError("post-discard cleanup failed")
+
+    monkeypatch.setattr(repository, "discard_unstarted_task", discard_then_fail)
+
+    with pytest.raises(RuntimeError, match="submit failed"):
+        service.create_task(failed_repo, "first")
+
+    with repository._connection_lock:
+        task_count = repository._connection.execute(
+            "SELECT COUNT(*) FROM tasks"
+        ).fetchone()[0]
+    assert task_count == 0
+    assert service._futures == {}
+    assert service._pending_owners == {}
+    assert service._active_repositories == {}
+    replacement = service.create_task(replacement_repo, "capacity is reusable")
+    assert service.start_task(replacement.id).result(timeout=2).status is TaskStatus.SUCCEEDED
+    service.close()
 
 
 def test_submission_queue_is_bounded_by_global_concurrency(

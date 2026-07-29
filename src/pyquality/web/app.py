@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import secrets
 from collections.abc import Mapping
 from pathlib import Path
@@ -33,6 +35,47 @@ _TEMPLATES = Jinja2Templates(directory=str(Path(__file__).with_name("templates")
 _BUNDLED_SCENARIO = "broken_calculator"
 
 
+class _SessionCodec:
+    """Issue and verify stateless cookies carrying one authenticated CSRF token."""
+
+    __slots__ = ("_key",)
+
+    def __init__(self, key: bytes | None = None) -> None:
+        if key is not None and (not isinstance(key, bytes) or len(key) < 32):
+            raise ValueError("session secret must contain at least 32 bytes")
+        self._key = key if key is not None else secrets.token_bytes(32)
+
+    def issue(self) -> tuple[str, str]:
+        token = secrets.token_urlsafe(32)
+        return token, self._encode(token)
+
+    def verify(self, cookie: object) -> str | None:
+        if (
+            not isinstance(cookie, str)
+            or len(cookie) > 160
+            or not cookie.isascii()
+        ):
+            return None
+        token, separator, signature = cookie.partition(".")
+        if (
+            separator != "."
+            or not token
+            or len(token) > 64
+            or len(signature) != hashlib.sha256().digest_size * 2
+        ):
+            return None
+        expected = self._signature(token)
+        return token if hmac.compare_digest(signature, expected) else None
+
+    def _encode(self, token: str) -> str:
+        return f"{token}.{self._signature(token)}"
+
+    def _signature(self, token: str) -> str:
+        return hmac.new(
+            self._key, token.encode("ascii"), hashlib.sha256
+        ).hexdigest()
+
+
 class PublicDemoService:
     """Capability-restricted, data-only registry for offline public scenarios."""
 
@@ -61,7 +104,10 @@ class PublicDemoService:
 
 
 def create_app(
-    service: WebService, mode: Literal["local", "public_mock"] = "local"
+    service: WebService,
+    mode: Literal["local", "public_mock"] = "local",
+    *,
+    session_secret: bytes | None = None,
 ) -> FastAPI:
     """Create a local UI or a path/credential-isolated public mock UI."""
     if mode not in {"local", "public_mock"}:
@@ -69,19 +115,19 @@ def create_app(
     if mode == "public_mock" and type(service) is not PublicDemoService:
         raise TypeError("public demo requires a capability-restricted service")
     app = FastAPI()
-    sessions: dict[str, dict[str, object]] = {}
+    session_codec = _SessionCodec(session_secret)
 
     @app.middleware("http")
     async def local_session(request: Request, call_next):
-        session_id = request.cookies.get("pyquality_session")
-        if not isinstance(session_id, str) or session_id not in sessions:
-            session_id = secrets.token_urlsafe(32)
-            sessions[session_id] = {}
-        request.scope["session"] = sessions[session_id]
+        cookie = request.cookies.get("pyquality_session")
+        csrf_token = session_codec.verify(cookie)
+        if csrf_token is None:
+            csrf_token, cookie = session_codec.issue()
+        request.scope["session"] = {"csrf_token": csrf_token}
         response = await call_next(request)
         response.set_cookie(
             "pyquality_session",
-            session_id,
+            cookie,
             httponly=True,
             samesite="strict",
         )

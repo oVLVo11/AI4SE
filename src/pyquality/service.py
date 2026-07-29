@@ -16,7 +16,12 @@ from pydantic import ConfigDict, Field
 from .config import Settings, load_settings
 from .domain.models import ApprovalDecision, AuditEvent, PublicModel, TaskResult, TaskStatus
 from .security import CredentialError, CredentialStatus, redact, sanitize_audit_metadata
-from .storage.sqlite import SQLiteTaskRepository, StorageStateError, TaskRecord
+from .storage.sqlite import (
+    ProjectReservationError,
+    SQLiteTaskRepository,
+    StorageStateError,
+    TaskRecord,
+)
 
 
 class ProjectBusyError(RuntimeError):
@@ -127,11 +132,16 @@ class HarnessService:
         with self._lock:
             if canonical in self._active_repositories:
                 self._capacity.release()
-                raise ProjectBusyError("repository already has active work")
+                raise ProjectBusyError("repository is busy: it already has active work")
             try:
-                record = self._repository.create_task(
+                record = self._repository.create_task_with_project_reservation(
                     canonical, request, self._settings.round_limit
                 )
+            except ProjectReservationError:
+                self._capacity.release()
+                raise ProjectBusyError(
+                    "repository is busy: it already has active work"
+                ) from None
             except Exception:
                 self._capacity.release()
                 raise
@@ -354,21 +364,66 @@ class HarnessService:
             )
         except Exception:
             if rollback_new_task:
-                self._repository.release_project_lease(
-                    task_id, owner_token=owner_token
+                self._rollback_new_dispatch(
+                    task_id,
+                    owner_token,
+                    placeholder,
                 )
-                self._repository.discard_unstarted_task(task_id)
-                self._remove_submission(task_id)
             else:
                 with self._lock:
                     self._futures.pop(task_id, None)
-            self._capacity.release()
+                self._capacity.release()
             raise
         worker.add_done_callback(
             lambda completed: self._complete_submission(
                 task_id, owner_token, placeholder, completed
             )
         )
+
+    def _rollback_new_dispatch(
+        self,
+        task_id: str,
+        owner_token: str,
+        placeholder: Future[TaskResult],
+    ) -> None:
+        """Best-effort every rollback step while preserving recoverable state."""
+        discarded = False
+        try:
+            self._repository.release_project_lease(
+                task_id, owner_token=owner_token
+            )
+        except BaseException as cleanup_error:  # noqa: BLE001 - keep submit failure primary.
+            _ = cleanup_error
+        try:
+            self._repository.discard_unstarted_task(task_id)
+            discarded = True
+        except BaseException as cleanup_error:  # noqa: BLE001 - retain durable recovery.
+            _ = cleanup_error
+            try:
+                discarded = not self._repository.task_exists(task_id)
+            except BaseException as inspection_error:  # noqa: BLE001 - fail closed.
+                _ = inspection_error
+        try:
+            with self._lock:
+                if self._futures.get(task_id) is placeholder:
+                    self._futures.pop(task_id, None)
+                if discarded:
+                    self._pending_owners.pop(task_id, None)
+                    canonical = self._task_repositories.pop(task_id, None)
+                    if (
+                        canonical is not None
+                        and self._active_repositories.get(canonical) == task_id
+                    ):
+                        self._active_repositories.pop(canonical, None)
+                else:
+                    self._pending_owners[task_id] = owner_token
+        except BaseException as cleanup_error:  # noqa: BLE001 - capacity is still mandatory.
+            _ = cleanup_error
+        finally:
+            try:
+                self._capacity.release()
+            except BaseException as cleanup_error:  # noqa: BLE001 - keep submit failure primary.
+                _ = cleanup_error
 
     def _complete_submission(
         self,
