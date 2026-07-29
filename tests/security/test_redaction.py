@@ -1957,7 +1957,7 @@ def test_completed_r4_marker_allows_live_checkpoint_to_advance(
 
 
 @pytest.mark.parametrize(
-    "scenario", ["torn_upgrade", "torn_sidecar", "mixed_future"]
+    "scenario", ["torn_upgrade", "torn_sidecar", "zero_sidecar", "mixed_future"]
 )
 def test_completed_pqamig1_marker_replays_and_upgrades_in_place(
     r4_tmp_path: Path,
@@ -2028,9 +2028,10 @@ def test_completed_pqamig1_marker_replays_and_upgrades_in_place(
         nonlocal v2_writes
         if payload.startswith(security._R4_MIGRATION_MAGIC):
             v2_writes += 1
-            target_write = 1 if scenario == "torn_sidecar" else 2
+            target_write = 1 if scenario in {"torn_sidecar", "zero_sidecar"} else 2
             if v2_writes == target_write:
-                real_write(descriptor, payload[: len(payload) // 2])
+                if scenario != "zero_sidecar":
+                    real_write(descriptor, payload[: len(payload) // 2])
                 os.fsync(descriptor)
                 raise OSError("simulated torn main-marker upgrade")
         real_write(descriptor, payload)
@@ -2043,6 +2044,26 @@ def test_completed_pqamig1_marker_replays_and_upgrades_in_place(
     AuditLogger(path, index_root=index_base).emit(events[-1])
 
     assert marker_path.read_bytes().startswith(security._R4_MIGRATION_MAGIC)
+
+
+def test_future_staging_marker_fails_closed_with_valid_completed_main(
+    r4_tmp_path: Path,
+) -> None:
+    from pyquality import security
+
+    path = r4_tmp_path / "future-staging" / "audit.jsonl"
+    index_base = r4_tmp_path / "future-staging-index"
+    events, _, _, new_root = _build_released_r4_audit_index(
+        path, index_base, event_count=2
+    )
+    AuditLogger(path, index_root=index_base).emit(events[0])
+    marker = (new_root / "migration").read_bytes()
+    assert marker.startswith(security._R4_MIGRATION_MAGIC)
+    future = b"PQAMIG9\0" + marker[8:]
+    _write_secure_test_file(new_root / "migration-v2", [(0, future)])
+
+    with pytest.raises(security.AuditRecoveryRequired):
+        AuditLogger(path, index_root=index_base).emit(events[-1])
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows token ACL semantics")

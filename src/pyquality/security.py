@@ -111,6 +111,10 @@ class AuditRecoveryRequired(AuditWriteError):
     """The bounded online protocol requires explicit rotation or offline repair."""
 
 
+class _FutureR4MigrationFormat(AuditRecoveryRequired):
+    pass
+
+
 class _AuditCheckpoint(NamedTuple):
     generation: int
     indexed_size: int
@@ -1857,7 +1861,9 @@ def _load_r4_migration_state(
                     source_root,
                 )
             )
-    if future_format or not candidates:
+    if future_format:
+        raise _FutureR4MigrationFormat
+    if not candidates:
         raise AuditRecoveryRequired
     return max(candidates, key=lambda state: state.generation)
 
@@ -2593,6 +2599,8 @@ def _migrate_released_r4_audit_index(
                     source_identity=source_identity,
                     audit_size=audit_size,
                 )
+            except _FutureR4MigrationFormat:
+                raise
             except AuditRecoveryRequired:
                 torn_upgrade = True
                 upgrade_state = None
@@ -2654,7 +2662,8 @@ def _migrate_released_r4_audit_index(
                             completed=True,
                             source_root=source_root,
                         )
-                        if not _exact_torn_prefix(
+                        upgrade_size = os.lseek(upgrade_descriptor, 0, os.SEEK_END)
+                        if upgrade_size != 0 and not _exact_torn_prefix(
                             upgrade_descriptor, 0, expected_upgrade
                         ):
                             raise AuditRecoveryRequired
