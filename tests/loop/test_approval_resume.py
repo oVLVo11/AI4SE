@@ -350,8 +350,8 @@ def test_approval_contention_consumes_exactly_one_decision(loop_fixture) -> None
 def test_approval_pauses_and_executes_once(loop_fixture) -> None:
     action = dependency_patch_json()
     harness = loop_fixture(
-        responses=[action, quality_json(), finish_json()],
-        reports=[successful_report(), successful_report(), successful_report()],
+        responses=[action, finish_json()],
+        reports=[successful_report(), successful_report()],
     )
 
     assert harness.loop.run(harness.task_id).status is TaskStatus.WAITING_APPROVAL
@@ -388,8 +388,10 @@ def test_rejected_action_becomes_feedback_once_after_reopen(loop_fixture) -> Non
     result = harness.loop.resume(harness.task_id)
 
     assert result.status is TaskStatus.SUCCEEDED
-    assert any(
-        "rejected by user" in call[-1].content for call in harness.llm.calls
+    assert "rejected by user" in harness.llm.calls[1][-1].content
+    assert all(
+        "rejected by user" not in call[-1].content
+        for call in harness.llm.calls[2:]
     )
     assert harness.dispatcher.actions == []
     assert harness.repository.resume_snapshot(harness.task_id).decided_approval.execution_state == "completed"
@@ -655,6 +657,46 @@ def test_failed_approved_verification_survives_cold_restart_without_redispatch(
     assert result.status is TaskStatus.SUCCEEDED
     assert "assertion" in restarted_llm.calls[0][-1].content
     assert harness.dispatcher.dispatch_count(action) == 1
+
+
+def test_passing_approved_verification_crash_recovers_candidate_then_finishes(
+    loop_fixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A crash after persisted approval pass must await a distinct finish, not terminalize."""
+    class CrashAfterApprovedPass(BaseException):
+        pass
+
+    action = dependency_patch_json()
+    harness = loop_fixture(
+        responses=[action, finish_json()],
+        reports=[successful_report(), successful_report()],
+    )
+    assert harness.loop.run(harness.task_id).status is TaskStatus.WAITING_APPROVAL
+    approval = harness.loop.pending_approval(harness.task_id)
+    harness.loop.decide_approval(approval.id, ApprovalDecision.APPROVE)
+    complete = harness.repository.complete_iteration_outcome
+
+    def crash_after_atomic_pass(*args, **kwargs):
+        complete(*args, **kwargs)
+        raise CrashAfterApprovedPass
+
+    monkeypatch.setattr(
+        harness.repository, "complete_iteration_outcome", crash_after_atomic_pass
+    )
+    with pytest.raises(CrashAfterApprovedPass):
+        harness.loop.resume(harness.task_id)
+    snapshot = harness.repository.resume_snapshot(harness.task_id)
+    assert snapshot.task.status is TaskStatus.RUNNING
+    assert snapshot.decided_approval is not None
+    assert snapshot.decided_approval.execution_state == "completed"
+    assert harness.repository.green_candidate(harness.task_id) is not None
+    monkeypatch.setattr(harness.repository, "complete_iteration_outcome", complete)
+
+    result = harness.loop.resume(harness.task_id)
+
+    assert result.status is TaskStatus.SUCCEEDED
+    assert harness.dispatcher.dispatch_count(action) == 1
+    assert len(harness.pipeline.calls) == 2
 
 
 def test_malformed_persisted_approval_action_maps_to_failed(loop_fixture) -> None:

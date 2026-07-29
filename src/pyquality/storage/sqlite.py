@@ -87,6 +87,12 @@ class GreenCandidate(_StorageRecord):
                 raise ValueError("changed paths must be repository-relative POSIX text")
             if len(value.encode("utf-8")) > MAX_CONFIG_PATTERN_BYTES:
                 raise ValueError("changed path exceeds configured bound")
+        if len(self.changed_paths) > 128:
+            raise ValueError("changed paths exceed 128 entries")
+        if len({path for path in self.changed_paths}) != len(self.changed_paths):
+            raise ValueError("changed paths must be unique")
+        if sum(len(path.encode("utf-8")) for path in self.changed_paths) > 16_384:
+            raise ValueError("changed paths exceed aggregate UTF-8 bound")
         return self
 
 
@@ -397,13 +403,21 @@ class SQLiteTaskRepository:
         findings: tuple[Finding, ...] = (),
         source_intent_ids: tuple[str, ...] = (),
         owner_token: str | None = None,
+        green_candidate: GreenCandidate | None = None,
+        clear_green_candidate: bool = False,
+        terminal_result: TaskResult | None = None,
     ) -> IterationRecord:
         iteration_id = _new_id()
         created_at = _utc_now()
         normalized_action = _canonical_json(action_json) if action_json is not None else None
         with self._transaction() as connection:
             self._require_task(connection, task_id)
-            if source_intent_ids:
+            lifecycle_write = (
+                green_candidate is not None
+                or clear_green_candidate
+                or terminal_result is not None
+            )
+            if source_intent_ids or lifecycle_write:
                 self._require_running_lease(connection, task_id, owner_token)
             try:
                 connection.execute(
@@ -443,6 +457,43 @@ class SQLiteTaskRepository:
             self._consume_transition_intents(
                 connection, task_id, source_intent_ids
             )
+            if green_candidate is not None:
+                if (
+                    green_candidate.task_id != task_id
+                    or green_candidate.iteration != sequence
+                    or quality_outcome != "passed"
+                ):
+                    raise StorageStateError("green candidate does not match passing iteration")
+                self._upsert_green_candidate(connection, green_candidate)
+            elif clear_green_candidate:
+                connection.execute(
+                    "DELETE FROM green_candidates WHERE task_id = ?", (task_id,)
+                )
+            if terminal_result is not None:
+                if terminal_result.task_id != task_id or terminal_result.status not in _TERMINAL_STATUSES:
+                    raise StorageStateError("terminal result does not match task")
+                cursor = connection.execute(
+                    """UPDATE tasks SET status = ?, result_json = ?
+                       WHERE id = ? AND status = ?""",
+                    (
+                        terminal_result.status.value,
+                        _canonical_json(terminal_result.model_dump(mode="json")),
+                        task_id,
+                        TaskStatus.RUNNING.value,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise StorageStateError("terminal iteration lost compare-and-set")
+                connection.execute(
+                    "DELETE FROM green_candidates WHERE task_id = ?", (task_id,)
+                )
+                connection.execute(
+                    "DELETE FROM project_leases WHERE task_id = ? AND owner_token = ?",
+                    (task_id, owner_token),
+                )
+                self._release_or_transfer_project_reservation(connection, task_id)
+        if terminal_result is not None:
+            self._release_local_lease(owner_token)
         return IterationRecord(
             id=iteration_id,
             task_id=task_id,
@@ -505,11 +556,29 @@ class SQLiteTaskRepository:
             self._release_local_lease(owner_token)
         return True
 
-    def save_green_candidate(self, candidate: GreenCandidate) -> None:
+    def save_green_candidate(
+        self, candidate: GreenCandidate, *, owner_token: str
+    ) -> None:
         """Atomically replace the bounded green evidence for one task."""
         with self._transaction() as connection:
-            self._require_task(connection, candidate.task_id)
-            connection.execute(
+            task = self._require_task(connection, candidate.task_id)
+            if task["status"] != TaskStatus.RUNNING.value:
+                raise StorageStateError("green candidate requires a running task")
+            self._require_running_lease(connection, candidate.task_id, owner_token)
+            iteration = connection.execute(
+                """SELECT quality_outcome FROM iterations
+                   WHERE task_id = ? AND sequence = ?""",
+                (candidate.task_id, candidate.iteration),
+            ).fetchone()
+            if iteration is None or iteration["quality_outcome"] != "passed":
+                raise StorageStateError("green candidate requires a passing task iteration")
+            self._upsert_green_candidate(connection, candidate)
+
+    @staticmethod
+    def _upsert_green_candidate(
+        connection: sqlite3.Connection, candidate: GreenCandidate
+    ) -> None:
+        connection.execute(
                 """INSERT INTO green_candidates
                    (task_id, iteration, report_digest, repository_digest, summary,
                     changed_paths_json)
@@ -547,9 +616,12 @@ class SQLiteTaskRepository:
             changed_paths=tuple(json.loads(row["changed_paths_json"])),
         )
 
-    def clear_green_candidate(self, task_id: str) -> None:
+    def clear_green_candidate(self, task_id: str, *, owner_token: str) -> None:
         with self._transaction() as connection:
-            self._require_task(connection, task_id)
+            task = self._require_task(connection, task_id)
+            if task["status"] != TaskStatus.RUNNING.value:
+                raise StorageStateError("green candidate clearing requires a running task")
+            self._require_running_lease(connection, task_id, owner_token)
             connection.execute(
                 "DELETE FROM green_candidates WHERE task_id = ?", (task_id,)
             )
@@ -566,6 +638,8 @@ class SQLiteTaskRepository:
         findings: tuple[Finding, ...] = (),
         source_intent_ids: tuple[str, ...] = (),
         owner_token: str | None = None,
+        green_candidate: GreenCandidate | None = None,
+        approval_id: str | None = None,
     ) -> IterationRecord:
         _require_digest(tool_result_digest, "tool_result_digest")
         if fingerprint is not None:
@@ -626,6 +700,27 @@ class SQLiteTaskRepository:
             self._consume_transition_intents(
                 connection, task_id, source_intent_ids
             )
+            if green_candidate is not None:
+                if (
+                    green_candidate.task_id != task_id
+                    or green_candidate.iteration != row["sequence"]
+                    or quality_outcome != "passed"
+                ):
+                    raise StorageStateError("green candidate does not match passing iteration")
+                self._upsert_green_candidate(connection, green_candidate)
+            else:
+                connection.execute(
+                    "DELETE FROM green_candidates WHERE task_id = ?", (task_id,)
+                )
+            if approval_id is not None:
+                approval = self._require_approval(connection, approval_id)
+                if approval["task_id"] != task_id:
+                    raise StorageStateError("approval belongs to another task")
+                connection.execute(
+                    """UPDATE approvals SET execution_state = 'completed',
+                       result_digest = ?, executed_at = ? WHERE id = ?""",
+                    (tool_result_digest, _dump_datetime(_utc_now()), approval_id),
+                )
         return self._iteration_by_id(iteration_id)
 
     def consume_intents_for_completed_iteration(
@@ -1793,7 +1888,9 @@ class SQLiteTaskRepository:
                 report_digest TEXT NOT NULL,
                 repository_digest TEXT NOT NULL,
                 summary TEXT NOT NULL,
-                changed_paths_json TEXT NOT NULL
+                changed_paths_json TEXT NOT NULL,
+                FOREIGN KEY(task_id, iteration)
+                    REFERENCES iterations(task_id, sequence) ON DELETE CASCADE
             );
             """
         )

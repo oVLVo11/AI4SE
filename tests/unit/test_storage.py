@@ -36,21 +36,38 @@ def _candidate(task_id: str, *, iteration: int = 1, suffix: str = "a") -> GreenC
     )
 
 
+def _seed_passing_candidate_iteration(
+    repo: SQLiteTaskRepository, task_id: str, owner: str, sequence: int = 1
+) -> None:
+    if repo.resume_snapshot(task_id).task.status is TaskStatus.CREATED:
+        _start(repo, task_id)
+        assert repo.acquire_project_lease(task_id, owner_token=owner)
+    repo.append_iteration(
+        task_id,
+        sequence=sequence,
+        context_digest=("a" if sequence == 1 else "b") * 64,
+        quality_outcome="passed",
+    )
+
+
 def test_green_candidate_save_read_replace_clear_and_task_isolation(
     repo: SQLiteTaskRepository,
 ) -> None:
     """A process-only or append-only candidate could finish the wrong verification state."""
     first = repo.create_task("C:/work/green-one", "fix", round_limit=8)
     second = repo.create_task("C:/work/green-two", "fix", round_limit=8)
+    _seed_passing_candidate_iteration(repo, first.id, OWNER_A)
+    _seed_passing_candidate_iteration(repo, second.id, OWNER_B)
 
-    repo.save_green_candidate(_candidate(first.id))
+    repo.save_green_candidate(_candidate(first.id), owner_token=OWNER_A)
     assert repo.green_candidate(first.id) == _candidate(first.id)
     assert repo.green_candidate(second.id) is None
 
     replacement = _candidate(first.id, iteration=2, suffix="d")
-    repo.save_green_candidate(replacement)
+    _seed_passing_candidate_iteration(repo, first.id, OWNER_A, sequence=2)
+    repo.save_green_candidate(replacement, owner_token=OWNER_A)
     assert repo.green_candidate(first.id) == replacement
-    repo.clear_green_candidate(first.id)
+    repo.clear_green_candidate(first.id, owner_token=OWNER_A)
     assert repo.green_candidate(first.id) is None
 
 
@@ -59,7 +76,8 @@ def test_green_candidate_survives_repository_reopen(tmp_path: Path) -> None:
     database = tmp_path / "green.sqlite"
     first = SQLiteTaskRepository(database)
     task = first.create_task("C:/work/green-reopen", "fix", round_limit=8)
-    first.save_green_candidate(_candidate(task.id))
+    _seed_passing_candidate_iteration(first, task.id, OWNER_A)
+    first.save_green_candidate(_candidate(task.id), owner_token=OWNER_A)
     first.close()
 
     reopened = SQLiteTaskRepository(database)
@@ -97,7 +115,10 @@ def test_terminal_transition_clears_green_candidate_transactionally(
     task = repo.create_task("C:/work/green-terminal", "fix", round_limit=8)
     _start(repo, task.id)
     assert repo.acquire_project_lease(task.id, owner_token=OWNER_A)
-    repo.save_green_candidate(_candidate(task.id))
+    repo.append_iteration(
+        task.id, sequence=1, context_digest="a" * 64, quality_outcome="passed"
+    )
+    repo.save_green_candidate(_candidate(task.id), owner_token=OWNER_A)
     result = TaskResult(
         task_id=task.id,
         status=TaskStatus.SUCCEEDED,
@@ -113,6 +134,70 @@ def test_terminal_transition_clears_green_candidate_transactionally(
         owner_token=OWNER_A,
     )
     assert repo.green_candidate(task.id) is None
+
+
+def test_iteration_and_green_candidate_rollback_together(
+    repo: SQLiteTaskRepository, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A candidate write failure must not leave a passing iteration without its evidence."""
+    task = repo.create_task("C:/work/green-atomic", "fix", round_limit=8)
+    _start(repo, task.id)
+    assert repo.acquire_project_lease(task.id, owner_token=OWNER_A)
+    candidate = _candidate(task.id)
+
+    def fail_candidate(*args, **kwargs):
+        del args, kwargs
+        raise RuntimeError("candidate write failed")
+
+    monkeypatch.setattr(repo, "_upsert_green_candidate", fail_candidate)
+    with pytest.raises(RuntimeError, match="candidate write failed"):
+        repo.append_iteration(
+            task.id,
+            sequence=1,
+            context_digest="a" * 64,
+            quality_outcome="passed",
+            green_candidate=candidate,
+            owner_token=OWNER_A,
+        )
+
+    assert repo.resume_snapshot(task.id).iterations == ()
+    assert repo.green_candidate(task.id) is None
+
+
+def test_finish_iteration_and_terminal_result_rollback_together(
+    repo: SQLiteTaskRepository, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A terminal cleanup failure must retain both the task and its prior green candidate."""
+    task = repo.create_task("C:/work/finish-atomic", "fix", round_limit=8)
+    _seed_passing_candidate_iteration(repo, task.id, OWNER_A)
+    repo.save_green_candidate(_candidate(task.id), owner_token=OWNER_A)
+    result = TaskResult(
+        task_id=task.id,
+        status=TaskStatus.SUCCEEDED,
+        iterations=2,
+        verification_summary="passed",
+    )
+
+    def fail_reservation(*args, **kwargs):
+        del args, kwargs
+        raise RuntimeError("reservation cleanup failed")
+
+    monkeypatch.setattr(repo, "_release_or_transfer_project_reservation", fail_reservation)
+    with pytest.raises(RuntimeError, match="reservation cleanup failed"):
+        repo.append_iteration(
+            task.id,
+            sequence=2,
+            context_digest="b" * 64,
+            quality_outcome="passed",
+            terminal_result=result,
+            clear_green_candidate=True,
+            owner_token=OWNER_A,
+        )
+
+    snapshot = repo.resume_snapshot(task.id)
+    assert snapshot.task.status is TaskStatus.RUNNING
+    assert len(snapshot.iterations) == 1
+    assert repo.green_candidate(task.id) == _candidate(task.id)
 
 
 @pytest.fixture

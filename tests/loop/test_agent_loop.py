@@ -36,6 +36,8 @@ def test_passing_patch_requires_finish_and_exposes_green_context(loop_fixture) -
     assert len(client.calls) == 2
     assert "quality is green" in client.calls[1][-1].content.casefold()
     assert "finish" in client.calls[1][-1].content.casefold()
+    assert "src/calc.py" in client.calls[1][-1].content
+    assert "remaining rounds: 7" in client.calls[1][-1].content.casefold()
     snapshot = harness.repository.resume_snapshot(harness.task_id)
     assert [json.loads(item.action_json)["kind"] for item in snapshot.iterations] == [
         "apply_patch",
@@ -152,6 +154,93 @@ def test_green_and_finish_audit_events_are_bounded_and_path_free(loop_fixture) -
     encoded = "".join(event.model_dump_json() for event in events)
     assert str(harness.repo_root) not in encoded
     assert "assert 0 == 1" not in encoded
+
+
+def test_later_failed_quality_clears_green_candidate_before_finish(loop_fixture) -> None:
+    """A failed report after green must make the earlier candidate unconsumable."""
+    harness = loop_fixture(
+        responses=[quality_json(), quality_json(), finish_json()],
+        reports=[successful_report(), failed_report()],
+        round_limit=3,
+    )
+
+    result = harness.loop.run(harness.task_id)
+
+    assert result.status is not TaskStatus.SUCCEEDED
+    assert harness.repository.green_candidate(harness.task_id) is None
+    assert len(harness.pipeline.calls) == 2
+
+
+def test_finish_rechecks_deadline_after_final_verifier(loop_fixture) -> None:
+    """A verifier crossing the deadline must not publish success from a late report."""
+    clock = FixedClock(NOW)
+
+    class AdvancingPipeline:
+        def __init__(self) -> None:
+            self.calls = []
+
+        def run(self, changed_paths):
+            self.calls.append(changed_paths)
+            if len(self.calls) == 2:
+                clock.value = NOW + timedelta(seconds=2)
+            return successful_report()
+
+    harness = loop_fixture(
+        responses=[quality_json(), finish_json()],
+        reports=[],
+        clock=clock,
+        deadline=NOW + timedelta(seconds=1),
+    )
+    harness.pipeline = AdvancingPipeline()
+    harness.loop._pipeline = harness.pipeline
+
+    result = harness.loop.run(harness.task_id)
+
+    assert result.status is TaskStatus.BUDGET_EXHAUSTED
+
+
+def test_recovered_finish_verifier_is_rejected_after_repository_drift(
+    loop_fixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A recovered passing verifier intent must be bound to the verified repository bytes."""
+    class CrashAfterVerifier(BaseException):
+        pass
+
+    harness = loop_fixture(
+        responses=[quality_json(), finish_json()],
+        reports=[successful_report(), successful_report()],
+    )
+    completed = harness.repository.complete_transition_intent
+    verifier_completions = 0
+
+    def crash_second_verifier(intent_id, **kwargs):
+        nonlocal verifier_completions
+        record = completed(intent_id, **kwargs)
+        if record.kind == "verifier":
+            verifier_completions += 1
+            if verifier_completions == 2:
+                raise CrashAfterVerifier
+        return record
+
+    monkeypatch.setattr(
+        harness.repository, "complete_transition_intent", crash_second_verifier
+    )
+    with pytest.raises(CrashAfterVerifier):
+        harness.loop.run(harness.task_id)
+    (harness.repo_root / "drift-after-verifier.txt").write_text(
+        "drift\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(
+        harness.repository, "complete_transition_intent", completed
+    )
+    harness.restart(ScriptedLLM([quality_json(), finish_json()]), type(harness.pipeline)([
+        successful_report(), successful_report()
+    ]))
+
+    result = harness.loop.resume(harness.task_id)
+
+    assert result.status is TaskStatus.SUCCEEDED
+    assert len(harness.pipeline.calls) == 2
 
 
 def test_loop_adopts_service_lease_without_reacquiring(loop_fixture) -> None:
