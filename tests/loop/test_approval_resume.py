@@ -13,6 +13,7 @@ from conftest import (
     successful_report,
 )
 
+from pyquality.config import Settings
 from pyquality.domain.models import (
     ApprovalDecision,
     PolicyDecision,
@@ -23,6 +24,34 @@ from pyquality.domain.models import (
 from pyquality.llm import Message, ScriptedLLM
 from pyquality.loop import ApprovalStateError
 from pyquality.policy import PolicyEngine
+from pyquality.service import HarnessService
+
+
+@pytest.mark.parametrize("decision", [ApprovalDecision.APPROVE, ApprovalDecision.REJECT])
+def test_service_approval_decision_resumes_real_loop_to_terminal(
+    loop_fixture, decision: ApprovalDecision
+) -> None:
+    harness = loop_fixture(
+        responses=[dependency_patch_json(), finish_json()],
+        reports=[successful_report(), successful_report()],
+    )
+    service = HarnessService(
+        repository=harness.repository,
+        loop=harness.loop,
+        settings=Settings(global_concurrency=1),
+        verifier_finder=lambda name: name,
+    )
+    task = service.create_task(harness.repo_root, "repair")
+    assert service.start_task(task.id).result(timeout=2).status is TaskStatus.WAITING_APPROVAL
+    approval = harness.loop.pending_approval(task.id)
+
+    future = (
+        service.approve(approval.id)
+        if decision is ApprovalDecision.APPROVE
+        else service.reject(approval.id)
+    )
+
+    assert future.result(timeout=2).status is TaskStatus.SUCCEEDED
 
 
 def test_approval_pauses_and_executes_once(loop_fixture) -> None:

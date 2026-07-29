@@ -697,6 +697,13 @@ def _approved_metadata(metadata: Mapping[str, object], secrets: set[str]) -> tup
     return dict(sorted(output.items())), duration, outcome
 
 
+def sanitize_audit_metadata(
+    metadata: Mapping[str, object], secrets: set[str]
+) -> tuple[dict[str, object], float | int | None, str | None]:
+    """Apply the centralized audit allowlist and recursive scalar redaction."""
+    return _approved_metadata(metadata, secrets)
+
+
 def _audit_scalar(value: object, secrets: set[str], limit: int) -> object:
     clean = redact(value, secrets, set())
     return _truncate_text(clean, limit) if isinstance(clean, str) else clean

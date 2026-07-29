@@ -23,7 +23,6 @@ class PublicService:
         self.calls.append((repo_path, request))
         return TaskView(
             id="demo-task",
-            request=request,
             status=TaskStatus.CREATED,
             round_limit=8,
             remaining_rounds=8,
@@ -35,7 +34,6 @@ class PublicService:
     def get_task(self, task_id: str) -> TaskView:
         return TaskView(
             id=task_id,
-            request="bundled demo",
             status=TaskStatus.CREATED,
             round_limit=8,
             remaining_rounds=8,

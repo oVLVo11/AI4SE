@@ -36,6 +36,7 @@ def _parser() -> argparse.ArgumentParser:
     serve = commands.add_parser("serve")
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", default=8000, type=int)
+    serve.add_argument("--repo", type=Path, default=Path.cwd())
     commands.add_parser("demo")
     credential = commands.add_parser("credential")
     credential_commands = credential.add_subparsers(
@@ -51,6 +52,19 @@ def _default_credentials() -> CredentialService:
     import keyring
 
     return CredentialService(keyring.get_keyring(), service_name="pyquality")
+
+
+def _default_run_service(repo: Path) -> _RunService:
+    from .application import build_service
+
+    return build_service(repo)
+
+
+def _default_app_factory(repo: Path, mode: str) -> object:
+    from .application import build_service
+    from .web.app import create_app
+
+    return create_app(build_service(repo, provider="mock" if mode == "public_mock" else None), mode=mode)
 
 
 def main(
@@ -76,12 +90,14 @@ def main(
         return 0
     if args.command == "serve":
         if app_factory is None:
-            raise RuntimeError("application factory is not configured")
-        uvicorn.run(app_factory("local"), host=args.host, port=args.port)
+            app = _default_app_factory(args.repo, "local")
+        else:
+            app = app_factory("local")
+        uvicorn.run(app, host=args.host, port=args.port)
         return 0
     if args.command == "run":
         if service is None:
-            raise RuntimeError("harness service is not configured")
+            service = _default_run_service(args.repo)
         task = service.create_task(args.repo, args.request)
         result = service.start_task(task.id).result()
         print(result.model_dump_json())

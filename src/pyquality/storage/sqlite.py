@@ -12,6 +12,7 @@ from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from tempfile import TemporaryDirectory
+from threading import RLock
 from typing import Literal
 
 from pydantic import ConfigDict
@@ -170,7 +171,10 @@ class SQLiteTaskRepository:
                 / f".{lock_identity_path.name}.lease-locks"
             )
         self._held_leases: dict[str, tuple[str, str, LocalProjectLock]] = {}
-        self._connection = sqlite3.connect(connection_path, isolation_level=None)
+        self._connection_lock = RLock()
+        self._connection = sqlite3.connect(
+            connection_path, isolation_level=None, check_same_thread=False
+        )
         self._connection.row_factory = sqlite3.Row
         self._connection.execute("PRAGMA foreign_keys = ON")
         self._connection.execute("PRAGMA journal_mode = WAL")
@@ -1050,6 +1054,20 @@ class SQLiteTaskRepository:
         finally:
             self._release_local_lease(owner_token)
 
+    def owns_project_lease(self, task_id: str, *, owner_token: str) -> bool:
+        """Confirm the caller owns both durable evidence and the live kernel lock."""
+        _require_owner_token(owner_token)
+        with self._connection_lock:
+            held = self._held_leases.get(owner_token)
+            if held is None or held[1] != task_id:
+                return False
+            row = self._connection.execute(
+                """SELECT 1 FROM project_leases
+                   WHERE task_id = ? AND owner_token = ? AND protocol = ?""",
+                (task_id, owner_token, _LEASE_PROTOCOL),
+            ).fetchone()
+            return row is not None
+
     def mark_findings_resolved(
         self, finding_ids: tuple[str, ...], resolved_at: datetime | None = None
     ) -> int:
@@ -1189,25 +1207,27 @@ class SQLiteTaskRepository:
 
     @contextmanager
     def _transaction(self) -> Iterator[sqlite3.Connection]:
-        self._connection.execute("BEGIN IMMEDIATE")
-        try:
-            yield self._connection
-        except Exception:
-            self._connection.rollback()
-            raise
-        else:
-            self._connection.commit()
+        with self._connection_lock:
+            self._connection.execute("BEGIN IMMEDIATE")
+            try:
+                yield self._connection
+            except Exception:
+                self._connection.rollback()
+                raise
+            else:
+                self._connection.commit()
 
     @contextmanager
     def _read_transaction(self) -> Iterator[sqlite3.Connection]:
-        self._connection.execute("BEGIN")
-        try:
-            yield self._connection
-        except Exception:
-            self._connection.rollback()
-            raise
-        else:
-            self._connection.commit()
+        with self._connection_lock:
+            self._connection.execute("BEGIN")
+            try:
+                yield self._connection
+            except Exception:
+                self._connection.rollback()
+                raise
+            else:
+                self._connection.commit()
 
     def _create_schema(self) -> None:
         self._connection.executescript(

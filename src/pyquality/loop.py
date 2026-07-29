@@ -145,11 +145,33 @@ class AgentLoop:
     def resume(self, task_id: str) -> TaskResult:
         return self._owned_call(task_id, resume=True)
 
-    def _owned_call(self, task_id: str, *, resume: bool) -> TaskResult:
-        owner_token = uuid4().hex
+    def run_leased(
+        self, task_id: str, owner_token: str, *, resume: bool
+    ) -> TaskResult:
+        """Adopt a lease acquired by the submitting service and release it on exit."""
+        if not self._repository.owns_project_lease(
+            task_id, owner_token=owner_token
+        ):
+            raise ApprovalStateError("service lease is not owned by this runner")
+        return self._owned_call(
+            task_id,
+            resume=resume,
+            owner_token=owner_token,
+            lease_acquired=True,
+        )
+
+    def _owned_call(
+        self,
+        task_id: str,
+        *,
+        resume: bool,
+        owner_token: str | None = None,
+        lease_acquired: bool = False,
+    ) -> TaskResult:
+        owner_token = owner_token or uuid4().hex
         context_token = self._owner_context.set(owner_token)
         cycle_token = self._cycle_intents.set(())
-        acquired = False
+        acquired = lease_acquired
         try:
             snapshot = self._repository.resume_snapshot(task_id)
             if snapshot.task.status in _TERMINAL:
@@ -163,13 +185,14 @@ class AgentLoop:
                     task_id, TaskStatus.CREATED, TaskStatus.RUNNING
                 ):
                     return self._owned_call(task_id, resume=True)
-            acquired = self._repository.acquire_project_lease(
-                task_id, owner_token=owner_token
-            )
             if not acquired:
-                return self._make_result(
-                    task_id, TaskStatus.BLOCKED, "Repository is busy."
+                acquired = self._repository.acquire_project_lease(
+                    task_id, owner_token=owner_token
                 )
+                if not acquired:
+                    return self._make_result(
+                        task_id, TaskStatus.BLOCKED, "Repository is busy."
+                    )
             if resume:
                 recovered = self._recover_decided_approval(task_id)
                 if recovered is not None:
@@ -200,7 +223,7 @@ class AgentLoop:
             raise ApprovalStateError("task has no pending approval")
         return approval
 
-    def decide_approval(self, approval_id: str, decision: ApprovalDecision) -> None:
+    def decide_approval(self, approval_id: str, decision: ApprovalDecision) -> str:
         try:
             approval = self._repository.decide_approval_and_resume(approval_id, decision)
             self._audit_after_commit(
@@ -208,6 +231,7 @@ class AgentLoop:
                 approval.task_id,
                 {"approval_id": approval.id, "decision": decision.value},
             )
+            return approval.task_id
         except StorageStateError as error:
             raise ApprovalStateError("approval cannot be decided") from error
 

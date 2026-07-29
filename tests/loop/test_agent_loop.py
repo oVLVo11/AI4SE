@@ -17,6 +17,23 @@ from pyquality.domain.models import TaskStatus, ToolResult
 from pyquality.llm import Message, OpenAICompatibleLLM, ScriptedLLM
 
 
+def test_loop_adopts_service_lease_without_reacquiring(loop_fixture) -> None:
+    harness = loop_fixture(responses=[finish_json()], reports=[successful_report()])
+    assert harness.repository.set_status(
+        harness.task_id, TaskStatus.CREATED, TaskStatus.RUNNING
+    )
+    assert harness.repository.acquire_project_lease(
+        harness.task_id, owner_token="service-owner"
+    )
+
+    result = harness.loop.run_leased(
+        harness.task_id, "service-owner", resume=False
+    )
+
+    assert result.status is TaskStatus.SUCCEEDED
+    assert harness.repository._held_leases == {}
+
+
 def test_failed_patch_feedback_changes_next_action(loop_fixture) -> None:
     bad_patch = ordinary_patch_json("1")
     corrected_patch = ordinary_patch_json("2")

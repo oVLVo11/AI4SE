@@ -18,6 +18,7 @@ class StubLoop:
     def __init__(self, repository: SQLiteTaskRepository) -> None:
         self.repository = repository
         self.runs: list[str] = []
+        self.leased_runs: list[tuple[str, str, bool]] = []
         self.decisions: list[tuple[str, ApprovalDecision]] = []
 
     def run(self, task_id: str) -> TaskResult:
@@ -32,8 +33,22 @@ class StubLoop:
     def resume(self, task_id: str) -> TaskResult:
         return self.run(task_id)
 
-    def decide_approval(self, approval_id: str, decision: ApprovalDecision) -> None:
+    def run_leased(self, task_id: str, owner_token: str, *, resume: bool) -> TaskResult:
+        assert self.repository.acquire_project_lease(task_id, owner_token=owner_token)
+        self.leased_runs.append((task_id, owner_token, resume))
+        result = self.resume(task_id) if resume else self.run(task_id)
+        assert self.repository.set_status(
+            task_id,
+            TaskStatus.RUNNING,
+            result.status,
+            result,
+            owner_token=owner_token,
+        )
+        return result
+
+    def decide_approval(self, approval_id: str, decision: ApprovalDecision) -> str:
         self.decisions.append((approval_id, decision))
+        return "task-for-approval"
 
 
 class CredentialProbe:
@@ -110,6 +125,7 @@ def test_bounded_submission_releases_capacity_and_repository_on_terminal_result(
     future = service.start_task(first.id)
     assert isinstance(future, Future)
     assert future.result(timeout=2).status is TaskStatus.SUCCEEDED
+    assert service._loop.leased_runs[0][0] == first.id
 
     second = service.create_task(repo, "second")
     assert service.start_task(second.id).result(timeout=2).status is TaskStatus.SUCCEEDED
@@ -147,7 +163,51 @@ def test_submission_queue_is_bounded_by_global_concurrency(
 
     release.set()
     assert running.result(timeout=2).status is TaskStatus.SUCCEEDED
-    assert service.start_task(second.id).result(timeout=2).status is TaskStatus.SUCCEEDED
+    assert repository.resume_snapshot(second.id).task.status is TaskStatus.FAILED
+    replacement = service.create_task(second_repo, "replacement")
+    assert service.start_task(replacement.id).result(timeout=2).status is TaskStatus.SUCCEEDED
+
+
+def test_lease_is_cross_repository_instance_safe_before_executor_submit(
+    tmp_path: Path,
+) -> None:
+    entered = Event()
+    release = Event()
+
+    class BlockingLoop(StubLoop):
+        def run(self, task_id: str) -> TaskResult:
+            entered.set()
+            assert release.wait(2)
+            return super().run(task_id)
+
+    db_path = tmp_path / "state.sqlite"
+    first_repository = SQLiteTaskRepository(db_path)
+    second_repository = SQLiteTaskRepository(db_path)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    first = HarnessService(
+        repository=first_repository,
+        loop=BlockingLoop(first_repository),
+        settings=Settings(),
+        verifier_finder=lambda name: name,
+    )
+    second = HarnessService(
+        repository=second_repository,
+        loop=StubLoop(second_repository),
+        settings=Settings(),
+        verifier_finder=lambda name: name,
+    )
+    running_task = first.create_task(repo, "first")
+    contender = second.create_task(repo, "second")
+    running = first.start_task(running_task.id)
+    assert entered.wait(1)
+
+    with pytest.raises(ProjectBusyError, match="busy"):
+        second.start_task(contender.id)
+
+    assert second_repository.resume_snapshot(contender.id).task.status is TaskStatus.FAILED
+    release.set()
+    assert running.result(timeout=2).status is TaskStatus.SUCCEEDED
 
 
 def test_get_task_is_a_typed_safe_view(repository: SQLiteTaskRepository, repo: Path) -> None:
@@ -158,25 +218,84 @@ def test_get_task_is_a_typed_safe_view(repository: SQLiteTaskRepository, repo: P
 
     assert view.id == task.id
     assert view.status is TaskStatus.CREATED
-    assert view.request == "fix escaped <source>"
+    assert "fix escaped" not in view.model_dump_json()
     assert view.remaining_rounds == Settings().round_limit
     assert "result_json" not in view.model_dump()
 
 
-def test_approval_methods_delegate_typed_decisions(repository: SQLiteTaskRepository) -> None:
-    loop = StubLoop(repository)
+def test_cancel_releases_never_started_repository_reservation(
+    repository: SQLiteTaskRepository, repo: Path
+) -> None:
+    service = make_service(repository)
+    abandoned = service.create_task(repo, "abandoned")
+
+    service.cancel_task(abandoned.id)
+
+    replacement = service.create_task(repo, "replacement")
+    assert replacement.status is TaskStatus.CREATED
+
+
+@pytest.mark.parametrize("decision", [ApprovalDecision.APPROVE, ApprovalDecision.REJECT])
+def test_approval_decision_bounded_resumes_to_terminal(
+    repository: SQLiteTaskRepository, repo: Path, decision: ApprovalDecision
+) -> None:
+    class ApprovalLoop(StubLoop):
+        task_id: str
+
+        def decide_approval(self, approval_id: str, selected: ApprovalDecision) -> str:
+            self.decisions.append((approval_id, selected))
+            assert repository.set_status(
+                self.task_id, TaskStatus.WAITING_APPROVAL, TaskStatus.RUNNING
+            )
+            return self.task_id
+
+        def run_leased(self, task_id: str, owner_token: str, *, resume: bool) -> TaskResult:
+            self.leased_runs.append((task_id, owner_token, resume))
+            result = TaskResult(
+                task_id=task_id,
+                status=TaskStatus.SUCCEEDED,
+                iterations=1,
+                verification_summary="continued",
+            )
+            assert repository.set_status(
+                task_id,
+                TaskStatus.RUNNING,
+                TaskStatus.SUCCEEDED,
+                result,
+                owner_token=owner_token,
+            )
+            return result
+
+    loop = ApprovalLoop(repository)
     service = HarnessService(
         repository=repository,
         loop=loop,
         settings=Settings(),
         verifier_finder=lambda name: name,
     )
-    service.approve("approval-1")
-    service.reject("approval-2")
-    assert loop.decisions == [
-        ("approval-1", ApprovalDecision.APPROVE),
-        ("approval-2", ApprovalDecision.REJECT),
-    ]
+    task = service.create_task(repo, "fix")
+    loop.task_id = task.id
+    assert repository.set_status(task.id, TaskStatus.CREATED, TaskStatus.RUNNING)
+    assert repository.acquire_project_lease(task.id, owner_token="setup-owner")
+    waiting = TaskResult(
+        task_id=task.id,
+        status=TaskStatus.WAITING_APPROVAL,
+        iterations=1,
+        verification_summary="waiting",
+    )
+    assert repository.set_status(
+        task.id,
+        TaskStatus.RUNNING,
+        TaskStatus.WAITING_APPROVAL,
+        waiting,
+        owner_token="setup-owner",
+    )
+
+    future = service.approve("approval-1") if decision is ApprovalDecision.APPROVE else service.reject("approval-1")
+
+    assert future.result(timeout=2).status is TaskStatus.SUCCEEDED
+    assert loop.decisions == [("approval-1", decision)]
+    assert loop.leased_runs[0][2] is True
 
 
 def test_export_audit_returns_only_redacted_structured_events(
@@ -211,3 +330,43 @@ def test_export_audit_returns_only_redacted_structured_events(
         ),
     )
     assert "prompt" not in events[0].model_dump_json()
+
+
+def test_export_audit_recursively_redacts_nested_auth_urls_and_known_secrets(
+    repository: SQLiteTaskRepository, tmp_path: Path
+) -> None:
+    audit = tmp_path / "audit.jsonl"
+    audit.write_text(
+        json.dumps(
+            {
+                "task_id": "task-1",
+                "iteration": None,
+                "component": "loop",
+                "event_type": "transition",
+                "duration": None,
+                "outcome": "https://example.invalid/x?api_key=token-value&safe=yes",
+                "metadata": {
+                    "nested": {"authorization": "Bearer token-value"},
+                    "url": "https://example.invalid/x?api_key=token-value&safe=yes",
+                    "intent_id": "known-secret",
+                    "status": "Bearer token-value",
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    service = make_service(
+        repository,
+        audit_path=audit,
+        audit_secrets={"known-secret", "token-value"},
+    )
+
+    encoded = "\n".join(event.model_dump_json() for event in service.export_audit())
+
+    assert "known-secret" not in encoded
+    assert "token-value" not in encoded
+    assert "Bearer [REDACTED]" in encoded
+    assert "api_key=%5BREDACTED%5D" in encoded
+    assert "nested" not in encoded
+    assert '"url"' not in encoded

@@ -3,7 +3,6 @@
 <h1>Task {{ task.id }}</h1>
 <p>Status: {{ task.status.value }}</p>
 <p>Remaining rounds: {{ task.remaining_rounds }}</p>
-<p>{{ task.request }}</p>
 {% if task.verification_summary %}<p>{{ task.verification_summary }}</p>{% endif %}
 {% if task.pending_approval_id %}{% include "approval.html" %}{% endif %}
 {% endblock %}

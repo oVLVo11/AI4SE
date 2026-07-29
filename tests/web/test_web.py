@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from concurrent.futures import Future
 from pathlib import Path
 
 import pytest
@@ -25,7 +26,6 @@ class WebService:
         self.rejected: list[str] = []
         self.view = TaskView(
             id="task-1",
-            request="fix <script>alert(1)</script>",
             status=TaskStatus.WAITING_APPROVAL,
             round_limit=8,
             remaining_rounds=5,
@@ -97,7 +97,7 @@ def test_local_timeline_approval_and_escaped_content(
     assert "Remaining rounds: 5" in page.text
     assert "Waiting for approval" in page.text
     assert "<script>alert(1)</script>" not in page.text
-    assert "&lt;script&gt;alert(1)&lt;/script&gt;" in page.text
+    assert "&lt;script&gt;alert(1)&lt;/script&gt;" not in page.text
 
     decided = client.post(
         "/approvals/approval-1/approve",
@@ -167,3 +167,54 @@ def test_cli_serve_defaults_to_loopback(monkeypatch: pytest.MonkeyPatch) -> None
     )
     assert main(["serve"], app_factory=lambda mode: object()) == 0
     assert called["host"] == "127.0.0.1"
+
+
+def test_installed_run_uses_default_production_composition(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    class DefaultService:
+        def create_task(self, repo_path: Path, request: str) -> TaskView:
+            return TaskView(
+                id="default-task",
+                status=TaskStatus.CREATED,
+                round_limit=8,
+                remaining_rounds=8,
+            )
+
+        def start_task(self, task_id: str) -> Future:
+            future: Future = Future()
+            from pyquality.domain.models import TaskResult
+
+            future.set_result(
+                TaskResult(
+                    task_id=task_id,
+                    status=TaskStatus.SUCCEEDED,
+                    iterations=1,
+                    verification_summary="done",
+                )
+            )
+            return future
+
+    monkeypatch.setattr(
+        "pyquality.cli._default_run_service", lambda repo: DefaultService()
+    )
+
+    assert main(["run", str(tmp_path), "fix"]) == 0
+
+
+def test_installed_serve_uses_default_production_composition(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    called: dict[str, object] = {}
+    monkeypatch.setattr(
+        "pyquality.cli._default_app_factory",
+        lambda repo, mode: called.update(repo=repo, mode=mode) or object(),
+    )
+    monkeypatch.setattr(
+        "pyquality.cli.uvicorn.run",
+        lambda app, **kwargs: called.update(app=app, **kwargs),
+    )
+
+    assert main(["serve", "--repo", str(tmp_path)]) == 0
+    assert called["repo"] == tmp_path
+    assert called["mode"] == "local"
