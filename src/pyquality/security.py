@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from threading import RLock
-from typing import Literal
+from typing import Literal, NamedTuple
 from urllib.parse import quote, urlsplit, urlunsplit
 
 from pydantic import Field
@@ -41,6 +41,9 @@ _MAX_RECEIPT_BYTES = 512
 _MAX_AUDIT_RECEIPTS = 16_384
 _CHECKPOINT_MAGIC = b"PQAIDX1\0"
 _CHECKPOINT_SLOT = struct.Struct(">8sQQQ32s")
+_CHECKPOINT_V2_MAGIC = b"PQAIDX2\0"
+_CHECKPOINT_V2_REGION_OFFSET = _CHECKPOINT_SLOT.size * 2
+_CHECKPOINT_V2_SLOT = struct.Struct(">8sQQQQ32s32s24x")
 _RECEIPT_MAGIC = b"PQARCP2\0"
 _RECEIPT_SLOT_OFFSET = 256
 _RECEIPT_SLOT = struct.Struct(">8sQQI32s32s32s")
@@ -100,6 +103,14 @@ class AuditWriteError(RuntimeError):
 
 class AuditRecoveryRequired(AuditWriteError):
     """The bounded online protocol requires explicit rotation or offline repair."""
+
+
+class _AuditCheckpoint(NamedTuple):
+    generation: int
+    indexed_size: int
+    committed_receipt_count: int
+    pending_event_id: str | None
+    pending_start_offset: int | None
 
 
 class CredentialWarning(PublicModel):
@@ -788,18 +799,41 @@ class AuditLogger:
                         receipt_path,
                         append=False,
                     )
-                    if receipt_descriptor is None:
-                        if checkpoint[2] >= _MAX_AUDIT_RECEIPTS:
-                            raise AuditRecoveryRequired
-                        receipt_descriptor = _open_audit(receipt_path, append=False)
                     try:
-                        receipt = _load_audit_receipt(receipt_descriptor)
-                        if receipt is not None:
-                            _verify_audit_receipt(descriptor, receipt, event_id)
-                            return
-                        if checkpoint[2] >= _MAX_AUDIT_RECEIPTS:
+                        if receipt_descriptor is not None:
+                            receipt = _load_audit_receipt(receipt_descriptor)
+                            if receipt is not None:
+                                _verify_audit_receipt(
+                                    descriptor,
+                                    receipt,
+                                    event_id,
+                                )
+                                return
+                        if (
+                            checkpoint.committed_receipt_count
+                            >= _MAX_AUDIT_RECEIPTS
+                        ):
                             raise AuditRecoveryRequired
                         offset = os.lseek(descriptor, 0, os.SEEK_END)
+                        checkpoint = _store_audit_checkpoint(
+                            checkpoint_descriptor,
+                            checkpoint,
+                            offset,
+                            checkpoint.committed_receipt_count,
+                            pending_event_id=event_id,
+                            pending_start_offset=offset,
+                        )
+                        if receipt_descriptor is None:
+                            receipt_descriptor = _open_audit(
+                                receipt_path,
+                                append=False,
+                            )
+                        receipt = _load_audit_receipt(
+                            receipt_descriptor,
+                            allow_torn=True,
+                        )
+                        if receipt is not None:
+                            raise AuditRecoveryRequired
                         _write_audit_record(descriptor, encoded)
                         _commit_audit_receipt(
                             receipt_descriptor,
@@ -811,10 +845,11 @@ class AuditLogger:
                             checkpoint_descriptor,
                             checkpoint,
                             offset + len(encoded),
-                            checkpoint[2] + 1,
+                            checkpoint.committed_receipt_count + 1,
                         )
                     finally:
-                        os.close(receipt_descriptor)
+                        if receipt_descriptor is not None:
+                            os.close(receipt_descriptor)
                 finally:
                     os.close(checkpoint_descriptor)
         finally:
@@ -902,6 +937,13 @@ def _open_existing_audit(path: Path, *, append: bool = True) -> int | None:
         if error.errno not in {2, 3}:
             raise
     return None
+
+
+def _remove_open_audit(path: Path, descriptor: int) -> None:
+    if os.name == "nt":
+        _remove_windows_open_audit(descriptor)
+        return
+    _remove_posix_open_audit(path.absolute(), descriptor)
 
 
 def _open_posix_audit(
@@ -1013,9 +1055,11 @@ def _recover_tail(descriptor: int) -> None:
         index = chunk.rfind(b"\n")
         if index >= 0:
             os.ftruncate(descriptor, position + index + 1)
+            os.fsync(descriptor)
             return
     if position == 0:
         os.ftruncate(descriptor, 0)
+        os.fsync(descriptor)
         return
     raise AuditRecoveryRequired
 
@@ -1066,8 +1110,32 @@ def _checkpoint_digest(
     ).digest()
 
 
-def _load_audit_checkpoint(descriptor: int) -> tuple[int, int, int] | None:
-    candidates: list[tuple[int, int, int]] = []
+def _checkpoint_v2_digest(
+    generation: int,
+    indexed_size: int,
+    committed_receipt_count: int,
+    pending_start_offset: int,
+    pending_event_id: bytes,
+) -> bytes:
+    return hashlib.sha256(
+        struct.pack(
+            ">QQQQ32s",
+            generation,
+            indexed_size,
+            committed_receipt_count,
+            pending_start_offset,
+            pending_event_id,
+        )
+    ).digest()
+
+
+def _load_audit_checkpoint(
+    descriptor: int,
+    *,
+    audit_size: int | None = None,
+) -> _AuditCheckpoint | None:
+    candidates: list[_AuditCheckpoint] = []
+    future_format = False
     for slot in range(2):
         encoded = _read_at(
             descriptor,
@@ -1079,34 +1147,166 @@ def _load_audit_checkpoint(descriptor: int) -> tuple[int, int, int] | None:
         magic, generation, indexed_size, receipt_count, digest = (
             _CHECKPOINT_SLOT.unpack(encoded)
         )
+        if magic.startswith(b"PQAIDX") and magic not in {
+            _CHECKPOINT_MAGIC,
+            _CHECKPOINT_V2_MAGIC,
+        }:
+            future_format = True
         if (
             magic == _CHECKPOINT_MAGIC
             and receipt_count <= _MAX_AUDIT_RECEIPTS
             and digest
             == _checkpoint_digest(generation, indexed_size, receipt_count)
         ):
-            candidates.append((generation, indexed_size, receipt_count))
-    return max(candidates, default=None)
+            candidates.append(
+                _AuditCheckpoint(
+                    generation,
+                    indexed_size,
+                    receipt_count,
+                    None,
+                    None,
+                )
+            )
+    for slot in range(2):
+        encoded = _read_at(
+            descriptor,
+            _CHECKPOINT_V2_REGION_OFFSET + slot * _CHECKPOINT_V2_SLOT.size,
+            _CHECKPOINT_V2_SLOT.size,
+        )
+        if len(encoded) != _CHECKPOINT_V2_SLOT.size:
+            continue
+        (
+            magic,
+            generation,
+            indexed_size,
+            committed_receipt_count,
+            stored_pending_start,
+            pending_event_id_bytes,
+            digest,
+        ) = _CHECKPOINT_V2_SLOT.unpack(encoded)
+        if magic.startswith(b"PQAIDX") and magic not in {
+            _CHECKPOINT_MAGIC,
+            _CHECKPOINT_V2_MAGIC,
+        }:
+            future_format = True
+        pending_event_id = (
+            None
+            if pending_event_id_bytes == bytes(32)
+            else pending_event_id_bytes.hex()
+        )
+        pending_start_offset = (
+            None if pending_event_id is None else stored_pending_start
+        )
+        if (
+            magic == _CHECKPOINT_V2_MAGIC
+            and generation > 0
+            and committed_receipt_count
+            + (1 if pending_event_id is not None else 0)
+            <= _MAX_AUDIT_RECEIPTS
+            and (pending_event_id is not None or stored_pending_start == 0)
+            and (
+                pending_start_offset is None
+                or pending_start_offset == indexed_size
+            )
+            and digest
+            == _checkpoint_v2_digest(
+                generation,
+                indexed_size,
+                committed_receipt_count,
+                stored_pending_start,
+                pending_event_id_bytes,
+            )
+        ):
+            candidates.append(
+                _AuditCheckpoint(
+                    generation,
+                    indexed_size,
+                    committed_receipt_count,
+                    pending_event_id,
+                    pending_start_offset,
+                )
+            )
+    if future_format:
+        raise AuditRecoveryRequired
+    if not candidates:
+        if os.lseek(descriptor, 0, os.SEEK_END):
+            raise AuditRecoveryRequired
+        return None
+    checkpoint = max(candidates, key=lambda item: item.generation)
+    if (
+        audit_size is not None
+        and (
+            checkpoint.indexed_size > audit_size
+            or (
+                checkpoint.pending_start_offset is not None
+                and checkpoint.pending_start_offset > audit_size
+            )
+        )
+    ):
+        raise AuditRecoveryRequired
+    return checkpoint
 
 
 def _store_audit_checkpoint(
     descriptor: int,
-    previous: tuple[int, int, int] | None,
+    previous: _AuditCheckpoint | None,
     indexed_size: int,
-    receipt_count: int,
-) -> tuple[int, int, int]:
-    generation = 1 if previous is None else previous[0] + 1
-    payload = _CHECKPOINT_SLOT.pack(
-        _CHECKPOINT_MAGIC,
+    committed_receipt_count: int,
+    *,
+    pending_event_id: str | None = None,
+    pending_start_offset: int | None = None,
+) -> _AuditCheckpoint:
+    if (
+        indexed_size < 0
+        or committed_receipt_count < 0
+        or committed_receipt_count
+        + (1 if pending_event_id is not None else 0)
+        > _MAX_AUDIT_RECEIPTS
+        or (
+            pending_event_id is not None
+            and (
+                re.fullmatch(r"[0-9a-f]{64}", pending_event_id) is None
+                or pending_start_offset != indexed_size
+            )
+        )
+        or (pending_event_id is None and pending_start_offset is not None)
+    ):
+        raise AuditRecoveryRequired
+    generation = 1 if previous is None else previous.generation + 1
+    pending_event_id_bytes = (
+        bytes(32) if pending_event_id is None else bytes.fromhex(pending_event_id)
+    )
+    stored_pending_start = 0 if pending_start_offset is None else pending_start_offset
+    payload = _CHECKPOINT_V2_SLOT.pack(
+        _CHECKPOINT_V2_MAGIC,
         generation,
         indexed_size,
-        receipt_count,
-        _checkpoint_digest(generation, indexed_size, receipt_count),
+        committed_receipt_count,
+        stored_pending_start,
+        pending_event_id_bytes,
+        _checkpoint_v2_digest(
+            generation,
+            indexed_size,
+            committed_receipt_count,
+            stored_pending_start,
+            pending_event_id_bytes,
+        ),
     )
-    os.lseek(descriptor, (generation % 2) * _CHECKPOINT_SLOT.size, os.SEEK_SET)
+    os.lseek(
+        descriptor,
+        _CHECKPOINT_V2_REGION_OFFSET
+        + (generation % 2) * _CHECKPOINT_V2_SLOT.size,
+        os.SEEK_SET,
+    )
     _write_all(descriptor, payload)
     os.fsync(descriptor)
-    return generation, indexed_size, receipt_count
+    return _AuditCheckpoint(
+        generation,
+        indexed_size,
+        committed_receipt_count,
+        pending_event_id,
+        pending_start_offset,
+    )
 
 
 def _receipt_checksum(
@@ -1266,16 +1466,116 @@ def _event_id_from_record(encoded: bytes) -> str | None:
     return event_id if isinstance(event_id, str) and re.fullmatch(r"[0-9a-f]{64}", event_id) else None
 
 
+def _remove_pending_audit_receipt(index_root: Path, event_id: str) -> None:
+    receipt_path = _audit_receipt_path(index_root, event_id)
+    receipt_descriptor = _open_existing_audit(receipt_path, append=False)
+    if receipt_descriptor is None:
+        return
+    try:
+        if os.lseek(receipt_descriptor, 0, os.SEEK_END) > _MAX_RECEIPT_BYTES:
+            raise AuditRecoveryRequired
+        _remove_open_audit(receipt_path, receipt_descriptor)
+    finally:
+        os.close(receipt_descriptor)
+
+
+def _recover_pending_audit_reservation(
+    audit_descriptor: int,
+    checkpoint_descriptor: int,
+    index_root: Path,
+    checkpoint: _AuditCheckpoint,
+    audit_size: int,
+) -> _AuditCheckpoint:
+    event_id = checkpoint.pending_event_id
+    start_offset = checkpoint.pending_start_offset
+    if event_id is None or start_offset is None:
+        return checkpoint
+    remaining = audit_size - start_offset
+    if remaining < 0:
+        raise AuditRecoveryRequired
+    if remaining == 0:
+        _remove_pending_audit_receipt(index_root, event_id)
+        return _store_audit_checkpoint(
+            checkpoint_descriptor,
+            checkpoint,
+            start_offset,
+            checkpoint.committed_receipt_count,
+        )
+    probe = _read_at(
+        audit_descriptor,
+        start_offset,
+        min(remaining, _MAX_RECORD_BYTES + 2),
+    )
+    newline = probe.find(b"\n")
+    if newline < 0:
+        if remaining <= min(_MAX_RECORD_BYTES + 1, _MAX_TAIL_RECOVERY_BYTES):
+            os.ftruncate(audit_descriptor, start_offset)
+            os.fsync(audit_descriptor)
+            _remove_pending_audit_receipt(index_root, event_id)
+            return _store_audit_checkpoint(
+                checkpoint_descriptor,
+                checkpoint,
+                start_offset,
+                checkpoint.committed_receipt_count,
+            )
+        raise AuditRecoveryRequired
+    record_length = newline + 1
+    if record_length > _MAX_RECORD_BYTES + 1:
+        raise AuditRecoveryRequired
+    encoded = probe[:record_length]
+    if _event_id_from_record(encoded) != event_id:
+        raise AuditRecoveryRequired
+    receipt_path = _audit_receipt_path(index_root, event_id)
+    receipt_descriptor = _open_existing_audit(receipt_path, append=False)
+    if receipt_descriptor is None:
+        receipt_descriptor = _open_audit(receipt_path, append=False)
+    try:
+        receipt = _load_audit_receipt(receipt_descriptor, allow_torn=True)
+        if receipt is None:
+            _commit_audit_receipt(
+                receipt_descriptor,
+                event_id,
+                start_offset,
+                encoded,
+            )
+        else:
+            _verify_audit_receipt(audit_descriptor, receipt, event_id)
+            if receipt["offset"] != start_offset:
+                raise AuditRecoveryRequired
+    finally:
+        os.close(receipt_descriptor)
+    return _store_audit_checkpoint(
+        checkpoint_descriptor,
+        checkpoint,
+        start_offset + record_length,
+        checkpoint.committed_receipt_count + 1,
+    )
+
+
 def _reconcile_audit_index(
     audit_descriptor: int,
     checkpoint_descriptor: int,
     index_root: Path,
-) -> tuple[int, int, int]:
+) -> _AuditCheckpoint:
     """Index a complete bounded suffix or fail without guessing about older IDs."""
-    checkpoint = _load_audit_checkpoint(checkpoint_descriptor)
     audit_size = os.lseek(audit_descriptor, 0, os.SEEK_END)
-    indexed_size = 0 if checkpoint is None else checkpoint[1]
-    receipt_count = 0 if checkpoint is None else checkpoint[2]
+    checkpoint = _load_audit_checkpoint(
+        checkpoint_descriptor,
+        audit_size=audit_size,
+    )
+    if checkpoint is not None and checkpoint.pending_event_id is not None:
+        checkpoint = _recover_pending_audit_reservation(
+            audit_descriptor,
+            checkpoint_descriptor,
+            index_root,
+            checkpoint,
+            audit_size,
+        )
+        audit_size = os.lseek(audit_descriptor, 0, os.SEEK_END)
+    indexed_size = 0 if checkpoint is None else checkpoint.indexed_size
+    receipt_count = (
+        0 if checkpoint is None else checkpoint.committed_receipt_count
+    )
     if indexed_size > audit_size:
         raise AuditRecoveryRequired
     unindexed = audit_size - indexed_size
@@ -1288,14 +1588,22 @@ def _reconcile_audit_index(
     for encoded in suffix.splitlines(keepends=True):
         event_id = _event_id_from_record(encoded)
         if event_id is not None:
+            if receipt_count >= _MAX_AUDIT_RECEIPTS:
+                raise AuditRecoveryRequired
+            checkpoint = _store_audit_checkpoint(
+                checkpoint_descriptor,
+                checkpoint,
+                offset,
+                receipt_count,
+                pending_event_id=event_id,
+                pending_start_offset=offset,
+            )
             receipt_path = _audit_receipt_path(index_root, event_id)
             receipt_descriptor = _open_existing_audit(
                 receipt_path,
                 append=False,
             )
             if receipt_descriptor is None:
-                if receipt_count >= _MAX_AUDIT_RECEIPTS:
-                    raise AuditRecoveryRequired
                 receipt_descriptor = _open_audit(receipt_path, append=False)
             try:
                 existing = _load_audit_receipt(
@@ -1316,8 +1624,14 @@ def _reconcile_audit_index(
             finally:
                 os.close(receipt_descriptor)
             receipt_count += 1
+            checkpoint = _store_audit_checkpoint(
+                checkpoint_descriptor,
+                checkpoint,
+                offset + len(encoded),
+                receipt_count,
+            )
         offset += len(encoded)
-    if checkpoint is None or unindexed:
+    if checkpoint is None or checkpoint.indexed_size != audit_size:
         checkpoint = _store_audit_checkpoint(
             checkpoint_descriptor,
             checkpoint,
@@ -1352,6 +1666,7 @@ if os.name == "nt":
     _FILE_OPEN_REPARSE_POINT = 0x00200000
     _FILE_READ_ATTRIBUTES = 0x00000080
     _FILE_WRITE_ATTRIBUTES = 0x00000100
+    _DELETE = 0x00010000
     _READ_CONTROL = 0x00020000
     _SYNCHRONIZE = 0x00100000
     _GENERIC_READ = 0x80000000
@@ -1421,6 +1736,9 @@ if os.name == "nt":
             ("OffsetHigh", wintypes.DWORD),
             ("hEvent", wintypes.HANDLE),
         ]
+
+    class _FileDispositionInfo(ctypes.Structure):
+        _fields_ = [("DeleteFile", wintypes.BOOL)]
 
     class _Trustee(ctypes.Structure):
         _fields_ = [
@@ -1527,6 +1845,14 @@ if os.name == "nt":
         ctypes.POINTER(_Overlapped),
     ]
     _unlock_file_ex.restype = wintypes.BOOL
+    _set_file_information_by_handle = _kernel32.SetFileInformationByHandle
+    _set_file_information_by_handle.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_int,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+    ]
+    _set_file_information_by_handle.restype = wintypes.BOOL
     _nt_create_file = _ntdll.NtCreateFile
     _nt_create_file.argtypes = [
         ctypes.POINTER(wintypes.HANDLE),
@@ -1727,7 +2053,11 @@ if os.name == "nt":
                     parent,
                     name,
                     desired_access=(
-                        _GENERIC_READ | _GENERIC_WRITE | _SYNCHRONIZE | _READ_CONTROL
+                        _GENERIC_READ
+                        | _GENERIC_WRITE
+                        | _DELETE
+                        | _SYNCHRONIZE
+                        | _READ_CONTROL
                     ),
                     disposition=_FILE_OPEN_IF if create else _FILE_OPEN,
                     attributes=_FILE_ATTRIBUTE_NORMAL,
@@ -2148,6 +2478,18 @@ if os.name == "nt":
     def _close_windows_handle(handle: int) -> None:
         _close_handle(wintypes.HANDLE(handle))
 
+    def _remove_windows_open_audit(descriptor: int) -> None:
+        information = _FileDispositionInfo(DeleteFile=True)
+        handle = wintypes.HANDLE(msvcrt.get_osfhandle(descriptor))
+        if not _set_file_information_by_handle(
+            handle,
+            4,
+            ctypes.byref(information),
+            ctypes.sizeof(information),
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+        os.fsync(descriptor)
+
     def _lock_descriptor(descriptor: int) -> None:
         overlapped = _Overlapped()
         handle = wintypes.HANDLE(msvcrt.get_osfhandle(descriptor))
@@ -2173,6 +2515,46 @@ else:
     def _audit_stream_identity(descriptor: int) -> str:
         information = os.fstat(descriptor)
         return f"{information.st_dev:x}-{information.st_ino:x}"
+
+    def _remove_posix_open_audit(path: Path, descriptor: int) -> None:
+        no_follow = getattr(os, "O_NOFOLLOW", None)
+        directory = getattr(os, "O_DIRECTORY", None)
+        if no_follow is None or directory is None:
+            raise OSError("descriptor-relative no-follow removal is unavailable")
+        root = Path(path.anchor)
+        parts = path.relative_to(root).parts
+        if not parts or parts[-1] in {"", ".", ".."}:
+            raise OSError("audit removal path has no file component")
+        flags = os.O_RDONLY | directory | no_follow | getattr(os, "O_CLOEXEC", 0)
+        parent_descriptor = os.open(root, flags)
+        try:
+            for part in parts[:-1]:
+                if part in {"", ".", ".."} or "/" in part or "\\" in part:
+                    raise OSError("audit removal path contains an invalid component")
+                next_descriptor = os.open(
+                    part,
+                    flags,
+                    dir_fd=parent_descriptor,
+                )
+                os.close(parent_descriptor)
+                parent_descriptor = next_descriptor
+            expected = os.fstat(descriptor)
+            visible = os.stat(
+                parts[-1],
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+            if (
+                not stat.S_ISREG(visible.st_mode)
+                or visible.st_uid != os.geteuid()
+                or (visible.st_dev, visible.st_ino)
+                != (expected.st_dev, expected.st_ino)
+            ):
+                raise OSError("audit removal target identity changed")
+            os.unlink(parts[-1], dir_fd=parent_descriptor)
+            os.fsync(parent_descriptor)
+        finally:
+            os.close(parent_descriptor)
 
     def _open_windows_audit(
         path: Path,

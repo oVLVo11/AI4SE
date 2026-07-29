@@ -751,6 +751,454 @@ def test_corrupt_latest_checkpoint_recovers_from_prior_slot_without_rescan(
     ]
 
 
+def test_legacy_r5_checkpoint_decodes_without_pending_reservation(
+    tmp_path: Path,
+) -> None:
+    """A released R5 checkpoint must upgrade without inventing pending work."""
+    from pyquality import security
+
+    checkpoint_path = tmp_path / "checkpoint"
+    generation = 7
+    indexed_size = 4_096
+    receipt_count = 3
+    payload = security._CHECKPOINT_SLOT.pack(
+        security._CHECKPOINT_MAGIC,
+        generation,
+        indexed_size,
+        receipt_count,
+        security._checkpoint_digest(generation, indexed_size, receipt_count),
+    )
+    descriptor = security._open_audit(checkpoint_path, append=False)
+    try:
+        security._write_all(descriptor, payload)
+        os.fsync(descriptor)
+        checkpoint = security._load_audit_checkpoint(descriptor)
+    finally:
+        os.close(descriptor)
+
+    assert checkpoint is not None
+    assert checkpoint.generation == generation
+    assert checkpoint.indexed_size == indexed_size
+    assert checkpoint.committed_receipt_count == receipt_count
+    assert checkpoint.pending_event_id is None
+    assert checkpoint.pending_start_offset is None
+
+
+def test_pending_checkpoint_generation_round_trips(tmp_path: Path) -> None:
+    """A missing pending field write would allow receipt creation without durable capacity."""
+    from pyquality import security
+
+    checkpoint_path = tmp_path / "checkpoint"
+    descriptor = security._open_audit(checkpoint_path, append=False)
+    try:
+        stored = security._store_audit_checkpoint(
+            descriptor,
+            None,
+            indexed_size=512,
+            committed_receipt_count=4,
+            pending_event_id="a" * 64,
+            pending_start_offset=512,
+        )
+        loaded = security._load_audit_checkpoint(descriptor, audit_size=640)
+    finally:
+        os.close(descriptor)
+
+    assert loaded == stored
+    assert loaded is not None
+    assert loaded.pending_event_id == "a" * 64
+    assert loaded.pending_start_offset == 512
+
+
+@pytest.mark.parametrize("kind", ["corrupt", "future"])
+def test_checkpoint_decoder_rejects_unrecoverable_or_future_format(
+    tmp_path: Path,
+    kind: str,
+) -> None:
+    """An unreadable sole checkpoint must fail typed instead of triggering a history scan."""
+    from pyquality import security
+
+    generation = 1
+    indexed_size = 0
+    receipt_count = 0
+    digest = security._checkpoint_digest(generation, indexed_size, receipt_count)
+    if kind == "corrupt":
+        digest = b"x" * len(digest)
+    magic = security._CHECKPOINT_MAGIC if kind == "corrupt" else b"PQAIDX9\0"
+    checkpoint_path = tmp_path / "checkpoint"
+    payload = security._CHECKPOINT_SLOT.pack(
+        magic,
+        generation,
+        indexed_size,
+        receipt_count,
+        digest,
+    )
+    descriptor = security._open_audit(checkpoint_path, append=False)
+    try:
+        security._write_all(descriptor, payload)
+        os.fsync(descriptor)
+        with pytest.raises(security.AuditRecoveryRequired):
+            security._load_audit_checkpoint(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def test_torn_new_pending_checkpoint_retains_older_valid_generation(
+    tmp_path: Path,
+) -> None:
+    """A torn inactive-slot update must not destroy the last durable reservation."""
+    from pyquality import security
+
+    checkpoint_path = tmp_path / "checkpoint"
+    descriptor = security._open_audit(checkpoint_path, append=False)
+    try:
+        older = security._store_audit_checkpoint(
+            descriptor,
+            None,
+            indexed_size=0,
+            committed_receipt_count=0,
+            pending_event_id="b" * 64,
+            pending_start_offset=0,
+        )
+        newest = security._store_audit_checkpoint(
+            descriptor,
+            older,
+            indexed_size=0,
+            committed_receipt_count=0,
+            pending_event_id="c" * 64,
+            pending_start_offset=0,
+        )
+        newest_offset = (
+            security._CHECKPOINT_V2_REGION_OFFSET
+            + (newest.generation % 2) * security._CHECKPOINT_V2_SLOT.size
+        )
+        os.lseek(descriptor, newest_offset, os.SEEK_SET)
+        first_byte = os.read(descriptor, 1)
+        os.lseek(descriptor, newest_offset, os.SEEK_SET)
+        os.write(descriptor, bytes([first_byte[0] ^ 0xFF]))
+        os.fsync(descriptor)
+        loaded = security._load_audit_checkpoint(descriptor, audit_size=0)
+    finally:
+        os.close(descriptor)
+
+    assert loaded == older
+
+
+def test_repeated_preappend_failures_keep_only_one_pending_receipt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Distinct failed appends must not accumulate uncounted receipt sidecars."""
+    from pyquality import security
+
+    monkeypatch.setattr(security, "_MAX_AUDIT_RECEIPTS", 1)
+    path = tmp_path / "audit.jsonl"
+    index_base = tmp_path / "index"
+    events = [
+        AuditEvent(event_id=character * 64, event_type="transition")
+        for character in ("1", "2", "3", "4")
+    ]
+
+    def fail_before_append(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise OSError("simulated pre-append failure")
+
+    monkeypatch.setattr(security, "_write_audit_record", fail_before_append)
+    logger = AuditLogger(path, index_root=index_base)
+    for event in events:
+        with pytest.raises(AuditWriteError):
+            logger.emit(event)
+
+    descriptor = security._open_audit(path)
+    try:
+        index_root = security._audit_index_root(path, descriptor, index_base)
+        audit_size = os.lseek(descriptor, 0, os.SEEK_END)
+    finally:
+        os.close(descriptor)
+    receipt_paths = [
+        security._audit_receipt_path(index_root, event.event_id) for event in events
+    ]
+    checkpoint_descriptor = security._open_audit(
+        index_root / "checkpoint",
+        append=False,
+    )
+    try:
+        checkpoint = security._load_audit_checkpoint(
+            checkpoint_descriptor,
+            audit_size=audit_size,
+        )
+    finally:
+        os.close(checkpoint_descriptor)
+
+    assert path.read_bytes() == b""
+    assert sum(receipt_path.exists() for receipt_path in receipt_paths) == 1
+    assert checkpoint is not None
+    assert checkpoint.committed_receipt_count == 0
+    assert checkpoint.pending_event_id == events[-1].event_id
+
+
+@pytest.mark.parametrize(
+    ("stage", "record_was_appended"),
+    [
+        ("pending_checkpoint_fsynced", False),
+        ("receipt_created", False),
+        ("before_append", False),
+        ("append_fsynced", True),
+        ("receipt_committed", True),
+        ("before_final_checkpoint", True),
+    ],
+)
+def test_pending_reservation_recovers_each_crash_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stage: str,
+    record_was_appended: bool,
+) -> None:
+    """Restart must clear an unused reservation or complete an appended one exactly once."""
+    from pyquality import security
+
+    monkeypatch.setattr(security, "_MAX_AUDIT_RECEIPTS", 1)
+    path = tmp_path / "audit.jsonl"
+    index_base = tmp_path / "index"
+    first = AuditEvent(event_id="a" * 64, event_type="transition")
+    second = AuditEvent(event_id="b" * 64, event_type="transition")
+    faulted = False
+    real_open = security._open_audit
+    real_store = security._store_audit_checkpoint
+    real_write = security._write_audit_record
+    real_commit = security._commit_audit_receipt
+
+    def fail_once() -> None:
+        nonlocal faulted
+        if not faulted:
+            faulted = True
+            raise OSError(f"simulated crash at {stage}")
+
+    def faulting_open(
+        target: Path,
+        *,
+        append: bool = True,
+        create: bool = True,
+    ) -> int:
+        descriptor = real_open(target, append=append, create=create)
+        if stage == "receipt_created" and Path(target).name == first.event_id:
+            os.close(descriptor)
+            fail_once()
+        return descriptor
+
+    def faulting_store(*args: object, **kwargs: object):
+        previous = args[1] if len(args) > 1 else kwargs.get("previous")
+        pending_event_id = kwargs.get("pending_event_id")
+        if (
+            stage == "before_final_checkpoint"
+            and previous is not None
+            and previous.pending_event_id == first.event_id
+            and pending_event_id is None
+        ):
+            fail_once()
+        stored = real_store(*args, **kwargs)
+        if (
+            stage == "pending_checkpoint_fsynced"
+            and stored.pending_event_id == first.event_id
+        ):
+            fail_once()
+        return stored
+
+    def faulting_write(descriptor: int, encoded: bytes) -> None:
+        if stage == "before_append":
+            fail_once()
+        real_write(descriptor, encoded)
+        if stage == "append_fsynced":
+            fail_once()
+
+    def faulting_commit(
+        descriptor: int,
+        event_id: str,
+        offset: int,
+        encoded: bytes,
+    ) -> None:
+        real_commit(descriptor, event_id, offset, encoded)
+        if stage == "receipt_committed" and event_id == first.event_id:
+            fail_once()
+
+    with monkeypatch.context() as fault:
+        fault.setattr(security, "_open_audit", faulting_open)
+        fault.setattr(security, "_store_audit_checkpoint", faulting_store)
+        fault.setattr(security, "_write_audit_record", faulting_write)
+        fault.setattr(security, "_commit_audit_receipt", faulting_commit)
+        with pytest.raises(AuditWriteError):
+            AuditLogger(path, index_root=index_base).emit(first)
+    assert faulted
+
+    recovered = AuditLogger(path, index_root=index_base)
+    if record_was_appended:
+        with pytest.raises(security.AuditRecoveryRequired):
+            recovered.emit(second)
+        recovered.emit(first)
+        expected_ids = [first.event_id]
+    else:
+        recovered.emit(second)
+        expected_ids = [second.event_id]
+
+    records = [json.loads(line) for line in path.read_bytes().splitlines()]
+    assert [record["event_id"] for record in records] == expected_ids
+    descriptor = security._open_audit(path)
+    try:
+        index_root = security._audit_index_root(path, descriptor, index_base)
+    finally:
+        os.close(descriptor)
+    assert not security._audit_receipt_path(index_root, first.event_id).exists() or record_was_appended
+    assert sum(
+        security._audit_receipt_path(index_root, event.event_id).exists()
+        for event in (first, second)
+    ) == 1
+
+
+@pytest.mark.parametrize("pending_bytes", ["different_event", "oversized_record"])
+def test_pending_recovery_rejects_unauthenticated_complete_bytes_without_create(
+    tmp_path: Path,
+    pending_bytes: str,
+) -> None:
+    """Pending recovery must not bless mismatched or over-bound bytes as its event."""
+    from pyquality import security
+
+    path = tmp_path / "audit.jsonl"
+    index_base = tmp_path / "index"
+    pending = AuditEvent(event_id="c" * 64, event_type="transition")
+    probe = AuditEvent(event_id="d" * 64, event_type="transition")
+    logger = AuditLogger(path, index_root=index_base)
+    descriptor = security._open_audit(path)
+    try:
+        index_root = security._audit_index_root(path, descriptor, index_base)
+        security._ensure_secure_audit_index_root(index_base, index_root)
+        checkpoint_descriptor = security._open_audit(
+            index_root / "checkpoint",
+            append=False,
+        )
+        try:
+            security._store_audit_checkpoint(
+                checkpoint_descriptor,
+                None,
+                indexed_size=0,
+                committed_receipt_count=0,
+                pending_event_id=pending.event_id,
+                pending_start_offset=0,
+            )
+        finally:
+            os.close(checkpoint_descriptor)
+        if pending_bytes == "different_event":
+            encoded = logger._encode(
+                AuditEvent(event_id="e" * 64, event_type="transition")
+            )
+        else:
+            encoded = b"x" * (security._MAX_RECORD_BYTES + 1) + b"\n"
+        security._write_audit_record(descriptor, encoded)
+    finally:
+        os.close(descriptor)
+
+    with pytest.raises(security.AuditRecoveryRequired) as raised:
+        logger.emit(probe)
+
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert not security._audit_receipt_path(index_root, pending.event_id).exists()
+    assert not security._audit_receipt_path(index_root, probe.event_id).exists()
+
+
+@pytest.mark.parametrize(
+    "stage",
+    ["reservation_checkpoint", "receipt_commit", "completion_checkpoint"],
+)
+def test_suffix_reconciliation_resumes_each_reserved_record_stage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stage: str,
+) -> None:
+    """A reconciliation crash must resume its one pending suffix record idempotently."""
+    from pyquality import security
+
+    path = tmp_path / "audit.jsonl"
+    index_base = tmp_path / "index"
+    logger = AuditLogger(path, index_root=index_base)
+    seeds = [
+        AuditEvent(event_id=character * 64, event_type="transition")
+        for character in ("5", "6")
+    ]
+    initial = b"".join(logger._encode(event) for event in seeds)
+    _prepare_existing_audit(path, initial)
+    first = seeds[0]
+    faulted = False
+    real_store = security._store_audit_checkpoint
+    real_commit = security._commit_audit_receipt
+
+    def fail_once() -> None:
+        nonlocal faulted
+        if not faulted:
+            faulted = True
+            raise OSError(f"simulated reconciliation crash at {stage}")
+
+    def faulting_store(*args: object, **kwargs: object):
+        previous = args[1] if len(args) > 1 else kwargs.get("previous")
+        pending_event_id = kwargs.get("pending_event_id")
+        if (
+            stage == "completion_checkpoint"
+            and previous is not None
+            and previous.pending_event_id == first.event_id
+            and pending_event_id is None
+        ):
+            fail_once()
+        stored = real_store(*args, **kwargs)
+        if (
+            stage == "reservation_checkpoint"
+            and stored.pending_event_id == first.event_id
+        ):
+            fail_once()
+        return stored
+
+    def faulting_commit(
+        descriptor: int,
+        event_id: str,
+        offset: int,
+        encoded: bytes,
+    ) -> None:
+        real_commit(descriptor, event_id, offset, encoded)
+        if stage == "receipt_commit" and event_id == first.event_id:
+            fail_once()
+
+    with monkeypatch.context() as fault:
+        fault.setattr(security, "_store_audit_checkpoint", faulting_store)
+        fault.setattr(security, "_commit_audit_receipt", faulting_commit)
+        with pytest.raises(AuditWriteError):
+            logger.emit(AuditEvent(event_id="7" * 64, event_type="transition"))
+    assert faulted
+
+    logger.emit(first)
+
+    records = [json.loads(line) for line in path.read_bytes().splitlines()]
+    assert [record["event_id"] for record in records] == [
+        event.event_id for event in seeds
+    ]
+    descriptor = security._open_audit(path)
+    try:
+        index_root = security._audit_index_root(path, descriptor, index_base)
+        audit_size = os.lseek(descriptor, 0, os.SEEK_END)
+    finally:
+        os.close(descriptor)
+    checkpoint_descriptor = security._open_audit(
+        index_root / "checkpoint",
+        append=False,
+    )
+    try:
+        checkpoint = security._load_audit_checkpoint(
+            checkpoint_descriptor,
+            audit_size=audit_size,
+        )
+    finally:
+        os.close(checkpoint_descriptor)
+    assert checkpoint is not None
+    assert checkpoint.pending_event_id is None
+    assert checkpoint.committed_receipt_count == len(seeds)
+
+
 def test_audit_id_scan_ignores_nested_id_in_oversized_legacy_record(
     tmp_path: Path,
 ) -> None:
