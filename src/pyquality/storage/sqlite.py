@@ -175,10 +175,11 @@ class SQLiteTaskRepository:
         self._connection = sqlite3.connect(
             connection_path, isolation_level=None, check_same_thread=False
         )
-        self._connection.row_factory = sqlite3.Row
-        self._connection.execute("PRAGMA foreign_keys = ON")
-        self._connection.execute("PRAGMA journal_mode = WAL")
-        self._create_schema()
+        with self._connection_lock:
+            self._connection.row_factory = sqlite3.Row
+            self._connection.execute("PRAGMA foreign_keys = ON")
+            self._connection.execute("PRAGMA journal_mode = WAL")
+            self._create_schema()
 
     def create_task(
         self,
@@ -717,14 +718,15 @@ class SQLiteTaskRepository:
         return self._approval_by_id(replacement_id)
 
     def pending_approval(self, task_id: str) -> ApprovalRecord | None:
-        row = self._connection.execute(
-            """SELECT approvals.* FROM approvals
-               JOIN tasks ON tasks.id = approvals.task_id
-               WHERE approvals.task_id = ? AND approvals.decision IS NULL
-                 AND tasks.status = ?
-               ORDER BY approvals.created_at DESC, approvals.id DESC LIMIT 1""",
-            (task_id, TaskStatus.WAITING_APPROVAL.value),
-        ).fetchone()
+        with self._connection_lock:
+            row = self._connection.execute(
+                """SELECT approvals.* FROM approvals
+                   JOIN tasks ON tasks.id = approvals.task_id
+                   WHERE approvals.task_id = ? AND approvals.decision IS NULL
+                     AND tasks.status = ?
+                   ORDER BY approvals.created_at DESC, approvals.id DESC LIMIT 1""",
+                (task_id, TaskStatus.WAITING_APPROVAL.value),
+            ).fetchone()
         return _approval_from_row(row) if row is not None else None
 
     def decide_approval(self, approval_id: str, decision: ApprovalDecision) -> ApprovalRecord:
@@ -766,6 +768,72 @@ class SQLiteTaskRepository:
                 ),
             )
         return self._approval_by_id(approval_id)
+
+    def decide_approval_and_acquire_lease(
+        self,
+        approval_id: str,
+        decision: ApprovalDecision,
+        *,
+        owner_token: str,
+    ) -> ApprovalRecord:
+        """Atomically decide, resume, and install the caller's pre-dispatch lease."""
+        _require_owner_token(owner_token)
+        with self._read_transaction() as connection:
+            approval = self._require_approval(connection, approval_id)
+            task = self._require_task(connection, approval["task_id"])
+            project_id = task["project_id"]
+        local_lock = LocalProjectLock.try_acquire(self._lock_root, project_id)
+        if local_lock is None:
+            raise StorageStateError("repository is busy")
+        try:
+            with self._transaction() as connection:
+                approval = self._require_approval(connection, approval_id)
+                task = self._require_task(connection, approval["task_id"])
+                if (
+                    approval["decision"] is not None
+                    or task["status"] != TaskStatus.WAITING_APPROVAL.value
+                ):
+                    raise StorageStateError("approval cannot be decided")
+                existing = connection.execute(
+                    "SELECT 1 FROM project_leases WHERE project_id = ?",
+                    (project_id,),
+                ).fetchone()
+                if existing is not None:
+                    raise StorageStateError("repository is busy")
+                connection.execute(
+                    "UPDATE approvals SET decision = ?, decided_at = ? WHERE id = ?",
+                    (decision.value, _dump_datetime(_utc_now()), approval_id),
+                )
+                connection.execute(
+                    """UPDATE tasks SET status = ?, result_json = NULL
+                       WHERE id = ? AND status = ?""",
+                    (
+                        TaskStatus.RUNNING.value,
+                        approval["task_id"],
+                        TaskStatus.WAITING_APPROVAL.value,
+                    ),
+                )
+                connection.execute(
+                    """INSERT INTO project_leases
+                       (project_id, task_id, owner_token, acquired_at, protocol)
+                       VALUES (?, ?, ?, ?, ?)""",
+                    (
+                        project_id,
+                        approval["task_id"],
+                        owner_token,
+                        _dump_datetime(_utc_now()),
+                        _LEASE_PROTOCOL,
+                    ),
+                )
+            self._held_leases[owner_token] = (
+                project_id,
+                approval["task_id"],
+                local_lock,
+            )
+            return self._approval_by_id(approval_id)
+        except Exception:
+            local_lock.release()
+            raise
 
     def mark_execution_intent(
         self,
@@ -921,16 +989,17 @@ class SQLiteTaskRepository:
         return self._transition_intent_by_id(intent_id)
 
     def close(self) -> None:
-        try:
-            for owner_token in tuple(self._held_leases):
-                self._release_local_lease(owner_token)
-        finally:
+        with self._connection_lock:
             try:
-                self._connection.close()
+                for owner_token in tuple(self._held_leases):
+                    self._release_local_lease(owner_token)
             finally:
-                if self._temporary_lock_directory is not None:
-                    self._temporary_lock_directory.cleanup()
-                    self._temporary_lock_directory = None
+                try:
+                    self._connection.close()
+                finally:
+                    if self._temporary_lock_directory is not None:
+                        self._temporary_lock_directory.cleanup()
+                        self._temporary_lock_directory = None
 
     def fail_inconsistent_task(self, task_id: str, summary: str) -> TaskResult:
         """Durably fail a task whose typed snapshot cannot be reconstructed."""
@@ -963,13 +1032,48 @@ class SQLiteTaskRepository:
         self._release_local_leases_for_task(task_id)
         return result
 
+    def discard_unstarted_task(self, task_id: str) -> None:
+        """Remove a task that failed before any agent-loop work was accepted."""
+        with self._transaction() as connection:
+            task = self._require_task(connection, task_id)
+            evidence = connection.execute(
+                """SELECT
+                     (SELECT COUNT(*) FROM iterations WHERE task_id = ?) AS iterations,
+                     (SELECT COUNT(*) FROM approvals WHERE task_id = ?) AS approvals""",
+                (task_id, task_id),
+            ).fetchone()
+            if evidence["iterations"] or evidence["approvals"]:
+                raise StorageStateError("task already has durable execution evidence")
+            connection.execute("DELETE FROM project_leases WHERE task_id = ?", (task_id,))
+            connection.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+            connection.execute(
+                """DELETE FROM projects WHERE id = ?
+                   AND NOT EXISTS (SELECT 1 FROM tasks WHERE project_id = ?)""",
+                (task["project_id"], task["project_id"]),
+            )
+        self._release_local_leases_for_task(task_id)
+
+    def task_project_path(self, task_id: str) -> str:
+        with self._read_transaction() as connection:
+            row = connection.execute(
+                """SELECT projects.canonical_path FROM tasks
+                   JOIN projects ON projects.id = tasks.project_id
+                   WHERE tasks.id = ?""",
+                (task_id,),
+            ).fetchone()
+            if row is None:
+                raise StorageStateError("task does not exist")
+            return str(row["canonical_path"])
+
     def acquire_project_lease(self, task_id: str, *, owner_token: str) -> bool:
         _require_owner_token(owner_token)
-        held = self._held_leases.get(owner_token)
+        with self._connection_lock:
+            held = self._held_leases.get(owner_token)
         if held is not None:
             return held[1] == task_id
 
-        task = self._require_task(self._connection, task_id)
+        with self._connection_lock:
+            task = self._require_task(self._connection, task_id)
         if task["status"] != TaskStatus.RUNNING.value:
             raise StorageStateError("only running tasks can acquire a project lease")
         project_id = task["project_id"]
@@ -1408,33 +1512,41 @@ class SQLiteTaskRepository:
             raise StorageStateError("running task does not own the project lease owner token")
 
     def _release_local_lease(self, owner_token: str) -> None:
-        held = self._held_leases.pop(owner_token, None)
+        with self._connection_lock:
+            held = self._held_leases.pop(owner_token, None)
         if held is not None:
             held[2].release()
 
     def _release_local_leases_for_task(self, task_id: str) -> None:
-        for owner_token, held in tuple(self._held_leases.items()):
+        with self._connection_lock:
+            held_items = tuple(self._held_leases.items())
+        for owner_token, held in held_items:
             if held[1] == task_id:
                 self._release_local_lease(owner_token)
 
     def _approval_by_id(self, approval_id: str) -> ApprovalRecord:
-        row = self._connection.execute("SELECT * FROM approvals WHERE id = ?", (approval_id,)).fetchone()
+        with self._connection_lock:
+            row = self._connection.execute(
+                "SELECT * FROM approvals WHERE id = ?", (approval_id,)
+            ).fetchone()
         if row is None:
             raise StorageStateError("approval does not exist")
         return _approval_from_row(row)
 
     def _iteration_by_id(self, iteration_id: str) -> IterationRecord:
-        row = self._connection.execute(
-            "SELECT * FROM iterations WHERE id = ?", (iteration_id,)
-        ).fetchone()
+        with self._connection_lock:
+            row = self._connection.execute(
+                "SELECT * FROM iterations WHERE id = ?", (iteration_id,)
+            ).fetchone()
         if row is None:
             raise StorageStateError("iteration does not exist")
         return _iteration_from_row(row)
 
     def _transition_intent_by_id(self, intent_id: str) -> TransitionIntentRecord:
-        row = self._connection.execute(
-            "SELECT * FROM transition_intents WHERE id = ?", (intent_id,)
-        ).fetchone()
+        with self._connection_lock:
+            row = self._connection.execute(
+                "SELECT * FROM transition_intents WHERE id = ?", (intent_id,)
+            ).fetchone()
         if row is None:
             raise StorageStateError("transition intent does not exist")
         return _transition_intent_from_row(row)

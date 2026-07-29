@@ -38,6 +38,14 @@ class _Loop(Protocol):
 
     def decide_approval(self, approval_id: str, decision: ApprovalDecision) -> str: ...
 
+    def decide_approval_leased(
+        self,
+        approval_id: str,
+        decision: ApprovalDecision,
+        *,
+        owner_token: str,
+    ) -> str: ...
+
 
 class _Credentials(Protocol):
     def status(self, account: str) -> CredentialStatus: ...
@@ -102,6 +110,7 @@ class HarnessService:
         self._active_repositories: dict[str, str] = {}
         self._task_repositories: dict[str, str] = {}
         self._futures: dict[str, Future[TaskResult]] = {}
+        self._pending_owners: dict[str, str] = {}
 
     @property
     def settings(self) -> Settings:
@@ -110,24 +119,66 @@ class HarnessService:
     def create_task(self, repo_path: Path | str, request: str) -> TaskView:
         root = self._preflight(Path(repo_path), request)
         canonical = str(root)
+        if not self._capacity.acquire(blocking=False):
+            raise PreflightError("global execution capacity is exhausted")
+        record: TaskRecord | None = None
+        placeholder: Future[TaskResult] = Future()
         with self._lock:
             if canonical in self._active_repositories:
+                self._capacity.release()
                 raise ProjectBusyError("repository already has active work")
-            record = self._repository.create_task(canonical, request, self._settings.round_limit)
+            try:
+                record = self._repository.create_task(
+                    canonical, request, self._settings.round_limit
+                )
+            except Exception:
+                self._capacity.release()
+                raise
             self._active_repositories[canonical] = record.id
             self._task_repositories[record.id] = canonical
-        return self._view(record)
+            self._futures[record.id] = placeholder
+        self._prepare_submission(
+            record.id,
+            placeholder,
+            resume=False,
+            rollback_new_task=True,
+        )
+        return self.get_task(record.id)
 
     def start_task(self, task_id: str, *, resume: bool = False) -> Future[TaskResult]:
         with self._lock:
             existing = self._futures.get(task_id)
-            if existing is not None and not existing.done():
+            if existing is not None:
                 return existing
-            self._require_known_task(task_id)
-            if not self._capacity.acquire(blocking=False):
-                self._fail_acceptance(task_id, "Global execution capacity is exhausted.")
-                raise PreflightError("global execution capacity is exhausted")
-        return self._submit_with_lease(task_id, resume=resume, capacity_held=True)
+        snapshot = self._snapshot(task_id)
+        if snapshot.task.status in _TERMINAL or snapshot.task.status is TaskStatus.WAITING_APPROVAL:
+            completed: Future[TaskResult] = Future()
+            if snapshot.task.result is None:
+                raise PreflightError("saved task result is unavailable")
+            completed.set_result(snapshot.task.result)
+            with self._lock:
+                return self._futures.setdefault(task_id, completed)
+        if not self._capacity.acquire(blocking=False):
+            raise PreflightError("global execution capacity is exhausted")
+        placeholder: Future[TaskResult] = Future()
+        with self._lock:
+            existing = self._futures.get(task_id)
+            if existing is not None:
+                self._capacity.release()
+                return existing
+            self._futures[task_id] = placeholder
+            canonical = self._repository.task_project_path(task_id)
+            self._task_repositories[task_id] = canonical
+            self._active_repositories[canonical] = task_id
+            owner_token = self._pending_owners.get(task_id)
+        self._prepare_submission(
+            task_id,
+            placeholder,
+            resume=resume or snapshot.task.status is TaskStatus.RUNNING,
+            rollback_new_task=False,
+            owner_token=owner_token,
+        )
+        return placeholder
 
     def get_task(self, task_id: str) -> TaskView:
         snapshot = self._snapshot(task_id)
@@ -142,12 +193,15 @@ class HarnessService:
     def cancel_task(self, task_id: str) -> None:
         with self._lock:
             future = self._futures.get(task_id)
-            if future is not None and not future.done():
+            if future is not None:
                 raise PreflightError("running task cannot be cancelled")
             canonical = self._task_repositories.pop(task_id, None)
             if canonical is not None and self._active_repositories.get(canonical) == task_id:
                 self._active_repositories.pop(canonical, None)
-        self._repository.fail_inconsistent_task(task_id, "Task cancelled before execution.")
+        snapshot = self._snapshot(task_id)
+        if snapshot.task.status is not TaskStatus.CREATED:
+            raise PreflightError("running task cannot be cancelled")
+        self._repository.discard_unstarted_task(task_id)
 
     def export_audit(self) -> tuple[AuditEvent, ...]:
         if self._audit_path is None:
@@ -204,17 +258,37 @@ class HarnessService:
     ) -> Future[TaskResult]:
         if not self._capacity.acquire(blocking=False):
             raise PreflightError("global execution capacity is exhausted")
+        owner_token = uuid4().hex
         try:
-            task_id = self._loop.decide_approval(approval_id, decision)
+            task_id = self._loop.decide_approval_leased(
+                approval_id, decision, owner_token=owner_token
+            )
         except Exception:
             self._capacity.release()
             raise
-        return self._submit_with_lease(task_id, resume=True, capacity_held=True)
+        placeholder: Future[TaskResult] = Future()
+        with self._lock:
+            self._futures[task_id] = placeholder
+            self._pending_owners[task_id] = owner_token
+        self._dispatch_preleased(
+            task_id,
+            owner_token,
+            placeholder,
+            resume=True,
+            rollback_new_task=False,
+        )
+        return placeholder
 
-    def _submit_with_lease(
-        self, task_id: str, *, resume: bool, capacity_held: bool
-    ) -> Future[TaskResult]:
-        owner_token = uuid4().hex
+    def _prepare_submission(
+        self,
+        task_id: str,
+        placeholder: Future[TaskResult],
+        *,
+        resume: bool,
+        rollback_new_task: bool,
+        owner_token: str | None = None,
+    ) -> None:
+        owner_token = owner_token or uuid4().hex
         lease_acquired = False
         try:
             snapshot = self._snapshot(task_id)
@@ -225,50 +299,102 @@ class HarnessService:
                     raise PreflightError("task state changed before submission")
             elif snapshot.task.status is not TaskStatus.RUNNING:
                 raise PreflightError("task is not ready for execution")
-            lease_acquired = self._repository.acquire_project_lease(
+            lease_acquired = self._repository.owns_project_lease(
+                task_id, owner_token=owner_token
+            ) or self._repository.acquire_project_lease(
                 task_id, owner_token=owner_token
             )
             if not lease_acquired:
                 raise ProjectBusyError("repository is busy")
-            future = self._executor.submit(
-                self._loop.run_leased,
-                task_id,
-                owner_token,
-                resume=resume,
-            )
-            with self._lock:
-                self._futures[task_id] = future
-            future.add_done_callback(lambda completed: self._after_run(task_id, completed))
-            return future
         except Exception:
             if lease_acquired:
                 self._repository.release_project_lease(
                     task_id, owner_token=owner_token
                 )
-            self._fail_acceptance(task_id, "Task submission failed.")
-            if capacity_held:
-                self._capacity.release()
+            if rollback_new_task:
+                self._repository.discard_unstarted_task(task_id)
+            self._remove_submission(task_id)
+            self._capacity.release()
             raise
+        with self._lock:
+            self._pending_owners[task_id] = owner_token
+        self._dispatch_preleased(
+            task_id,
+            owner_token,
+            placeholder,
+            resume=resume,
+            rollback_new_task=rollback_new_task,
+        )
 
-    def _fail_acceptance(self, task_id: str, summary: str) -> None:
-        self._repository.fail_inconsistent_task(task_id, summary)
-        canonical = self._task_repositories.pop(task_id, None)
-        if canonical is not None and self._active_repositories.get(canonical) == task_id:
-            self._active_repositories.pop(canonical, None)
-
-    def _after_run(self, task_id: str, future: Future[TaskResult]) -> None:
+    def _dispatch_preleased(
+        self,
+        task_id: str,
+        owner_token: str,
+        placeholder: Future[TaskResult],
+        *,
+        resume: bool,
+        rollback_new_task: bool,
+    ) -> None:
         try:
-            try:
-                result = future.result()
-            except Exception:  # noqa: BLE001 - executor preserves injected loop failures.
-                result = None
-            if result is None or result.status in _TERMINAL:
+            worker = self._executor.submit(
+                self._loop.run_leased,
+                task_id,
+                owner_token,
+                resume=resume,
+            )
+        except Exception:
+            if rollback_new_task:
+                self._repository.release_project_lease(
+                    task_id, owner_token=owner_token
+                )
+                self._repository.discard_unstarted_task(task_id)
+                self._remove_submission(task_id)
+            else:
                 with self._lock:
+                    self._futures.pop(task_id, None)
+            self._capacity.release()
+            raise
+        worker.add_done_callback(
+            lambda completed: self._complete_submission(
+                task_id, owner_token, placeholder, completed
+            )
+        )
+
+    def _complete_submission(
+        self,
+        task_id: str,
+        owner_token: str,
+        placeholder: Future[TaskResult],
+        worker: Future[TaskResult],
+    ) -> None:
+        result: TaskResult | None = None
+        try:
+            result = worker.result()
+            placeholder.set_result(result)
+        except Exception as error:  # noqa: BLE001 - preserve injected loop failure.
+            placeholder.set_exception(error)
+        finally:
+            if self._repository.owns_project_lease(
+                task_id, owner_token=owner_token
+            ):
+                self._repository.release_project_lease(
+                    task_id, owner_token=owner_token
+                )
+            with self._lock:
+                self._pending_owners.pop(task_id, None)
+                if result is None or result.status in _TERMINAL:
                     canonical = self._task_repositories.pop(task_id, None)
                     if canonical is not None and self._active_repositories.get(canonical) == task_id:
                         self._active_repositories.pop(canonical, None)
-        finally:
             self._capacity.release()
+
+    def _remove_submission(self, task_id: str) -> None:
+        with self._lock:
+            self._futures.pop(task_id, None)
+            self._pending_owners.pop(task_id, None)
+            canonical = self._task_repositories.pop(task_id, None)
+            if canonical is not None and self._active_repositories.get(canonical) == task_id:
+                self._active_repositories.pop(canonical, None)
 
     def _view(self, task: TaskRecord, *, snapshot: object | None = None) -> TaskView:
         iterations = getattr(snapshot, "iterations", ())

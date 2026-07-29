@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
+from threading import Barrier
 
 import pytest
 from conftest import (
@@ -25,6 +27,7 @@ from pyquality.llm import Message, ScriptedLLM
 from pyquality.loop import ApprovalStateError
 from pyquality.policy import PolicyEngine
 from pyquality.service import HarnessService
+from pyquality.storage.sqlite import StorageStateError
 
 
 @pytest.mark.parametrize("decision", [ApprovalDecision.APPROVE, ApprovalDecision.REJECT])
@@ -52,6 +55,79 @@ def test_service_approval_decision_resumes_real_loop_to_terminal(
     )
 
     assert future.result(timeout=2).status is TaskStatus.SUCCEEDED
+
+
+@pytest.mark.parametrize("decision", [ApprovalDecision.APPROVE, ApprovalDecision.REJECT])
+def test_service_approval_submit_failure_keeps_recoverable_decision_and_lease(
+    loop_fixture, decision: ApprovalDecision
+) -> None:
+    harness = loop_fixture(
+        responses=[dependency_patch_json(), finish_json()],
+        reports=[successful_report(), successful_report()],
+    )
+    service = HarnessService(
+        repository=harness.repository,
+        loop=harness.loop,
+        settings=Settings(global_concurrency=1),
+        verifier_finder=lambda name: name,
+    )
+    task = service.create_task(harness.repo_root, "repair")
+    assert service.start_task(task.id).result(timeout=2).status is TaskStatus.WAITING_APPROVAL
+    approval = harness.loop.pending_approval(task.id)
+
+    class FailingExecutor:
+        def submit(self, *args, **kwargs):
+            raise RuntimeError("submit failed")
+
+    service._executor = FailingExecutor()
+    with pytest.raises(RuntimeError, match="submit failed"):
+        if decision is ApprovalDecision.APPROVE:
+            service.approve(approval.id)
+        else:
+            service.reject(approval.id)
+
+    snapshot = harness.repository.resume_snapshot(task.id)
+    assert snapshot.task.status is TaskStatus.RUNNING
+    assert snapshot.decided_approval is not None
+    assert snapshot.decided_approval.decision is decision
+    assert harness.repository._held_leases
+    service._executor = ThreadPoolExecutor(max_workers=1)
+    assert service.start_task(task.id).result(timeout=2).status is TaskStatus.SUCCEEDED
+
+
+def test_approval_contention_consumes_exactly_one_decision(loop_fixture) -> None:
+    harness = loop_fixture(responses=[dependency_patch_json()])
+    service = HarnessService(
+        repository=harness.repository,
+        loop=harness.loop,
+        settings=Settings(global_concurrency=1),
+        verifier_finder=lambda name: name,
+    )
+    task = service.create_task(harness.repo_root, "repair")
+    assert service.start_task(task.id).result(timeout=2).status is TaskStatus.WAITING_APPROVAL
+    approval = harness.loop.pending_approval(task.id)
+    contender = type(harness.repository)(harness.db_path)
+    barrier = Barrier(2)
+
+    def decide(repository, decision: ApprovalDecision, token: str) -> str:
+        barrier.wait()
+        try:
+            repository.decide_approval_and_acquire_lease(
+                approval.id, decision, owner_token=token
+            )
+            return decision.value
+        except StorageStateError:
+            return "lost"
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [
+            pool.submit(decide, harness.repository, ApprovalDecision.APPROVE, "approve-owner"),
+            pool.submit(decide, contender, ApprovalDecision.REJECT, "reject-owner"),
+        ]
+        values = [future.result() for future in futures]
+
+    assert values.count("lost") == 1
+    assert len({value for value in values if value != "lost"}) == 1
 
 
 def test_approval_pauses_and_executes_once(loop_fixture) -> None:

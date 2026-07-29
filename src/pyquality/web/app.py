@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import secrets
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Literal, Protocol
 
@@ -10,6 +11,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
+from ..domain.models import TaskStatus
 from ..service import PreflightError, ProjectBusyError, TaskView
 
 
@@ -29,12 +31,41 @@ _TEMPLATES = Jinja2Templates(directory=str(Path(__file__).with_name("templates")
 _BUNDLED_SCENARIO = "broken_calculator"
 
 
+class PublicDemoService:
+    """Capability-restricted, data-only registry for offline public scenarios."""
+
+    def __init__(self, scenarios: Mapping[str, str]) -> None:
+        self._scenarios = dict(scenarios)
+        self._tasks: dict[str, TaskView] = {}
+
+    def run_scenario(self, scenario_id: str) -> TaskView:
+        task_id = self._scenarios.get(scenario_id)
+        if not isinstance(task_id, str) or not task_id:
+            raise PreflightError("public scenario is unavailable")
+        view = TaskView(
+            id=task_id,
+            status=TaskStatus.CREATED,
+            round_limit=8,
+            remaining_rounds=8,
+        )
+        self._tasks[task_id] = view
+        return view
+
+    def get_task(self, task_id: str) -> TaskView:
+        try:
+            return self._tasks[task_id]
+        except KeyError:
+            raise PreflightError("task does not exist") from None
+
+
 def create_app(
     service: WebService, mode: Literal["local", "public_mock"] = "local"
 ) -> FastAPI:
     """Create a local UI or a path/credential-isolated public mock UI."""
     if mode not in {"local", "public_mock"}:
         raise ValueError("unsupported WebUI mode")
+    if mode == "public_mock" and type(service) is not PublicDemoService:
+        raise TypeError("public demo requires a capability-restricted service")
     app = FastAPI()
     sessions: dict[str, dict[str, object]] = {}
 
@@ -83,17 +114,15 @@ def create_app(
         form = await require_csrf(request)
         if isinstance(form, HTMLResponse):
             return form
-        if mode == "public_mock":
-            if set(form) - {"scenario", "csrf_token"} or form.get("scenario") != _BUNDLED_SCENARIO:
-                return HTMLResponse("Public demo accepts only the bundled scenario", status_code=403)
-            repo_path: Path | str = _BUNDLED_SCENARIO
-            requested = "Run bundled scenario"
-        else:
-            repo_path = Path(str(form.get("repo_path", "")))
-            requested = str(form.get("request", ""))
         try:
-            task = service.create_task(repo_path, requested)
-            service.start_task(task.id)
+            if mode == "public_mock":
+                if set(form) - {"scenario", "csrf_token"} or form.get("scenario") != _BUNDLED_SCENARIO:
+                    return HTMLResponse("Public demo accepts only the bundled scenario", status_code=403)
+                task = service.run_scenario(_BUNDLED_SCENARIO)
+            else:
+                repo_path = Path(str(form.get("repo_path", "")))
+                requested = str(form.get("request", ""))
+                task = service.create_task(repo_path, requested)
         except (PreflightError, ProjectBusyError) as error:
             return _TEMPLATES.TemplateResponse(
                 request=request,

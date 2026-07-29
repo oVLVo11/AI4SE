@@ -61,10 +61,16 @@ def _default_run_service(repo: Path) -> _RunService:
 
 
 def _default_app_factory(repo: Path, mode: str) -> object:
-    from .application import build_service
-    from .web.app import create_app
+    from .web.app import PublicDemoService, create_app
 
-    return create_app(build_service(repo, provider="mock" if mode == "public_mock" else None), mode=mode)
+    if mode == "public_mock":
+        return create_app(
+            PublicDemoService({"broken_calculator": "public-demo"}),
+            mode="public_mock",
+        )
+    from .application import build_service
+
+    return create_app(build_service(repo), mode="local")
 
 
 def main(

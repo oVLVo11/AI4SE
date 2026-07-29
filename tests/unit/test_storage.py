@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -780,3 +781,53 @@ def test_deferred_approval_outcome_completes_original_iteration_idempotently(
     assert len(reopened.iterations) == 1
     assert reopened.iterations[0].quality_outcome == "failed"
     assert tuple(record.finding for record in reopened.findings) == (finding,)
+
+
+def test_every_shared_connection_execute_is_serialized_by_repository_lock(
+    repo: SQLiteTaskRepository, tmp_path: Path
+) -> None:
+    root = tmp_path / "serialized"
+    root.mkdir()
+    task = repo.create_task(str(root.resolve()), "read", round_limit=2)
+    connection = repo._connection
+
+    class GuardedConnection:
+        def execute(self, *args, **kwargs):
+            assert repo._connection_lock._is_owned()
+            return connection.execute(*args, **kwargs)
+
+        def __getattr__(self, name: str):
+            return getattr(connection, name)
+
+    repo._connection = GuardedConnection()
+    try:
+        assert repo.pending_approval(task.id) is None
+    finally:
+        repo._connection = connection
+
+
+def test_concurrent_snapshot_readers_and_iteration_writer_share_one_connection_lock(
+    repo: SQLiteTaskRepository, tmp_path: Path
+) -> None:
+    root = tmp_path / "reader-writer"
+    root.mkdir()
+    task = repo.create_task(str(root.resolve()), "stress", round_limit=8)
+
+    def write() -> None:
+        for sequence in range(1, 21):
+            repo.append_iteration(
+                task.id,
+                sequence=sequence,
+                context_digest=f"{sequence:064x}",
+            )
+
+    def read() -> None:
+        for _ in range(40):
+            assert repo.resume_snapshot(task.id).task.id == task.id
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        futures = [pool.submit(write), pool.submit(read), pool.submit(read)]
+        for future in futures:
+            future.result()
+
+    assert len(repo.resume_snapshot(task.id).iterations) == 20

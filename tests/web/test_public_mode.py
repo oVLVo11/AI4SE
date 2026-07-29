@@ -6,9 +6,10 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
+from pyquality.cli import _default_app_factory
 from pyquality.domain.models import TaskStatus
 from pyquality.service import TaskView
-from pyquality.web.app import create_app
+from pyquality.web.app import PublicDemoService, create_app
 
 pytestmark = pytest.mark.filterwarnings(
     "ignore:Using `httpx` with `starlette.testclient` is deprecated:DeprecationWarning"
@@ -46,7 +47,7 @@ def csrf(client: TestClient) -> str:
 
 
 def test_public_mock_rejects_paths_provider_changes_and_credentials() -> None:
-    service = PublicService()
+    service = PublicDemoService({"broken_calculator": "demo-task"})
     client = TestClient(create_app(service, mode="public_mock"))
     token = csrf(client)
 
@@ -59,11 +60,47 @@ def test_public_mock_rejects_paths_provider_changes_and_credentials() -> None:
     assert client.post(
         "/provider", data={"provider": "openai", "csrf_token": token}
     ).status_code == 404
-    assert service.calls == []
+
+
+def test_public_mock_rejects_service_with_repository_or_credential_capability() -> None:
+    with pytest.raises(TypeError, match="public demo"):
+        create_app(PublicService(), mode="public_mock")
+
+
+def test_real_public_demo_capability_accepts_only_registered_offline_scenario() -> None:
+    service = PublicDemoService({"broken_calculator": "demo-task"})
+    client = TestClient(create_app(service, mode="public_mock"))
+
+    response = client.post(
+        "/tasks",
+        data={"scenario": "broken_calculator", "csrf_token": csrf(client)},
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+
+
+def test_default_public_app_cannot_build_real_provider_or_credentials(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(
+        "pyquality.application.build_service",
+        lambda *args, **kwargs: pytest.fail("real harness composition reached"),
+    )
+
+    app = _default_app_factory(tmp_path, "public_mock")
+    client = TestClient(app)
+    response = client.post(
+        "/tasks",
+        data={"scenario": "broken_calculator", "csrf_token": csrf(client)},
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
 
 
 def test_public_mock_accepts_only_bundled_scenario() -> None:
-    service = PublicService()
+    service = PublicDemoService({"broken_calculator": "demo-task"})
     client = TestClient(create_app(service, mode="public_mock"))
     response = client.post(
         "/tasks",
@@ -71,11 +108,13 @@ def test_public_mock_accepts_only_bundled_scenario() -> None:
         follow_redirects=False,
     )
     assert response.status_code == 303
-    assert service.calls == [("broken_calculator", "Run bundled scenario")]
+    assert service.get_task("demo-task").id == "demo-task"
 
 
 def test_public_mock_rejects_unknown_scenario() -> None:
-    client = TestClient(create_app(PublicService(), mode="public_mock"))
+    client = TestClient(
+        create_app(PublicDemoService({"broken_calculator": "demo-task"}), mode="public_mock")
+    )
     response = client.post(
         "/tasks", data={"scenario": "other", "csrf_token": csrf(client)}
     )

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from concurrent.futures import Future
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from threading import Event
 
@@ -85,11 +85,27 @@ def make_service(repository: SQLiteTaskRepository, **kwargs: object) -> HarnessS
 def test_service_rejects_second_active_task_for_same_repository(
     repository: SQLiteTaskRepository, repo: Path
 ) -> None:
-    service = make_service(repository)
+    entered = Event()
+    release = Event()
+
+    class BlockingLoop(StubLoop):
+        def run(self, task_id: str) -> TaskResult:
+            entered.set()
+            assert release.wait(2)
+            return super().run(task_id)
+
+    service = HarnessService(
+        repository=repository,
+        loop=BlockingLoop(repository),
+        settings=Settings(),
+        verifier_finder=lambda name: name,
+    )
     service.create_task(repo, "first")
+    assert entered.wait(1)
 
     with pytest.raises(ProjectBusyError, match="already has active work"):
         service.create_task(repo, "second")
+    release.set()
 
 
 def test_preflight_reports_missing_verifier_and_invalid_repository(
@@ -154,16 +170,13 @@ def test_submission_queue_is_bounded_by_global_concurrency(
         verifier_finder=lambda name: name,
     )
     first = service.create_task(first_repo, "first")
-    second = service.create_task(second_repo, "second")
-    running = service.start_task(first.id)
     assert entered.wait(1)
 
     with pytest.raises(PreflightError, match="capacity"):
-        service.start_task(second.id)
+        service.create_task(second_repo, "second")
 
     release.set()
-    assert running.result(timeout=2).status is TaskStatus.SUCCEEDED
-    assert repository.resume_snapshot(second.id).task.status is TaskStatus.FAILED
+    assert service.start_task(first.id).result(timeout=2).status is TaskStatus.SUCCEEDED
     replacement = service.create_task(second_repo, "replacement")
     assert service.start_task(replacement.id).result(timeout=2).status is TaskStatus.SUCCEEDED
 
@@ -198,16 +211,89 @@ def test_lease_is_cross_repository_instance_safe_before_executor_submit(
         verifier_finder=lambda name: name,
     )
     running_task = first.create_task(repo, "first")
-    contender = second.create_task(repo, "second")
-    running = first.start_task(running_task.id)
     assert entered.wait(1)
 
     with pytest.raises(ProjectBusyError, match="busy"):
-        second.start_task(contender.id)
+        second.create_task(repo, "second")
 
-    assert second_repository.resume_snapshot(contender.id).task.status is TaskStatus.FAILED
     release.set()
-    assert running.result(timeout=2).status is TaskStatus.SUCCEEDED
+    assert first.start_task(running_task.id).result(timeout=2).status is TaskStatus.SUCCEEDED
+
+
+def test_create_atomically_submits_and_duplicate_start_returns_same_future(
+    repository: SQLiteTaskRepository, repo: Path
+) -> None:
+    entered = Event()
+    release = Event()
+
+    class BlockingLoop(StubLoop):
+        def run(self, task_id: str) -> TaskResult:
+            entered.set()
+            assert release.wait(2)
+            return super().run(task_id)
+
+    service = HarnessService(
+        repository=repository,
+        loop=BlockingLoop(repository),
+        settings=Settings(global_concurrency=1),
+        verifier_finder=lambda name: name,
+    )
+    task = service.create_task(repo, "atomic")
+    assert entered.wait(1)
+
+    with ThreadPoolExecutor(max_workers=2) as callers:
+        returned = list(callers.map(lambda _: service.start_task(task.id), range(2)))
+    first, second = returned
+
+    assert first is second
+    release.set()
+    assert first.result(timeout=2).status is TaskStatus.SUCCEEDED
+
+
+def test_capacity_rejection_persists_no_task(
+    repository: SQLiteTaskRepository, tmp_path: Path
+) -> None:
+    entered = Event()
+    release = Event()
+
+    class BlockingLoop(StubLoop):
+        def run(self, task_id: str) -> TaskResult:
+            entered.set()
+            assert release.wait(2)
+            return super().run(task_id)
+
+    first_repo = tmp_path / "first-atomic"
+    second_repo = tmp_path / "second-atomic"
+    first_repo.mkdir()
+    second_repo.mkdir()
+    service = HarnessService(
+        repository=repository,
+        loop=BlockingLoop(repository),
+        settings=Settings(global_concurrency=1),
+        verifier_finder=lambda name: name,
+    )
+    first = service.create_task(first_repo, "first")
+    assert entered.wait(1)
+    before = repository._connection.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+
+    with pytest.raises(PreflightError, match="capacity"):
+        service.create_task(second_repo, "second")
+
+    after = repository._connection.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+    assert before == after == 1
+    release.set()
+    assert service.start_task(first.id).result(timeout=2).status is TaskStatus.SUCCEEDED
+
+
+def test_accepted_task_is_never_left_created(
+    repository: SQLiteTaskRepository, repo: Path
+) -> None:
+    service = make_service(repository)
+
+    task = service.create_task(repo, "submitted")
+
+    assert repository.resume_snapshot(task.id).task.status is not TaskStatus.CREATED
+    assert service.start_task(task.id).result(timeout=2).status is TaskStatus.SUCCEEDED
 
 
 def test_get_task_is_a_typed_safe_view(repository: SQLiteTaskRepository, repo: Path) -> None:
@@ -217,85 +303,37 @@ def test_get_task_is_a_typed_safe_view(repository: SQLiteTaskRepository, repo: P
     view = service.get_task(task.id)
 
     assert view.id == task.id
-    assert view.status is TaskStatus.CREATED
+    assert view.status is TaskStatus.SUCCEEDED
     assert "fix escaped" not in view.model_dump_json()
     assert view.remaining_rounds == Settings().round_limit
     assert "result_json" not in view.model_dump()
 
 
-def test_cancel_releases_never_started_repository_reservation(
+def test_cancel_rejects_an_already_submitted_task(
     repository: SQLiteTaskRepository, repo: Path
 ) -> None:
-    service = make_service(repository)
-    abandoned = service.create_task(repo, "abandoned")
+    entered = Event()
+    release = Event()
 
-    service.cancel_task(abandoned.id)
+    class BlockingLoop(StubLoop):
+        def run(self, task_id: str) -> TaskResult:
+            entered.set()
+            assert release.wait(2)
+            return super().run(task_id)
 
-    replacement = service.create_task(repo, "replacement")
-    assert replacement.status is TaskStatus.CREATED
-
-
-@pytest.mark.parametrize("decision", [ApprovalDecision.APPROVE, ApprovalDecision.REJECT])
-def test_approval_decision_bounded_resumes_to_terminal(
-    repository: SQLiteTaskRepository, repo: Path, decision: ApprovalDecision
-) -> None:
-    class ApprovalLoop(StubLoop):
-        task_id: str
-
-        def decide_approval(self, approval_id: str, selected: ApprovalDecision) -> str:
-            self.decisions.append((approval_id, selected))
-            assert repository.set_status(
-                self.task_id, TaskStatus.WAITING_APPROVAL, TaskStatus.RUNNING
-            )
-            return self.task_id
-
-        def run_leased(self, task_id: str, owner_token: str, *, resume: bool) -> TaskResult:
-            self.leased_runs.append((task_id, owner_token, resume))
-            result = TaskResult(
-                task_id=task_id,
-                status=TaskStatus.SUCCEEDED,
-                iterations=1,
-                verification_summary="continued",
-            )
-            assert repository.set_status(
-                task_id,
-                TaskStatus.RUNNING,
-                TaskStatus.SUCCEEDED,
-                result,
-                owner_token=owner_token,
-            )
-            return result
-
-    loop = ApprovalLoop(repository)
     service = HarnessService(
         repository=repository,
-        loop=loop,
+        loop=BlockingLoop(repository),
         settings=Settings(),
         verifier_finder=lambda name: name,
     )
-    task = service.create_task(repo, "fix")
-    loop.task_id = task.id
-    assert repository.set_status(task.id, TaskStatus.CREATED, TaskStatus.RUNNING)
-    assert repository.acquire_project_lease(task.id, owner_token="setup-owner")
-    waiting = TaskResult(
-        task_id=task.id,
-        status=TaskStatus.WAITING_APPROVAL,
-        iterations=1,
-        verification_summary="waiting",
-    )
-    assert repository.set_status(
-        task.id,
-        TaskStatus.RUNNING,
-        TaskStatus.WAITING_APPROVAL,
-        waiting,
-        owner_token="setup-owner",
-    )
+    submitted = service.create_task(repo, "submitted")
+    assert entered.wait(1)
 
-    future = service.approve("approval-1") if decision is ApprovalDecision.APPROVE else service.reject("approval-1")
+    with pytest.raises(PreflightError, match="running"):
+        service.cancel_task(submitted.id)
 
-    assert future.result(timeout=2).status is TaskStatus.SUCCEEDED
-    assert loop.decisions == [("approval-1", decision)]
-    assert loop.leased_runs[0][2] is True
+    release.set()
 
 
 def test_export_audit_returns_only_redacted_structured_events(

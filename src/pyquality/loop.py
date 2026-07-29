@@ -235,6 +235,27 @@ class AgentLoop:
         except StorageStateError as error:
             raise ApprovalStateError("approval cannot be decided") from error
 
+    def decide_approval_leased(
+        self,
+        approval_id: str,
+        decision: ApprovalDecision,
+        *,
+        owner_token: str,
+    ) -> str:
+        """Atomically decide and reserve the task for bounded service dispatch."""
+        try:
+            approval = self._repository.decide_approval_and_acquire_lease(
+                approval_id, decision, owner_token=owner_token
+            )
+            self._audit_after_commit(
+                "approval_decided",
+                approval.task_id,
+                {"approval_id": approval.id, "decision": decision.value},
+            )
+            return approval.task_id
+        except StorageStateError as error:
+            raise ApprovalStateError("approval cannot be decided") from error
+
     def _drive(self, task_id: str) -> TaskResult:
         while True:
             snapshot = self._repository.resume_snapshot(task_id)
