@@ -39,3 +39,47 @@
 - A passing non-finish report no longer terminalizes; missing/stale candidates and failing final verification cannot succeed.
 - The demo makes no provider/keyring/network call and copies only its bundled fixture into a disposable repository.
 - CLI failure is typed and sanitized; success JSON is schema-versioned and contains no absolute path.
+
+## Formal review round 1
+
+The authoritative review reported two Critical findings: stale finish success after a
+policy/verifier-intent crash followed by repository drift, and approved passing-patch
+recovery terminalizing without a candidate or distinct finish. It reported six Important
+findings: non-transactional candidate lifecycle and missing bounds/ownership; approved
+patches masked by artificial quality rounds; missing post-final deadline/lease/digest
+checks; fixed post-green text omitting persisted evidence; demo fixture/evidence not
+actually packaged/derived; and incomplete typed CLI/demo failure containment. No other
+findings were reported.
+
+Fix commits:
+
+- `d60a8bc fix: make finish evidence crash-safe`
+- `10339c0 fix: package and sanitize deterministic demo`
+
+RED/GREEN mapping:
+
+- Crash after the second completed verifier intent, mutate the repository, reopen: RED
+  reused the report with zero pipeline calls; GREEN binds verifier intent evidence to the
+  actual repository digest and performs two new real verifications before success.
+- Green candidate followed by failed quality then finish: RED reached a third verifier;
+  GREEN clears the candidate atomically with the failing iteration and rejects finish.
+- Final verifier crossing the deadline: RED succeeded; GREEN persists the verifier round
+  and terminalizes `BUDGET_EXHAUSTED` after the post-verifier check.
+- Approved patch then finish with two reports: RED exhausted the scripted model; GREEN
+  atomically persists the passing approved iteration, candidate, and completed approval,
+  then consumes one distinct finish/final verification. Crash-after-atomic-pass recovery
+  proves exact-once dispatch and two verifier calls.
+- Candidate/terminal transaction failures: injected RED-risk boundaries now roll back the
+  iteration together with candidate and roll back final iteration/result/cleanup together.
+- Post-green context RED omitted changed paths and rounds; GREEN renders persisted bounded
+  summary, relative changed paths, and computed remaining rounds through ContextBuilder.
+- Packaged fixture RED raised `ModuleNotFoundError`; GREEN copies via
+  `importlib.resources`. Report attempted state, action order, and patch digests now derive
+  from persisted actions and real dispatcher observations.
+- Forced demo and outer CLI temp setup failures RED leaked `OSError`; GREEN returns nonzero
+  stable path-free JSON without traceback.
+
+Round-1 verification collected 491 tests: 482 passed and 9 skipped. The new clean-wheel
+installation test is skipped only when the offline `hatchling` backend is unavailable; it
+builds, inspects, installs, and runs the wheel when that backend exists. Ruff and cumulative
+diff-check passed.
