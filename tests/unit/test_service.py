@@ -364,9 +364,9 @@ def test_incomplete_create_rollback_keeps_running_task_recoverable_and_frees_cap
     service = make_service(repository)
     service._executor = FailOnceExecutor(service._executor)
     original_release = repository.release_project_lease
-    original_discard = repository.discard_unstarted_task
+    original_rollback = repository.rollback_running_task
     release_calls = 0
-    discard_calls = 0
+    rollback_calls = 0
 
     def fail_release_once(task_id: str, *, owner_token: str) -> None:
         nonlocal release_calls
@@ -375,15 +375,15 @@ def test_incomplete_create_rollback_keeps_running_task_recoverable_and_frees_cap
             raise RuntimeError("release failed")
         original_release(task_id, owner_token=owner_token)
 
-    def fail_discard_once(task_id: str) -> None:
-        nonlocal discard_calls
-        discard_calls += 1
-        if discard_calls == 1:
-            raise RuntimeError("discard failed")
-        original_discard(task_id)
+    def fail_rollback_once(task_id: str, *, owner_token: str) -> bool:
+        nonlocal rollback_calls
+        rollback_calls += 1
+        if rollback_calls == 1:
+            raise RuntimeError("rollback failed")
+        return original_rollback(task_id, owner_token=owner_token)
 
     monkeypatch.setattr(repository, "release_project_lease", fail_release_once)
-    monkeypatch.setattr(repository, "discard_unstarted_task", fail_discard_once)
+    monkeypatch.setattr(repository, "rollback_running_task", fail_rollback_once)
 
     with pytest.raises(RuntimeError, match="submit failed"):
         service.create_task(failed_repo, "first")
@@ -405,7 +405,7 @@ def test_incomplete_create_rollback_keeps_running_task_recoverable_and_frees_cap
     service.close()
 
 
-def test_create_rollback_recognizes_discard_committed_before_cleanup_error(
+def test_create_rollback_recognizes_atomic_commit_before_cleanup_error(
     repository: SQLiteTaskRepository,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -416,13 +416,13 @@ def test_create_rollback_recognizes_discard_committed_before_cleanup_error(
     replacement_repo.mkdir()
     service = make_service(repository)
     service._executor = FailOnceExecutor(service._executor)
-    original_discard = repository.discard_unstarted_task
+    original_rollback = repository.rollback_running_task
 
-    def discard_then_fail(task_id: str) -> None:
-        original_discard(task_id)
-        raise RuntimeError("post-discard cleanup failed")
+    def rollback_then_fail(task_id: str, *, owner_token: str) -> bool:
+        assert original_rollback(task_id, owner_token=owner_token) is True
+        raise RuntimeError("post-rollback cleanup failed")
 
-    monkeypatch.setattr(repository, "discard_unstarted_task", discard_then_fail)
+    monkeypatch.setattr(repository, "rollback_running_task", rollback_then_fail)
 
     with pytest.raises(RuntimeError, match="submit failed"):
         service.create_task(failed_repo, "first")
@@ -627,6 +627,449 @@ def test_cancel_rejects_an_already_submitted_task(
         service.cancel_task(submitted.id)
 
     release.set()
+
+
+def test_cancel_race_loses_without_deleting_live_runner_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db_path = tmp_path / "state.sqlite"
+    project = tmp_path / "cancel-race"
+    project.mkdir()
+    cancellation_repository = SQLiteTaskRepository(db_path)
+    runner_repository = SQLiteTaskRepository(db_path)
+    task = cancellation_repository.create_task_with_project_reservation(
+        str(project.resolve()), "run me", round_limit=8
+    )
+    cancellation_started = Event()
+    allow_cancellation = Event()
+    worker_entered = Event()
+    release_worker = Event()
+
+    class BlockingLoop(StubLoop):
+        def run(self, task_id: str) -> TaskResult:
+            worker_entered.set()
+            assert release_worker.wait(2)
+            return super().run(task_id)
+
+    cancellation_service = HarnessService(
+        repository=cancellation_repository,
+        loop=StubLoop(cancellation_repository),
+        settings=Settings(global_concurrency=1),
+        verifier_finder=lambda name: name,
+    )
+    runner_service = HarnessService(
+        repository=runner_repository,
+        loop=BlockingLoop(runner_repository),
+        settings=Settings(global_concurrency=1),
+        verifier_finder=lambda name: name,
+    )
+    canonical = str(project.resolve())
+    with cancellation_service._lock:
+        cancellation_service._task_repositories[task.id] = canonical
+        cancellation_service._active_repositories[canonical] = task.id
+
+    def pause_cancellation() -> None:
+        cancellation_started.set()
+        assert allow_cancellation.wait(2)
+
+    original_snapshot = cancellation_service._snapshot
+
+    def paused_snapshot(task_id: str):
+        snapshot = original_snapshot(task_id)
+        if snapshot.task.status is TaskStatus.CREATED:
+            pause_cancellation()
+        return snapshot
+
+    original_cancel = cancellation_repository.cancel_created_task
+
+    def paused_cancel_created_task(task_id: str) -> bool:
+        assert (
+            cancellation_repository.resume_snapshot(task_id).task.status
+            is TaskStatus.CREATED
+        )
+        pause_cancellation()
+        return original_cancel(task_id)
+
+    monkeypatch.setattr(cancellation_service, "_snapshot", paused_snapshot)
+    monkeypatch.setattr(
+        cancellation_repository, "cancel_created_task", paused_cancel_created_task
+    )
+
+    runner_future: Future[TaskResult] | None = None
+    try:
+        with ThreadPoolExecutor(max_workers=1) as callers:
+            cancelled = callers.submit(cancellation_service.cancel_task, task.id)
+            assert cancellation_started.wait(1)
+            runner_future = runner_service.start_task(task.id)
+            assert worker_entered.wait(1)
+            owner_token = runner_service._pending_owners[task.id]
+            allow_cancellation.set()
+
+            with pytest.raises(PreflightError) as captured:
+                cancelled.result(timeout=2)
+
+            assert captured.value.__cause__ is None
+            assert captured.value.__context__ is None
+            message = str(captured.value)
+            assert task.id not in message
+            assert canonical not in message
+            assert owner_token not in message
+            assert (
+                runner_repository.resume_snapshot(task.id).task.status
+                is TaskStatus.RUNNING
+            )
+            assert runner_repository.owns_project_lease(
+                task.id, owner_token=owner_token
+            ) is True
+            assert runner_service._futures[task.id] is runner_future
+            assert cancellation_service._task_repositories[task.id] == canonical
+            assert cancellation_service._active_repositories[canonical] == task.id
+            with runner_repository._connection_lock:
+                reservation = runner_repository._connection.execute(
+                    """SELECT task_id FROM project_reservations
+                       WHERE project_id = ?""",
+                    (task.project_id,),
+                ).fetchone()
+            assert reservation["task_id"] == task.id
+
+        release_worker.set()
+        assert runner_future.result(timeout=2).status is TaskStatus.SUCCEEDED
+    finally:
+        allow_cancellation.set()
+        release_worker.set()
+        runner_service.close()
+        cancellation_service.close()
+        runner_repository.close()
+        cancellation_repository.close()
+
+
+def test_cancellation_winner_leaves_start_without_placeholder_or_capacity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db_path = tmp_path / "state.sqlite"
+    project = tmp_path / "cancellation-winner"
+    project.mkdir()
+    cancellation_repository = SQLiteTaskRepository(db_path)
+    runner_repository = SQLiteTaskRepository(db_path)
+    task = cancellation_repository.create_task_with_project_reservation(
+        str(project.resolve()), "cancel me", round_limit=8
+    )
+    cancellation_service = make_service(cancellation_repository)
+    runner_service = make_service(runner_repository)
+    canonical = str(project.resolve())
+    with cancellation_service._lock:
+        cancellation_service._task_repositories[task.id] = canonical
+        cancellation_service._active_repositories[canonical] = task.id
+    candidate_observed = Event()
+    cancellation_committed = Event()
+    original_snapshot = runner_service._snapshot
+
+    def stale_created_snapshot(task_id: str):
+        snapshot = original_snapshot(task_id)
+        if snapshot.task.status is TaskStatus.CREATED:
+            candidate_observed.set()
+            assert cancellation_committed.wait(2)
+        return snapshot
+
+    monkeypatch.setattr(runner_service, "_snapshot", stale_created_snapshot)
+
+    try:
+        with ThreadPoolExecutor(max_workers=1) as callers:
+            started = callers.submit(runner_service.start_task, task.id)
+            assert candidate_observed.wait(1)
+            cancellation_service.cancel_task(task.id)
+            assert cancellation_repository.task_exists(task.id) is False
+            assert cancellation_service._task_repositories == {}
+            assert cancellation_service._active_repositories == {}
+            cancellation_committed.set()
+            try:
+                started.result(timeout=2)
+            except Exception as caught:  # noqa: BLE001 - assert exact public type below.
+                error = caught
+            else:
+                raise AssertionError("stale start unexpectedly succeeded")
+
+        assert runner_service._futures == {}
+        assert runner_service._pending_owners == {}
+        assert runner_service._task_repositories == {}
+        assert runner_service._active_repositories == {}
+        assert runner_service._capacity.acquire(blocking=False) is True
+        runner_service._capacity.release()
+        assert type(error) is PreflightError
+        assert error.__cause__ is None
+        assert error.__context__ is None
+        assert task.id not in str(error)
+        assert canonical not in str(error)
+    finally:
+        cancellation_committed.set()
+        runner_service.close()
+        cancellation_service.close()
+        runner_repository.close()
+        cancellation_repository.close()
+
+
+@pytest.mark.parametrize(
+    ("primary_stage", "cleanup_stage"),
+    [
+        pytest.param("snapshot", "local", id="snapshot-local"),
+        pytest.param("path", "inspection", id="path-inspection"),
+        pytest.param("transition", "rollback", id="transition-rollback"),
+        pytest.param("lease", "release", id="lease-release"),
+        pytest.param("busy", "inspection", id="busy-inspection"),
+        pytest.param("executor", "release", id="executor-release"),
+        pytest.param("executor", "rollback", id="executor-rollback"),
+        pytest.param("executor", "local", id="executor-local"),
+    ],
+)
+def test_setup_compensation_primary_error_wins_failure_matrix(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    primary_stage: str,
+    cleanup_stage: str,
+) -> None:
+    class PrimarySetupFailure(RuntimeError):
+        pass
+
+    class CleanupSetupFailure(RuntimeError):
+        pass
+
+    db_path = tmp_path / "state.sqlite"
+    project = tmp_path / f"matrix-{primary_stage}-{cleanup_stage}"
+    project.mkdir()
+    canonical = str(project.resolve())
+    request_text = "request-sensitive-matrix-value"
+    cleanup_details = (
+        "cleanup-sensitive-token C:/cleanup/private request-sensitive-cleanup"
+    )
+    repository = SQLiteTaskRepository(db_path)
+    service = make_service(repository)
+    created_ids: list[str] = []
+    cleanup_armed = Event()
+    cleanup_injected = Event()
+    original_create = repository.create_task_with_project_reservation
+
+    def tracked_create(*args, **kwargs):
+        record = original_create(*args, **kwargs)
+        created_ids.append(record.id)
+        return record
+
+    monkeypatch.setattr(
+        repository, "create_task_with_project_reservation", tracked_create
+    )
+
+    if cleanup_stage == "release":
+        def fail_release(task_id: str, *, owner_token: str) -> None:
+            del task_id, owner_token
+            assert cleanup_armed.is_set()
+            cleanup_injected.set()
+            raise CleanupSetupFailure(cleanup_details)
+
+        monkeypatch.setattr(repository, "release_project_lease", fail_release)
+    elif cleanup_stage == "rollback":
+        def fail_rollback(task_id: str, *, owner_token: str) -> bool:
+            del task_id, owner_token
+            assert cleanup_armed.is_set()
+            cleanup_injected.set()
+            raise CleanupSetupFailure(cleanup_details)
+
+        monkeypatch.setattr(repository, "rollback_running_task", fail_rollback)
+    elif cleanup_stage == "inspection":
+        original_exists = repository.task_exists
+        original_resume = repository.resume_snapshot
+        inspection_failed = False
+
+        def fail_inspection_once() -> None:
+            nonlocal inspection_failed
+            if cleanup_armed.is_set() and not inspection_failed:
+                inspection_failed = True
+                cleanup_injected.set()
+                raise CleanupSetupFailure(cleanup_details)
+
+        def inspected_exists(task_id: str) -> bool:
+            fail_inspection_once()
+            return original_exists(task_id)
+
+        def inspected_resume(task_id: str, *, owner_token: str | None = None):
+            fail_inspection_once()
+            return original_resume(task_id, owner_token=owner_token)
+
+        monkeypatch.setattr(repository, "task_exists", inspected_exists)
+        monkeypatch.setattr(repository, "resume_snapshot", inspected_resume)
+    else:
+        class FailOnceActiveMap(dict[str, str]):
+            failed = False
+
+            def get(self, key: str, default: str | None = None):
+                if cleanup_armed.is_set() and not self.failed:
+                    self.failed = True
+                    cleanup_injected.set()
+                    raise CleanupSetupFailure(cleanup_details)
+                return super().get(key, default)
+
+        service._active_repositories = FailOnceActiveMap()
+
+    if primary_stage == "snapshot":
+        def fail_snapshot(task_id: str):
+            del task_id
+            cleanup_armed.set()
+            raise PrimarySetupFailure("primary snapshot failure")
+
+        monkeypatch.setattr(service, "_snapshot", fail_snapshot)
+    elif primary_stage == "path":
+        task = repository.create_task_with_project_reservation(
+            canonical, request_text, round_limit=8
+        )
+
+        def fail_path(task_id: str) -> str:
+            del task_id
+            cleanup_armed.set()
+            raise PrimarySetupFailure("primary path failure")
+
+        monkeypatch.setattr(repository, "task_project_path", fail_path)
+    elif primary_stage == "transition":
+        def fail_transition(*args, **kwargs) -> bool:
+            del args, kwargs
+            cleanup_armed.set()
+            raise PrimarySetupFailure("primary transition failure")
+
+        monkeypatch.setattr(repository, "set_status", fail_transition)
+    elif primary_stage in {"lease", "busy"}:
+        def fail_or_refuse_lease(*args, **kwargs) -> bool:
+            del args, kwargs
+            cleanup_armed.set()
+            if primary_stage == "busy":
+                return False
+            raise PrimarySetupFailure("primary lease failure")
+
+        monkeypatch.setattr(
+            repository, "acquire_project_lease", fail_or_refuse_lease
+        )
+    else:
+        class FailingExecutor:
+            def __init__(self, delegate: ThreadPoolExecutor) -> None:
+                self._delegate = delegate
+
+            def submit(self, *args, **kwargs):
+                del args, kwargs
+                cleanup_armed.set()
+                raise PrimarySetupFailure("primary executor failure")
+
+            def shutdown(self, *, wait: bool, cancel_futures: bool) -> None:
+                self._delegate.shutdown(
+                    wait=wait, cancel_futures=cancel_futures
+                )
+
+        service._executor = FailingExecutor(service._executor)
+
+    observer: SQLiteTaskRepository | None = None
+    try:
+        try:
+            if primary_stage == "path":
+                service.start_task(task.id)
+            else:
+                service.create_task(project, request_text)
+        except Exception as caught:  # noqa: BLE001 - assert exact primary below.
+            error = caught
+        else:
+            raise AssertionError("injected setup failure unexpectedly succeeded")
+
+        expected_type = (
+            ProjectBusyError if primary_stage == "busy" else PrimarySetupFailure
+        )
+        assert type(error) is expected_type
+        assert cleanup_injected.is_set()
+        assert service._futures == {}
+        assert service._capacity.acquire(blocking=False) is True
+        service._capacity.release()
+
+        chain: list[BaseException] = []
+        pending: list[BaseException] = [error]
+        while pending:
+            current = pending.pop()
+            if current in chain:
+                continue
+            chain.append(current)
+            if current.__cause__ is not None:
+                pending.append(current.__cause__)
+            if current.__context__ is not None:
+                pending.append(current.__context__)
+        exposed = " ".join(str(item) for item in chain)
+        assert cleanup_details not in exposed
+        assert "cleanup-sensitive-token" not in exposed
+        assert "C:/cleanup/private" not in exposed
+        assert request_text not in exposed
+        assert canonical not in exposed
+
+        task_id = created_ids[-1]
+        observer = SQLiteTaskRepository(db_path)
+        if observer.task_exists(task_id):
+            snapshot = observer.resume_snapshot(task_id)
+            assert snapshot.task.status in {
+                TaskStatus.CREATED,
+                TaskStatus.RUNNING,
+            }
+            assert service._futures == {}
+            if snapshot.task.status is TaskStatus.RUNNING:
+                assert service.get_task(task_id).resume_available is True
+            with observer._connection_lock:
+                reservation = observer._connection.execute(
+                    "SELECT task_id FROM project_reservations WHERE task_id = ?",
+                    (task_id,),
+                ).fetchone()
+            assert reservation["task_id"] == task_id
+        else:
+            assert service._pending_owners == {}
+            assert service._task_repositories == {}
+            assert service._active_repositories == {}
+    finally:
+        service.close()
+        if observer is not None:
+            observer.close()
+        repository.close()
+
+
+def test_setup_compensation_rollback_failure_keeps_running_web_recovery(
+    repository: SQLiteTaskRepository,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = tmp_path / "rollback-recovery"
+    project.mkdir()
+    service = make_service(repository)
+    service._executor = FailOnceExecutor(service._executor)
+    original_create = repository.create_task_with_project_reservation
+    original_rollback = repository.rollback_running_task
+    created_ids: list[str] = []
+
+    def tracked_create(*args, **kwargs):
+        record = original_create(*args, **kwargs)
+        created_ids.append(record.id)
+        return record
+
+    def fail_rollback(task_id: str, *, owner_token: str) -> bool:
+        del task_id, owner_token
+        raise RuntimeError("cleanup-sensitive-token")
+
+    monkeypatch.setattr(
+        repository, "create_task_with_project_reservation", tracked_create
+    )
+    monkeypatch.setattr(repository, "rollback_running_task", fail_rollback)
+
+    with pytest.raises(RuntimeError, match="submit failed") as captured:
+        service.create_task(project, "recover me")
+
+    task_id = created_ids[-1]
+    assert "cleanup-sensitive-token" not in str(captured.value)
+    assert service._futures == {}
+    assert service._capacity.acquire(blocking=False) is True
+    service._capacity.release()
+    assert repository.resume_snapshot(task_id).task.status is TaskStatus.RUNNING
+    view = service.get_task(task_id)
+    assert view.resume_available is True
+
+    monkeypatch.setattr(repository, "rollback_running_task", original_rollback)
+    assert service.resume_task(task_id).result(timeout=2).status is TaskStatus.SUCCEEDED
+    service.close()
 
 
 def test_export_audit_returns_only_redacted_structured_events(

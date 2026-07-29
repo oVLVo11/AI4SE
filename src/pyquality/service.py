@@ -129,25 +129,40 @@ class HarnessService:
             raise PreflightError("global execution capacity is exhausted")
         record: TaskRecord | None = None
         placeholder: Future[TaskResult] = Future()
-        with self._lock:
-            if canonical in self._active_repositories:
-                self._capacity.release()
-                raise ProjectBusyError("repository is busy: it already has active work")
-            try:
+        reservation_conflict = False
+        try:
+            with self._lock:
+                if canonical in self._active_repositories:
+                    raise ProjectBusyError(
+                        "repository is busy: it already has active work"
+                    )
                 record = self._repository.create_task_with_project_reservation(
                     canonical, request, self._settings.round_limit
                 )
-            except ProjectReservationError:
-                self._capacity.release()
-                raise ProjectBusyError(
-                    "repository is busy: it already has active work"
-                ) from None
-            except Exception:
-                self._capacity.release()
-                raise
-            self._active_repositories[canonical] = record.id
-            self._task_repositories[record.id] = canonical
-            self._futures[record.id] = placeholder
+                self._active_repositories[canonical] = record.id
+                self._task_repositories[record.id] = canonical
+                self._futures[record.id] = placeholder
+        except ProjectReservationError:
+            self._compensate_setup_failure(
+                None,
+                None,
+                None,
+                rollback_new_task=False,
+            )
+            reservation_conflict = True
+        except Exception:
+            self._compensate_setup_failure(
+                record.id if record is not None else None,
+                None,
+                placeholder if record is not None else None,
+                rollback_new_task=record is not None,
+            )
+            raise
+        if reservation_conflict:
+            raise ProjectBusyError(
+                "repository is busy: it already has active work"
+            )
+        assert record is not None
         self._prepare_submission(
             record.id,
             placeholder,
@@ -177,10 +192,33 @@ class HarnessService:
                 self._capacity.release()
                 return existing
             self._futures[task_id] = placeholder
+        state_changed = False
+        try:
             canonical = self._repository.task_project_path(task_id)
-            self._task_repositories[task_id] = canonical
-            self._active_repositories[canonical] = task_id
-            owner_token = self._pending_owners.get(task_id)
+            with self._lock:
+                if self._futures.get(task_id) is not placeholder:
+                    raise PreflightError("task state changed before submission")
+                self._task_repositories[task_id] = canonical
+                self._active_repositories[canonical] = task_id
+                owner_token = self._pending_owners.get(task_id)
+        except StorageStateError:
+            self._compensate_setup_failure(
+                task_id,
+                None,
+                placeholder,
+                rollback_new_task=False,
+            )
+            state_changed = True
+        except Exception:
+            self._compensate_setup_failure(
+                task_id,
+                None,
+                placeholder,
+                rollback_new_task=False,
+            )
+            raise
+        if state_changed:
+            raise PreflightError("task state changed before submission")
         self._prepare_submission(
             task_id,
             placeholder,
@@ -211,17 +249,22 @@ class HarnessService:
         return self.start_task(task_id, resume=True)
 
     def cancel_task(self, task_id: str) -> None:
+        missing = False
+        try:
+            cancelled = self._repository.cancel_created_task(task_id)
+        except StorageStateError:
+            missing = True
+            cancelled = False
+        if missing:
+            raise PreflightError("task does not exist")
+        if not cancelled:
+            raise PreflightError("running task cannot be cancelled")
         with self._lock:
-            future = self._futures.get(task_id)
-            if future is not None:
-                raise PreflightError("running task cannot be cancelled")
+            self._futures.pop(task_id, None)
+            self._pending_owners.pop(task_id, None)
             canonical = self._task_repositories.pop(task_id, None)
             if canonical is not None and self._active_repositories.get(canonical) == task_id:
                 self._active_repositories.pop(canonical, None)
-        snapshot = self._snapshot(task_id)
-        if snapshot.task.status is not TaskStatus.CREATED:
-            raise PreflightError("running task cannot be cancelled")
-        self._repository.discard_unstarted_task(task_id)
 
     def export_audit(self) -> tuple[AuditEvent, ...]:
         if self._audit_path is None:
@@ -266,9 +309,12 @@ class HarnessService:
 
     def _snapshot(self, task_id: str):
         try:
-            return self._repository.resume_snapshot(task_id)
+            snapshot = self._repository.resume_snapshot(task_id)
         except StorageStateError:
-            raise PreflightError("task does not exist") from None
+            pass
+        else:
+            return snapshot
+        raise PreflightError("task does not exist")
 
     def _require_known_task(self, task_id: str) -> None:
         self._snapshot(task_id)
@@ -327,14 +373,12 @@ class HarnessService:
             if not lease_acquired:
                 raise ProjectBusyError("repository is busy")
         except Exception:
-            if lease_acquired:
-                self._repository.release_project_lease(
-                    task_id, owner_token=owner_token
-                )
-            if rollback_new_task:
-                self._repository.discard_unstarted_task(task_id)
-            self._remove_submission(task_id)
-            self._capacity.release()
+            self._compensate_setup_failure(
+                task_id,
+                owner_token,
+                placeholder,
+                rollback_new_task=rollback_new_task,
+            )
             raise
         with self._lock:
             self._pending_owners[task_id] = owner_token
@@ -363,16 +407,12 @@ class HarnessService:
                 resume=resume,
             )
         except Exception:
-            if rollback_new_task:
-                self._rollback_new_dispatch(
-                    task_id,
-                    owner_token,
-                    placeholder,
-                )
-            else:
-                with self._lock:
-                    self._futures.pop(task_id, None)
-                self._capacity.release()
+            self._compensate_setup_failure(
+                task_id,
+                owner_token,
+                placeholder,
+                rollback_new_task=rollback_new_task,
+            )
             raise
         worker.add_done_callback(
             lambda completed: self._complete_submission(
@@ -380,49 +420,172 @@ class HarnessService:
             )
         )
 
-    def _rollback_new_dispatch(
+    def _compensate_setup_failure(
         self,
-        task_id: str,
-        owner_token: str,
-        placeholder: Future[TaskResult],
+        task_id: str | None,
+        owner_token: str | None,
+        placeholder: Future[TaskResult] | None,
+        *,
+        rollback_new_task: bool,
     ) -> None:
-        """Best-effort every rollback step while preserving recoverable state."""
-        discarded = False
+        """Best-effort one setup rollback while preserving the caller's error."""
         try:
-            self._repository.release_project_lease(
-                task_id, owner_token=owner_token
+            self._reconcile_setup_failure(
+                task_id,
+                owner_token,
+                placeholder,
+                rollback_new_task=rollback_new_task,
             )
-        except BaseException as cleanup_error:  # noqa: BLE001 - keep submit failure primary.
-            _ = cleanup_error
-        try:
-            self._repository.discard_unstarted_task(task_id)
-            discarded = True
-        except BaseException as cleanup_error:  # noqa: BLE001 - retain durable recovery.
-            _ = cleanup_error
-            try:
-                discarded = not self._repository.task_exists(task_id)
-            except BaseException as inspection_error:  # noqa: BLE001 - fail closed.
-                _ = inspection_error
-        try:
-            with self._lock:
-                if self._futures.get(task_id) is placeholder:
-                    self._futures.pop(task_id, None)
-                if discarded:
-                    self._pending_owners.pop(task_id, None)
-                    canonical = self._task_repositories.pop(task_id, None)
-                    if (
-                        canonical is not None
-                        and self._active_repositories.get(canonical) == task_id
-                    ):
-                        self._active_repositories.pop(canonical, None)
-                else:
-                    self._pending_owners[task_id] = owner_token
-        except BaseException as cleanup_error:  # noqa: BLE001 - capacity is still mandatory.
+        except BaseException as cleanup_error:  # noqa: BLE001 - keep primary.
             _ = cleanup_error
         finally:
             try:
                 self._capacity.release()
-            except BaseException as cleanup_error:  # noqa: BLE001 - keep submit failure primary.
+            except BaseException as cleanup_error:  # noqa: BLE001 - keep primary.
+                _ = cleanup_error
+
+    def _reconcile_setup_failure(
+        self,
+        task_id: str | None,
+        owner_token: str | None,
+        placeholder: Future[TaskResult] | None,
+        *,
+        rollback_new_task: bool,
+    ) -> None:
+        deleted = False
+        durable_status: TaskStatus | None = None
+        durable_known = False
+        if rollback_new_task and task_id is not None and owner_token is not None:
+            try:
+                deleted = self._repository.rollback_running_task(
+                    task_id, owner_token=owner_token
+                )
+            except BaseException as cleanup_error:  # noqa: BLE001 - keep primary.
+                _ = cleanup_error
+        if rollback_new_task and task_id is not None and not deleted:
+            try:
+                deleted = self._repository.cancel_created_task(task_id)
+            except BaseException as cleanup_error:  # noqa: BLE001 - keep primary.
+                _ = cleanup_error
+        if (
+            rollback_new_task
+            and task_id is not None
+            and owner_token is not None
+        ):
+            try:
+                self._repository.release_project_lease(
+                    task_id, owner_token=owner_token
+                )
+            except BaseException as cleanup_error:  # noqa: BLE001 - keep primary.
+                _ = cleanup_error
+        if task_id is not None and not deleted:
+            exists: bool | None = None
+            try:
+                exists = self._repository.task_exists(task_id)
+            except BaseException as inspection_error:  # noqa: BLE001 - fail closed.
+                _ = inspection_error
+            if exists is False:
+                deleted = True
+                durable_known = True
+            else:
+                try:
+                    durable_status = self._repository.resume_snapshot(
+                        task_id
+                    ).task.status
+                    durable_known = True
+                except StorageStateError:
+                    deleted = True
+                    durable_known = True
+                except BaseException as inspection_error:  # noqa: BLE001 - fail closed.
+                    _ = inspection_error
+        elif deleted:
+            durable_known = True
+        try:
+            if task_id is not None and placeholder is not None:
+                with self._lock:
+                    if self._futures.get(task_id) is placeholder:
+                        self._futures.pop(task_id, None)
+        except BaseException as cleanup_error:  # noqa: BLE001 - keep reconciling.
+            _ = cleanup_error
+        terminal_or_deleted = deleted or (
+            durable_known and durable_status in _TERMINAL
+        )
+        if task_id is not None and terminal_or_deleted:
+            try:
+                with self._lock:
+                    self._pending_owners.pop(task_id, None)
+            except BaseException as cleanup_error:  # noqa: BLE001 - keep reconciling.
+                _ = cleanup_error
+            canonical: str | None = None
+            try:
+                with self._lock:
+                    canonical = self._task_repositories.pop(task_id, None)
+            except BaseException as cleanup_error:  # noqa: BLE001 - keep reconciling.
+                _ = cleanup_error
+            if canonical is not None:
+                try:
+                    with self._lock:
+                        if self._active_repositories.get(canonical) == task_id:
+                            self._active_repositories.pop(canonical, None)
+                except BaseException as cleanup_error:  # noqa: BLE001 - use identity sweep.
+                    _ = cleanup_error
+            try:
+                with self._lock:
+                    for active_path, active_task in tuple(
+                        self._active_repositories.items()
+                    ):
+                        if active_task == task_id:
+                            self._active_repositories.pop(active_path, None)
+            except BaseException as cleanup_error:  # noqa: BLE001 - keep primary.
+                _ = cleanup_error
+        elif task_id is not None and durable_known:
+            if durable_status is TaskStatus.RUNNING and owner_token is not None:
+                owns_lease: bool | None = None
+                try:
+                    owns_lease = self._repository.owns_project_lease(
+                        task_id, owner_token=owner_token
+                    )
+                except BaseException as cleanup_error:  # noqa: BLE001 - retain fail-closed.
+                    _ = cleanup_error
+                try:
+                    with self._lock:
+                        if owns_lease is False:
+                            if self._pending_owners.get(task_id) == owner_token:
+                                self._pending_owners.pop(task_id, None)
+                        else:
+                            self._pending_owners[task_id] = owner_token
+                except BaseException as cleanup_error:  # noqa: BLE001 - keep primary.
+                    _ = cleanup_error
+            else:
+                try:
+                    with self._lock:
+                        self._pending_owners.pop(task_id, None)
+                except BaseException as cleanup_error:  # noqa: BLE001 - keep primary.
+                    _ = cleanup_error
+            if durable_status in {
+                TaskStatus.CREATED,
+                TaskStatus.RUNNING,
+                TaskStatus.WAITING_APPROVAL,
+            }:
+                canonical = None
+                try:
+                    canonical = self._repository.task_project_path(task_id)
+                except BaseException as cleanup_error:  # noqa: BLE001 - keep recoverable maps.
+                    _ = cleanup_error
+                if canonical is not None:
+                    try:
+                        with self._lock:
+                            active_task = self._active_repositories.get(canonical)
+                            if active_task in {None, task_id}:
+                                self._task_repositories[task_id] = canonical
+                                self._active_repositories[canonical] = task_id
+                    except BaseException as cleanup_error:  # noqa: BLE001 - keep primary.
+                        _ = cleanup_error
+        elif task_id is not None and owner_token is not None:
+            try:
+                with self._lock:
+                    self._pending_owners[task_id] = owner_token
+            except BaseException as cleanup_error:  # noqa: BLE001 - fail closed.
                 _ = cleanup_error
 
     def _complete_submission(

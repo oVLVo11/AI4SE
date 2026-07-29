@@ -1138,6 +1138,82 @@ class SQLiteTaskRepository:
             )
         self._release_local_leases_for_task(task_id)
 
+    def cancel_created_task(self, task_id: str) -> bool:
+        """Atomically delete only an untouched task that is still CREATED."""
+        with self._transaction() as connection:
+            task = self._require_task(connection, task_id)
+            evidence = connection.execute(
+                """SELECT
+                     (SELECT COUNT(*) FROM iterations WHERE task_id = ?) AS iterations,
+                     (SELECT COUNT(*) FROM approvals WHERE task_id = ?) AS approvals,
+                     (SELECT COUNT(*) FROM project_leases WHERE task_id = ?) AS leases""",
+                (task_id, task_id, task_id),
+            ).fetchone()
+            if (
+                task["status"] != TaskStatus.CREATED.value
+                or evidence["iterations"]
+                or evidence["approvals"]
+                or evidence["leases"]
+            ):
+                return False
+            connection.execute(
+                "DELETE FROM project_reservations WHERE task_id = ?", (task_id,)
+            )
+            connection.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+            connection.execute(
+                """DELETE FROM projects WHERE id = ?
+                   AND NOT EXISTS (SELECT 1 FROM tasks WHERE project_id = ?)""",
+                (task["project_id"], task["project_id"]),
+            )
+        return True
+
+    def rollback_running_task(self, task_id: str, *, owner_token: str) -> bool:
+        """Atomically delete untouched RUNNING work owned by this lease token."""
+        _require_owner_token(owner_token)
+        with self._transaction() as connection:
+            task = self._require_task(connection, task_id)
+            evidence = connection.execute(
+                """SELECT
+                     (SELECT COUNT(*) FROM iterations WHERE task_id = ?) AS iterations,
+                     (SELECT COUNT(*) FROM approvals WHERE task_id = ?) AS approvals""",
+                (task_id, task_id),
+            ).fetchone()
+            lease = connection.execute(
+                """SELECT task_id, owner_token, protocol FROM project_leases
+                   WHERE project_id = ?""",
+                (task["project_id"],),
+            ).fetchone()
+            if (
+                task["status"] != TaskStatus.RUNNING.value
+                or evidence["iterations"]
+                or evidence["approvals"]
+                or lease is None
+                or lease["task_id"] != task_id
+                or lease["owner_token"] != owner_token
+                or lease["protocol"] != _LEASE_PROTOCOL
+            ):
+                return False
+            connection.execute(
+                """DELETE FROM project_leases
+                   WHERE task_id = ? AND owner_token = ? AND protocol = ?""",
+                (task_id, owner_token, _LEASE_PROTOCOL),
+            )
+            connection.execute(
+                "DELETE FROM project_reservations WHERE task_id = ?", (task_id,)
+            )
+            connection.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+            connection.execute(
+                """DELETE FROM projects WHERE id = ?
+                   AND NOT EXISTS (SELECT 1 FROM tasks WHERE project_id = ?)""",
+                (task["project_id"], task["project_id"]),
+            )
+        with self._connection_lock:
+            held = self._held_leases.get(owner_token)
+            matching_local_lease = held is not None and held[1] == task_id
+        if matching_local_lease:
+            self._release_local_lease(owner_token)
+        return True
+
     def task_project_path(self, task_id: str) -> str:
         with self._read_transaction() as connection:
             row = connection.execute(

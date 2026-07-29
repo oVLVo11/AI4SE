@@ -3,7 +3,7 @@ from __future__ import annotations
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from threading import Barrier
+from threading import Barrier, Event
 
 import pytest
 
@@ -44,6 +44,345 @@ def _approval_decision() -> PolicyDecision:
 
 OWNER_A = "runner-a"
 OWNER_B = "runner-b"
+
+
+def test_cancel_created_task_deletes_reserved_task_and_unused_project(
+    repo: SQLiteTaskRepository,
+) -> None:
+    task = repo.create_task_with_project_reservation(
+        "C:/work/cancel-created", "cancel me", round_limit=8
+    )
+
+    assert repo.cancel_created_task(task.id) is True
+    assert repo.task_exists(task.id) is False
+    with repo._connection_lock:
+        counts = repo._connection.execute(
+            """SELECT
+                 (SELECT COUNT(*) FROM projects) AS projects,
+                 (SELECT COUNT(*) FROM project_reservations) AS reservations"""
+        ).fetchone()
+    assert tuple(counts) == (0, 0)
+
+
+def test_cancel_created_task_does_not_transfer_service_reservation(
+    repo: SQLiteTaskRepository,
+) -> None:
+    low_level = repo.create_task(
+        "C:/work/cancel-created-shared", "low-level", round_limit=8
+    )
+    service_task = repo.create_task_with_project_reservation(
+        "C:/work/cancel-created-shared", "service", round_limit=8
+    )
+
+    assert repo.cancel_created_task(service_task.id) is True
+    assert repo.task_exists(low_level.id) is True
+    replacement = repo.create_task_with_project_reservation(
+        "C:/work/cancel-created-shared", "replacement", round_limit=8
+    )
+
+    assert replacement.status is TaskStatus.CREATED
+
+
+@pytest.mark.parametrize("evidence", ["iteration", "approval", "lease"])
+def test_cancel_created_task_rejects_durable_execution_evidence(
+    repo: SQLiteTaskRepository, evidence: str
+) -> None:
+    task = repo.create_task_with_project_reservation(
+        f"C:/work/cancel-created-{evidence}", "keep me", round_limit=8
+    )
+    if evidence in {"iteration", "approval"}:
+        iteration = repo.append_iteration(
+            task.id, sequence=1, context_digest="a" * 64
+        )
+        if evidence == "approval":
+            repo.record_approval(
+                task.id,
+                iteration.id,
+                '{"arguments":{},"kind":"finish","rationale":"pause"}',
+                "b" * 64,
+                "c" * 64,
+            )
+    else:
+        with repo._connection_lock:
+            repo._connection.execute(
+                """INSERT INTO project_leases
+                   (project_id, task_id, owner_token, acquired_at, protocol)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (
+                    task.project_id,
+                    task.id,
+                    OWNER_A,
+                    "2026-07-29T00:00:00+00:00",
+                    "os-file-v1",
+                ),
+            )
+
+    assert repo.cancel_created_task(task.id) is False
+    assert repo.task_exists(task.id) is True
+    with repo._connection_lock:
+        reservation = repo._connection.execute(
+            "SELECT task_id FROM project_reservations WHERE project_id = ?",
+            (task.project_id,),
+        ).fetchone()
+    assert reservation["task_id"] == task.id
+
+
+def test_cancellation_cas_loses_to_running_lease_without_deleting_live_state(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "state.sqlite"
+    runner = SQLiteTaskRepository(db_path)
+    canceller = SQLiteTaskRepository(db_path)
+    task = runner.create_task_with_project_reservation(
+        "C:/work/cancel-race", "run me", round_limit=8
+    )
+    cancellation_started = Barrier(2)
+    transition_committed = Event()
+
+    def cancel_after_transition() -> bool:
+        cancellation_started.wait()
+        assert transition_committed.wait(2)
+        return canceller.cancel_created_task(task.id)
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        outcome = pool.submit(cancel_after_transition)
+        cancellation_started.wait()
+        assert runner.set_status(
+            task.id, TaskStatus.CREATED, TaskStatus.RUNNING
+        ) is True
+        assert runner.acquire_project_lease(task.id, owner_token=OWNER_A) is True
+        transition_committed.set()
+        assert outcome.result() is False
+
+    snapshot = runner.resume_snapshot(task.id)
+    assert snapshot.task.status is TaskStatus.RUNNING
+    assert runner.owns_project_lease(task.id, owner_token=OWNER_A) is True
+    with runner._connection_lock:
+        rows = runner._connection.execute(
+            """SELECT
+                 (SELECT COUNT(*) FROM projects WHERE id = ?) AS projects,
+                 (SELECT COUNT(*) FROM project_reservations
+                  WHERE project_id = ? AND task_id = ?) AS reservations,
+                 (SELECT COUNT(*) FROM project_leases
+                  WHERE project_id = ? AND task_id = ? AND owner_token = ?) AS leases""",
+            (
+                task.project_id,
+                task.project_id,
+                task.id,
+                task.project_id,
+                task.id,
+                OWNER_A,
+            ),
+        ).fetchone()
+    assert tuple(rows) == (1, 1, 1)
+
+
+def test_two_cancellation_cas_callers_have_exactly_one_success(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "state.sqlite"
+    creator = SQLiteTaskRepository(db_path)
+    first = SQLiteTaskRepository(db_path)
+    second = SQLiteTaskRepository(db_path)
+    task = creator.create_task_with_project_reservation(
+        "C:/work/two-cancellers", "cancel once", round_limit=8
+    )
+    ready = Barrier(3)
+
+    def cancel(repository: SQLiteTaskRepository) -> bool:
+        ready.wait()
+        try:
+            return repository.cancel_created_task(task.id)
+        except StorageStateError:
+            return False
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        outcomes = [pool.submit(cancel, repository) for repository in (first, second)]
+        ready.wait()
+        values = [outcome.result() for outcome in outcomes]
+
+    assert values.count(True) == 1
+    assert creator.task_exists(task.id) is False
+
+
+def test_cancel_created_task_unknown_task_raises_sanitized_error(
+    repo: SQLiteTaskRepository,
+) -> None:
+    unknown = "missing-task-sensitive-token"
+
+    with pytest.raises(StorageStateError) as captured:
+        repo.cancel_created_task(unknown)
+
+    assert str(captured.value) == "task does not exist"
+    assert unknown not in str(captured.value)
+
+
+def test_rollback_running_task_deletes_owned_task_lease_reservation_and_project(
+    repo: SQLiteTaskRepository,
+) -> None:
+    task = repo.create_task_with_project_reservation(
+        "C:/work/rollback-running", "roll back", round_limit=8
+    )
+    _start(repo, task.id)
+    assert repo.acquire_project_lease(task.id, owner_token=OWNER_A) is True
+
+    assert repo.rollback_running_task(task.id, owner_token=OWNER_A) is True
+    assert repo.task_exists(task.id) is False
+    assert OWNER_A not in repo._held_leases
+    with repo._connection_lock:
+        counts = repo._connection.execute(
+            """SELECT
+                 (SELECT COUNT(*) FROM projects) AS projects,
+                 (SELECT COUNT(*) FROM project_reservations) AS reservations,
+                 (SELECT COUNT(*) FROM project_leases) AS leases"""
+        ).fetchone()
+    assert tuple(counts) == (0, 0, 0)
+
+
+def test_rollback_running_task_does_not_transfer_service_reservation(
+    repo: SQLiteTaskRepository,
+) -> None:
+    low_level = repo.create_task(
+        "C:/work/rollback-running-shared", "low-level", round_limit=8
+    )
+    service_task = repo.create_task_with_project_reservation(
+        "C:/work/rollback-running-shared", "service", round_limit=8
+    )
+    _start(repo, service_task.id)
+    assert repo.acquire_project_lease(
+        service_task.id, owner_token=OWNER_A
+    ) is True
+
+    assert repo.rollback_running_task(
+        service_task.id, owner_token=OWNER_A
+    ) is True
+    assert repo.task_exists(low_level.id) is True
+    replacement = repo.create_task_with_project_reservation(
+        "C:/work/rollback-running-shared", "replacement", round_limit=8
+    )
+
+    assert replacement.status is TaskStatus.CREATED
+
+
+def test_rollback_running_task_wrong_owner_preserves_live_owner_state(
+    repo: SQLiteTaskRepository,
+) -> None:
+    task = repo.create_task_with_project_reservation(
+        "C:/work/rollback-wrong-owner", "keep running", round_limit=8
+    )
+    _start(repo, task.id)
+    assert repo.acquire_project_lease(task.id, owner_token=OWNER_A) is True
+
+    assert repo.rollback_running_task(task.id, owner_token=OWNER_B) is False
+
+    assert repo.resume_snapshot(task.id).task.status is TaskStatus.RUNNING
+    assert repo.owns_project_lease(task.id, owner_token=OWNER_A) is True
+    with repo._connection_lock:
+        reservation = repo._connection.execute(
+            "SELECT task_id FROM project_reservations WHERE project_id = ?",
+            (task.project_id,),
+        ).fetchone()
+    assert reservation["task_id"] == task.id
+
+
+def test_rollback_running_task_wrong_protocol_preserves_local_and_durable_lease(
+    repo: SQLiteTaskRepository,
+) -> None:
+    task = repo.create_task_with_project_reservation(
+        "C:/work/rollback-wrong-protocol", "keep running", round_limit=8
+    )
+    _start(repo, task.id)
+    assert repo.acquire_project_lease(task.id, owner_token=OWNER_A) is True
+    with repo._connection_lock:
+        repo._connection.execute(
+            "UPDATE project_leases SET protocol = 'legacy' WHERE task_id = ?",
+            (task.id,),
+        )
+
+    assert repo.rollback_running_task(task.id, owner_token=OWNER_A) is False
+
+    assert repo.resume_snapshot(task.id).task.status is TaskStatus.RUNNING
+    assert repo._held_leases[OWNER_A][1] == task.id
+    with repo._connection_lock:
+        lease = repo._connection.execute(
+            "SELECT owner_token, protocol FROM project_leases WHERE task_id = ?",
+            (task.id,),
+        ).fetchone()
+    assert tuple(lease) == (OWNER_A, "legacy")
+
+
+@pytest.mark.parametrize(
+    "status",
+    [TaskStatus.CREATED, TaskStatus.WAITING_APPROVAL, TaskStatus.SUCCEEDED],
+)
+def test_rollback_running_task_rejects_non_running_status_without_mutation(
+    repo: SQLiteTaskRepository, status: TaskStatus
+) -> None:
+    task = repo.create_task_with_project_reservation(
+        f"C:/work/rollback-{status.value}", "keep task", round_limit=8
+    )
+    if status is not TaskStatus.CREATED:
+        _start(repo, task.id)
+        assert repo.acquire_project_lease(task.id, owner_token=OWNER_A) is True
+        assert repo.set_status(
+            task.id,
+            TaskStatus.RUNNING,
+            status,
+            owner_token=OWNER_A,
+        ) is True
+
+    assert repo.rollback_running_task(task.id, owner_token=OWNER_A) is False
+    assert repo.resume_snapshot(task.id).task.status is status
+
+
+@pytest.mark.parametrize("evidence", ["iteration", "approval"])
+def test_rollback_running_task_rejects_execution_evidence(
+    repo: SQLiteTaskRepository, evidence: str
+) -> None:
+    task = repo.create_task_with_project_reservation(
+        f"C:/work/rollback-{evidence}", "keep evidence", round_limit=8
+    )
+    _start(repo, task.id)
+    assert repo.acquire_project_lease(task.id, owner_token=OWNER_A) is True
+    iteration = repo.append_iteration(
+        task.id, sequence=1, context_digest="a" * 64
+    )
+    if evidence == "approval":
+        repo.record_approval(
+            task.id,
+            iteration.id,
+            '{"arguments":{},"kind":"finish","rationale":"pause"}',
+            "b" * 64,
+            "c" * 64,
+        )
+
+    assert repo.rollback_running_task(task.id, owner_token=OWNER_A) is False
+
+    assert repo.resume_snapshot(task.id).task.status is TaskStatus.RUNNING
+    assert repo.owns_project_lease(task.id, owner_token=OWNER_A) is True
+
+
+def test_rollback_running_task_unknown_task_raises_sanitized_error(
+    repo: SQLiteTaskRepository,
+) -> None:
+    unknown = "missing-running-task-sensitive-token"
+
+    with pytest.raises(StorageStateError) as captured:
+        repo.rollback_running_task(unknown, owner_token=OWNER_A)
+
+    assert str(captured.value) == "task does not exist"
+    assert unknown not in str(captured.value)
+
+
+def test_rollback_running_task_validates_owner_token(
+    repo: SQLiteTaskRepository,
+) -> None:
+    task = repo.create_task_with_project_reservation(
+        "C:/work/rollback-invalid-owner", "keep task", round_limit=8
+    )
+
+    with pytest.raises(StorageStateError, match="owner token"):
+        repo.rollback_running_task(task.id, owner_token="")
 
 
 def test_nonterminal_project_reservation_is_atomic_across_repository_instances(
