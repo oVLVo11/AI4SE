@@ -20,6 +20,7 @@ from pyquality.storage.sqlite import (
     ProjectReservationError,
     SQLiteTaskRepository,
     StorageStateError,
+    TaskCreationConflictError,
 )
 
 
@@ -44,6 +45,8 @@ def _approval_decision() -> PolicyDecision:
 
 OWNER_A = "runner-a"
 OWNER_B = "runner-b"
+CREATION_NONCE_A = "a" * 64
+CREATION_NONCE_B = "b" * 64
 
 
 def test_creation_identity_replay_is_idempotent_for_exact_reserved_task(
@@ -56,12 +59,14 @@ def test_creation_identity_replay_is_idempotent_for_exact_reserved_task(
         "same request",
         round_limit=8,
         task_id=task_id,
+        creation_nonce=CREATION_NONCE_A,
     )
     replay = repo.create_task_with_project_reservation(
         "C:/work/creation-replay",
         "same request",
         round_limit=8,
         task_id=task_id,
+        creation_nonce=CREATION_NONCE_A,
     )
 
     assert first == replay
@@ -71,8 +76,9 @@ def test_creation_identity_replay_is_idempotent_for_exact_reserved_task(
             """SELECT
                  (SELECT COUNT(*) FROM tasks WHERE id = ?) AS tasks,
                  (SELECT COUNT(*) FROM project_reservations
-                  WHERE task_id = ? AND migrated = 0) AS reservations""",
-            (task_id, task_id),
+                  WHERE task_id = ? AND migrated = 0
+                    AND creation_nonce = ?) AS reservations""",
+            (task_id, task_id, CREATION_NONCE_A),
         ).fetchone()
     assert tuple(counts) == (1, 1)
 
@@ -86,14 +92,16 @@ def test_creation_identity_conflict_preserves_original_reserved_task(
         "original request",
         round_limit=8,
         task_id=task_id,
+        creation_nonce=CREATION_NONCE_A,
     )
 
-    with pytest.raises(StorageStateError) as captured:
+    with pytest.raises(TaskCreationConflictError) as captured:
         repo.create_task_with_project_reservation(
             "C:/work/creation-conflict",
             "sensitive conflicting request",
             round_limit=8,
             task_id=task_id,
+            creation_nonce=CREATION_NONCE_A,
         )
 
     assert str(captured.value) == "task creation identity conflicts with stored work"
@@ -106,6 +114,140 @@ def test_creation_identity_conflict_preserves_original_reserved_task(
             (task_id,),
         ).fetchone()
     assert reservation["task_id"] == task_id
+
+
+def test_creation_nonce_mismatch_conflicts_even_for_exact_task_inputs(
+    repo: SQLiteTaskRepository,
+) -> None:
+    task_id = "nonce-conflicting-creation-identity"
+    original = repo.create_task_with_project_reservation(
+        "C:/work/creation-nonce-conflict",
+        "same request",
+        round_limit=8,
+        task_id=task_id,
+        creation_nonce=CREATION_NONCE_A,
+    )
+
+    with pytest.raises(TaskCreationConflictError) as captured:
+        repo.create_task_with_project_reservation(
+            "C:/work/creation-nonce-conflict",
+            "same request",
+            round_limit=8,
+            task_id=task_id,
+            creation_nonce=CREATION_NONCE_B,
+        )
+
+    assert str(captured.value) == "task creation identity conflicts with stored work"
+    assert captured.value.__cause__ is None
+    assert captured.value.__context__ is None
+    assert repo.resume_snapshot(task_id).task == original
+
+
+def test_rollback_created_task_deletes_only_matching_nonce_owned_work(
+    repo: SQLiteTaskRepository,
+) -> None:
+    task = repo.create_task_with_project_reservation(
+        "C:/work/rollback-created",
+        "rollback exact owner",
+        round_limit=8,
+        creation_nonce=CREATION_NONCE_A,
+    )
+
+    assert (
+        repo.rollback_created_task(task.id, creation_nonce=CREATION_NONCE_A)
+        is True
+    )
+    assert repo.task_exists(task.id) is False
+    with repo._connection_lock:
+        counts = repo._connection.execute(
+            """SELECT
+                 (SELECT COUNT(*) FROM projects) AS projects,
+                 (SELECT COUNT(*) FROM project_reservations) AS reservations"""
+        ).fetchone()
+    assert tuple(counts) == (0, 0)
+
+
+def test_rollback_created_task_wrong_nonce_preserves_task_and_reservation(
+    repo: SQLiteTaskRepository,
+) -> None:
+    task = repo.create_task_with_project_reservation(
+        "C:/work/rollback-created-wrong-owner",
+        "preserve exact owner",
+        round_limit=8,
+        creation_nonce=CREATION_NONCE_A,
+    )
+
+    assert (
+        repo.rollback_created_task(task.id, creation_nonce=CREATION_NONCE_B)
+        is False
+    )
+    assert repo.resume_snapshot(task.id).task == task
+    with repo._connection_lock:
+        reservation = repo._connection.execute(
+            "SELECT task_id, creation_nonce FROM project_reservations WHERE task_id = ?",
+            (task.id,),
+        ).fetchone()
+    assert tuple(reservation) == (task.id, CREATION_NONCE_A)
+
+
+@pytest.mark.parametrize("evidence", ["iteration", "approval", "lease"])
+def test_rollback_created_task_rejects_execution_evidence(
+    repo: SQLiteTaskRepository,
+    evidence: str,
+) -> None:
+    task = repo.create_task_with_project_reservation(
+        f"C:/work/rollback-created-{evidence}",
+        "preserve evidence",
+        round_limit=8,
+        creation_nonce=CREATION_NONCE_A,
+    )
+    if evidence in {"iteration", "approval"}:
+        iteration = repo.append_iteration(
+            task.id, sequence=1, context_digest="a" * 64
+        )
+        if evidence == "approval":
+            repo.record_approval(
+                task.id,
+                iteration.id,
+                '{"arguments":{},"kind":"finish","rationale":"pause"}',
+                "b" * 64,
+                "c" * 64,
+            )
+    else:
+        with repo._connection_lock:
+            repo._connection.execute(
+                """INSERT INTO project_leases
+                   (project_id, task_id, owner_token, acquired_at, protocol)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (
+                    task.project_id,
+                    task.id,
+                    OWNER_A,
+                    "2026-07-29T00:00:00+00:00",
+                    "os-file-v1",
+                ),
+            )
+
+    assert (
+        repo.rollback_created_task(task.id, creation_nonce=CREATION_NONCE_A)
+        is False
+    )
+    assert repo.task_exists(task.id) is True
+
+
+def test_rollback_created_task_unknown_task_raises_sanitized_error(
+    repo: SQLiteTaskRepository,
+) -> None:
+    unknown = "missing-created-task-sensitive-token"
+
+    with pytest.raises(StorageStateError) as captured:
+        repo.rollback_created_task(unknown, creation_nonce=CREATION_NONCE_A)
+
+    assert str(captured.value) == "task does not exist"
+    assert unknown not in str(captured.value)
+    assert CREATION_NONCE_A not in str(captured.value)
+    assert captured.value.__cause__ is None
+    assert captured.value.__context__ is None
 
 
 def test_cancel_created_task_deletes_reserved_task_and_unused_project(
@@ -598,7 +740,7 @@ def test_legacy_database_open_backfills_nonterminal_project_reservation(
         );
         INSERT INTO projects VALUES ('legacy-project', 'C:/work/legacy', '2026-07-29T00:00:00+00:00');
         INSERT INTO tasks VALUES (
-            'legacy-task', 'legacy-project', 'repair', 'waiting_approval', 8,
+            'legacy-task', 'legacy-project', 'repair', 'created', 8,
             NULL, NULL, '2026-07-29T00:00:00+00:00'
         );
         """
@@ -609,9 +751,16 @@ def test_legacy_database_open_backfills_nonterminal_project_reservation(
 
     with reopened._connection_lock:
         reservation = reopened._connection.execute(
-            "SELECT task_id, migrated FROM project_reservations"
+            "SELECT task_id, migrated, creation_nonce FROM project_reservations"
         ).fetchone()
-    assert tuple(reservation) == ("legacy-task", 1)
+    assert tuple(reservation) == ("legacy-task", 1, None)
+    assert (
+        reopened.rollback_created_task(
+            "legacy-task", creation_nonce=CREATION_NONCE_A
+        )
+        is False
+    )
+    assert reopened.task_exists("legacy-task") is True
     with pytest.raises(ProjectReservationError, match="active work"):
         reopened.create_task_with_project_reservation(
             "C:/work/legacy", "second", round_limit=8

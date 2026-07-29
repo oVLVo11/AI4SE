@@ -216,6 +216,7 @@ class SQLiteTaskRepository:
         deadline: datetime | None = None,
         *,
         task_id: str | None = None,
+        creation_nonce: str | None = None,
     ) -> TaskRecord:
         """Atomically create work only when the project has no non-terminal task."""
         return self._create_task(
@@ -225,6 +226,7 @@ class SQLiteTaskRepository:
             deadline,
             reserve_project=True,
             task_id=task_id,
+            creation_nonce=creation_nonce,
         )
 
     def _create_task(
@@ -236,6 +238,7 @@ class SQLiteTaskRepository:
         *,
         reserve_project: bool,
         task_id: str | None = None,
+        creation_nonce: str | None = None,
     ) -> TaskRecord:
         project_id = _new_id()
         task_id = task_id if task_id is not None else _new_id()
@@ -244,7 +247,9 @@ class SQLiteTaskRepository:
             existing = connection.execute(
                 """SELECT tasks.*, projects.canonical_path,
                           project_reservations.task_id AS reservation_task_id,
-                          project_reservations.migrated AS reservation_migrated
+                          project_reservations.migrated AS reservation_migrated,
+                          project_reservations.creation_nonce
+                            AS reservation_creation_nonce
                    FROM tasks
                    JOIN projects ON projects.id = tasks.project_id
                    LEFT JOIN project_reservations
@@ -263,6 +268,8 @@ class SQLiteTaskRepository:
                     and existing["result_json"] is None
                     and existing["reservation_task_id"] == task_id
                     and existing["reservation_migrated"] == 0
+                    and creation_nonce is not None
+                    and existing["reservation_creation_nonce"] == creation_nonce
                 )
                 if exact_reserved_replay:
                     return _task_from_row(existing)
@@ -327,9 +334,14 @@ class SQLiteTaskRepository:
             if reserve_project:
                 connection.execute(
                     """INSERT INTO project_reservations
-                       (project_id, task_id, acquired_at, migrated)
-                       VALUES (?, ?, ?, 0)""",
-                    (project_id, task_id, _dump_datetime(created_at)),
+                       (project_id, task_id, acquired_at, migrated, creation_nonce)
+                       VALUES (?, ?, ?, 0, ?)""",
+                    (
+                        project_id,
+                        task_id,
+                        _dump_datetime(created_at),
+                        creation_nonce,
+                    ),
                 )
         return TaskRecord(
             id=task_id,
@@ -1174,6 +1186,53 @@ class SQLiteTaskRepository:
             )
         self._release_local_leases_for_task(task_id)
 
+    def rollback_created_task(self, task_id: str, *, creation_nonce: str) -> bool:
+        """Delete untouched CREATED work owned by this durable creation nonce."""
+        sqlite_failed = False
+        try:
+            with self._transaction() as connection:
+                task = self._require_task(connection, task_id)
+                evidence = connection.execute(
+                    """SELECT
+                         (SELECT COUNT(*) FROM iterations WHERE task_id = ?) AS iterations,
+                         (SELECT COUNT(*) FROM approvals WHERE task_id = ?) AS approvals,
+                         (SELECT COUNT(*) FROM project_leases WHERE task_id = ?) AS leases""",
+                    (task_id, task_id, task_id),
+                ).fetchone()
+                reservation = connection.execute(
+                    """SELECT project_id, migrated, creation_nonce
+                       FROM project_reservations WHERE task_id = ?""",
+                    (task_id,),
+                ).fetchone()
+                if (
+                    task["status"] != TaskStatus.CREATED.value
+                    or evidence["iterations"]
+                    or evidence["approvals"]
+                    or evidence["leases"]
+                    or reservation is None
+                    or reservation["project_id"] != task["project_id"]
+                    or reservation["migrated"] != 0
+                    or reservation["creation_nonce"] is None
+                    or reservation["creation_nonce"] != creation_nonce
+                ):
+                    return False
+                connection.execute(
+                    """DELETE FROM project_reservations
+                       WHERE task_id = ? AND migrated = 0 AND creation_nonce = ?""",
+                    (task_id, creation_nonce),
+                )
+                connection.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+                connection.execute(
+                    """DELETE FROM projects WHERE id = ?
+                       AND NOT EXISTS (SELECT 1 FROM tasks WHERE project_id = ?)""",
+                    (task["project_id"], task["project_id"]),
+                )
+        except sqlite3.Error:
+            sqlite_failed = True
+        if sqlite_failed:
+            raise StorageStateError("task creation rollback is unavailable")
+        return True
+
     def cancel_created_task(self, task_id: str) -> bool:
         """Atomically delete only an untouched task that is still CREATED."""
         sqlite_failed = False
@@ -1626,7 +1685,8 @@ class SQLiteTaskRepository:
                 project_id TEXT PRIMARY KEY REFERENCES projects(id),
                 task_id TEXT NOT NULL UNIQUE REFERENCES tasks(id) ON DELETE CASCADE,
                 acquired_at TEXT NOT NULL,
-                migrated INTEGER NOT NULL DEFAULT 0
+                migrated INTEGER NOT NULL DEFAULT 0,
+                creation_nonce TEXT
             );
             CREATE TABLE IF NOT EXISTS schema_migrations (
                 name TEXT PRIMARY KEY,
@@ -1661,6 +1721,7 @@ class SQLiteTaskRepository:
         self._ensure_column(
             "project_reservations", "migrated", "INTEGER NOT NULL DEFAULT 0"
         )
+        self._ensure_column("project_reservations", "creation_nonce", "TEXT")
         self._migrate_project_reservations()
 
     def _migrate_project_reservations(self) -> None:

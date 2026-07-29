@@ -352,7 +352,7 @@ def test_create_submit_failure_completes_cleanup_when_lease_release_raises(
     service.close()
 
 
-def test_post_commit_create_failure_cancels_exact_caller_owned_task(
+def test_same_nonce_post_commit_failure_uses_authorized_creation_rollback(
     repository: SQLiteTaskRepository,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -362,15 +362,22 @@ def test_post_commit_create_failure_cancels_exact_caller_owned_task(
     service = make_service(repository)
     original_create = repository.create_task_with_project_reservation
     committed_ids: list[str] = []
+    public_cancel_called = Event()
 
     def commit_then_fail(*args, **kwargs):
         record = original_create(*args, **kwargs)
         committed_ids.append(record.id)
         raise RuntimeError("primary post-commit failure")
 
+    def forbid_public_cancel(task_id: str) -> bool:
+        del task_id
+        public_cancel_called.set()
+        raise RuntimeError("public cancellation is forbidden for compensation")
+
     monkeypatch.setattr(
         repository, "create_task_with_project_reservation", commit_then_fail
     )
+    monkeypatch.setattr(repository, "cancel_created_task", forbid_public_cancel)
 
     with pytest.raises(RuntimeError, match="primary post-commit failure") as captured:
         service.create_task(project, "first")
@@ -378,6 +385,7 @@ def test_post_commit_create_failure_cancels_exact_caller_owned_task(
     task_id = committed_ids[-1]
     assert captured.value.__cause__ is None
     assert captured.value.__context__ is None
+    assert public_cancel_called.is_set() is False
     assert repository.task_exists(task_id) is False
     with repository._connection_lock:
         counts = repository._connection.execute(
@@ -416,6 +424,7 @@ def test_creation_identity_conflict_never_deletes_preexisting_task(
         "original",
         round_limit=8,
         task_id=task_id,
+        creation_nonce="original-creation-nonce",
     )
     service = make_service(repository)
 
@@ -436,6 +445,67 @@ def test_creation_identity_conflict_never_deletes_preexisting_task(
             (task_id,),
         ).fetchone()
     assert reservation["task_id"] == task_id
+    assert service._capacity.acquire(blocking=False) is True
+    service._capacity.release()
+    service.close()
+
+
+@pytest.mark.parametrize("same_inputs", [False, True], ids=["fixed-id", "exact-inputs"])
+def test_creation_nonce_setup_failure_never_cancels_unowned_collision(
+    repository: SQLiteTaskRepository,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    same_inputs: bool,
+) -> None:
+    original_project = tmp_path / "nonce-owner"
+    attempted_project = original_project if same_inputs else tmp_path / "nonce-collision"
+    original_project.mkdir()
+    if attempted_project != original_project:
+        attempted_project.mkdir()
+    task_id = "fixed-colliding-task-id"
+    original_request = "same immutable request"
+    attempted_request = original_request if same_inputs else "different work"
+    original_nonce = "original-durable-creation-nonce"
+    attempted_nonce = "different-attempt-creation-nonce"
+    original = repository.create_task_with_project_reservation(
+        str(original_project.resolve()),
+        original_request,
+        round_limit=8,
+        task_id=task_id,
+        creation_nonce=original_nonce,
+    )
+    service = make_service(repository)
+    identities = iter((task_id, attempted_nonce))
+
+    class FixedIdentity:
+        def __init__(self, value: str) -> None:
+            self.hex = value
+
+    monkeypatch.setattr(
+        "pyquality.service.uuid4", lambda: FixedIdentity(next(identities))
+    )
+
+    def fail_before_storage(*args, **kwargs):
+        del args, kwargs
+        raise RuntimeError("primary setup failure before storage")
+
+    monkeypatch.setattr(
+        repository, "create_task_with_project_reservation", fail_before_storage
+    )
+
+    with pytest.raises(RuntimeError, match="primary setup failure") as captured:
+        service.create_task(attempted_project, attempted_request)
+
+    assert captured.value.__cause__ is None
+    assert captured.value.__context__ is None
+    assert repository.resume_snapshot(task_id).task == original
+    with repository._connection_lock:
+        reservation = repository._connection.execute(
+            """SELECT task_id, creation_nonce FROM project_reservations
+               WHERE task_id = ?""",
+            (task_id,),
+        ).fetchone()
+    assert tuple(reservation) == (task_id, original_nonce)
     assert service._capacity.acquire(blocking=False) is True
     service._capacity.release()
     service.close()

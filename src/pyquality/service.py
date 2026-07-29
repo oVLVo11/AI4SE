@@ -127,6 +127,7 @@ class HarnessService:
         root = self._preflight(Path(repo_path), request)
         canonical = str(root)
         task_id = uuid4().hex
+        creation_nonce = uuid4().hex
         if not self._capacity.acquire(blocking=False):
             raise PreflightError("global execution capacity is exhausted")
         record: TaskRecord | None = None
@@ -145,6 +146,7 @@ class HarnessService:
                     request,
                     self._settings.round_limit,
                     task_id=task_id,
+                    creation_nonce=creation_nonce,
                 )
                 self._active_repositories[canonical] = record.id
                 self._task_repositories[record.id] = canonical
@@ -171,6 +173,7 @@ class HarnessService:
                 None,
                 placeholder,
                 rollback_new_task=True,
+                creation_nonce=creation_nonce,
             )
             raise
         if reservation_conflict:
@@ -185,6 +188,7 @@ class HarnessService:
             placeholder,
             resume=False,
             rollback_new_task=True,
+            creation_nonce=creation_nonce,
         )
         return self.get_task(record.id)
 
@@ -392,6 +396,7 @@ class HarnessService:
         resume: bool,
         rollback_new_task: bool,
         owner_token: str | None = None,
+        creation_nonce: str | None = None,
     ) -> None:
         owner_token = owner_token or uuid4().hex
         lease_acquired = False
@@ -417,6 +422,7 @@ class HarnessService:
                 owner_token,
                 placeholder,
                 rollback_new_task=rollback_new_task,
+                creation_nonce=creation_nonce,
             )
             raise
         with self._lock:
@@ -427,6 +433,7 @@ class HarnessService:
             placeholder,
             resume=resume,
             rollback_new_task=rollback_new_task,
+            creation_nonce=creation_nonce,
         )
 
     def _dispatch_preleased(
@@ -437,6 +444,7 @@ class HarnessService:
         *,
         resume: bool,
         rollback_new_task: bool,
+        creation_nonce: str | None = None,
     ) -> None:
         try:
             worker = self._executor.submit(
@@ -451,6 +459,7 @@ class HarnessService:
                 owner_token,
                 placeholder,
                 rollback_new_task=rollback_new_task,
+                creation_nonce=creation_nonce,
             )
             raise
         worker.add_done_callback(
@@ -466,6 +475,7 @@ class HarnessService:
         placeholder: Future[TaskResult] | None,
         *,
         rollback_new_task: bool,
+        creation_nonce: str | None = None,
     ) -> None:
         """Best-effort one setup rollback while preserving the caller's error."""
         try:
@@ -474,6 +484,7 @@ class HarnessService:
                 owner_token,
                 placeholder,
                 rollback_new_task=rollback_new_task,
+                creation_nonce=creation_nonce,
             )
         except BaseException as cleanup_error:  # noqa: BLE001 - keep primary.
             _ = cleanup_error
@@ -490,6 +501,7 @@ class HarnessService:
         placeholder: Future[TaskResult] | None,
         *,
         rollback_new_task: bool,
+        creation_nonce: str | None = None,
     ) -> None:
         deleted = False
         durable_status: TaskStatus | None = None
@@ -501,9 +513,16 @@ class HarnessService:
                 )
             except BaseException as cleanup_error:  # noqa: BLE001 - keep primary.
                 _ = cleanup_error
-        if rollback_new_task and task_id is not None and not deleted:
+        if (
+            rollback_new_task
+            and task_id is not None
+            and creation_nonce is not None
+            and not deleted
+        ):
             try:
-                deleted = self._repository.cancel_created_task(task_id)
+                deleted = self._repository.rollback_created_task(
+                    task_id, creation_nonce=creation_nonce
+                )
             except BaseException as cleanup_error:  # noqa: BLE001 - keep primary.
                 _ = cleanup_error
         if (
