@@ -190,6 +190,94 @@ def test_provider_result_canonicalizes_huge_textual_decimal_spellings(
         service.get("provider", lambda _: result)
 
 
+def test_set_rejects_numeric_credential_outside_closed_text_domain(
+    memory_keyring: MemoryKeyring,
+) -> None:
+    """Catches storing an exponent whose equivalent integer exceeds the 4 KiB domain."""
+    service = CredentialService(memory_keyring, service_name="pyquality")
+
+    with pytest.raises(ValueError) as raised:
+        service.set("provider", "1e4096")
+
+    assert memory_keyring.get_password("pyquality", "provider") is None
+    assert "1e4096" not in str(raised.value)
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+
+
+@pytest.mark.parametrize(
+    "result", ["x" * 4_097, b"x" * 4_097], ids=["str-4097-bytes", "bytes-4097"]
+)
+def test_provider_rejects_text_results_above_four_kib_before_return(
+    memory_keyring: MemoryKeyring, result: str | bytes
+) -> None:
+    """Catches returning oversized callback text that happens not to contain the credential."""
+    service = CredentialService(memory_keyring, service_name="pyquality")
+    service.set("provider", "sk-secret")
+
+    with pytest.raises(CredentialProviderError) as raised:
+        service.get("provider", lambda _: result)
+
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+
+
+@pytest.mark.parametrize(
+    ("secret", "result"),
+    [
+        ("1e4094", "1" + "0" * 4_094),
+        ("1" + "0" * 4_094, "1" + "0" * 4_094 + "."),
+        ("1" + "0" * 4_094 + ".", "1e4094"),
+    ],
+)
+def test_largest_exponent_integer_and_fixed_spellings_share_one_identity(
+    memory_keyring: MemoryKeyring, secret: str, result: str
+) -> None:
+    """Catches splitting the largest three-form equivalence class inside 4,096 bytes."""
+    service = CredentialService(memory_keyring, service_name="pyquality")
+    service.set("provider", secret)
+
+    with pytest.raises(CredentialProviderError):
+        service.get("provider", lambda _: result)
+
+
+def test_nonnumeric_api_key_with_large_exponent_suffix_remains_exact_text(
+    memory_keyring: MemoryKeyring,
+) -> None:
+    """Catches rejecting ordinary API-key text merely because its suffix resembles a number."""
+    service = CredentialService(memory_keyring, service_name="pyquality")
+    service.set("provider", "sk-live-1e4096")
+
+    result = service.get("provider", lambda _: "1e4096")
+
+    assert result.value == "1e4096"
+
+
+def test_provider_rejects_numeric_like_objects_without_string_or_repr_inspection(
+    memory_keyring: MemoryKeyring,
+) -> None:
+    """Catches expanding or inspecting an unsupported numeric-like callback result."""
+
+    class HugeNumber:
+        def __str__(self) -> str:
+            raise AssertionError("str must not be invoked")
+
+        def __repr__(self) -> str:
+            raise AssertionError("repr must not be invoked")
+
+        def __int__(self) -> int:
+            raise AssertionError("int conversion must not be invoked")
+
+    service = CredentialService(memory_keyring, service_name="pyquality")
+    service.set("provider", "sk-secret")
+
+    with pytest.raises(CredentialProviderError) as raised:
+        service.get("provider", lambda _: HugeNumber())
+
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+
+
 @pytest.mark.parametrize(
     ("secret", "result"),
     [
@@ -227,7 +315,7 @@ def test_provider_scalar_grammar_rejects_huge_results_without_poisoning_huge_tex
 ) -> None:
     """Catches unbounded numeric conversion and false positives from an unparseable text secret."""
     service = CredentialService(memory_keyring, service_name="pyquality")
-    service.set("provider", "9" * 10_000)
+    service.set("provider", "sk-" + "9" * 10_000)
 
     assert service.get("provider", lambda _: 7).value == 7
     with pytest.raises(CredentialProviderError) as raised:

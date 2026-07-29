@@ -18,6 +18,18 @@ def _set_process_environment(root: str) -> None:
         os.environ[name] = root
 
 
+def _prepare_existing_audit(path: Path, content: bytes = b"") -> None:
+    if os.name == "nt":
+        from pyquality import security
+
+        descriptor = security._open_windows_audit(path)
+        os.close(descriptor)
+        if content:
+            path.write_bytes(content)
+        return
+    path.write_bytes(content)
+
+
 def _emit_in_process(path: str, start: int, count: int, environment_root: str) -> None:
     _set_process_environment(environment_root)
     logger = AuditLogger(Path(path))
@@ -491,7 +503,7 @@ def test_audit_multi_process_hardlink_aliases_share_one_complete_record_stream(t
     left.mkdir()
     right.mkdir()
     path = left / "audit.jsonl"
-    path.touch()
+    _prepare_existing_audit(path)
     alias = right / "audit-alias.jsonl"
     try:
         os.link(path, alias)
@@ -523,7 +535,7 @@ def test_audit_file_lock_excludes_live_hardlink_alias_writer_with_different_envi
     left.mkdir()
     right.mkdir()
     path = left / "audit.jsonl"
-    path.touch()
+    _prepare_existing_audit(path)
     alias = right / "audit-alias.jsonl"
     try:
         os.link(path, alias)
@@ -608,6 +620,313 @@ def test_audit_rejects_final_and_parent_symlink_targets(
     assert not (outside_dir / "audit.jsonl").exists()
 
 
+def _windows_current_user_sid() -> tuple[object, object]:
+    import ctypes
+    from ctypes import wintypes
+
+    class SidAndAttributes(ctypes.Structure):
+        _fields_ = [("Sid", wintypes.LPVOID), ("Attributes", wintypes.DWORD)]
+
+    class TokenUser(ctypes.Structure):
+        _fields_ = [("User", SidAndAttributes)]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    get_current_process = kernel32.GetCurrentProcess
+    get_current_process.restype = wintypes.HANDLE
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = [wintypes.HANDLE]
+    close_handle.restype = wintypes.BOOL
+    open_process_token = advapi32.OpenProcessToken
+    open_process_token.argtypes = [
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.HANDLE),
+    ]
+    open_process_token.restype = wintypes.BOOL
+    get_token_information = advapi32.GetTokenInformation
+    get_token_information.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_int,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    get_token_information.restype = wintypes.BOOL
+
+    token = wintypes.HANDLE()
+    assert open_process_token(get_current_process(), 0x00000008, ctypes.byref(token))
+    try:
+        required = wintypes.DWORD()
+        ctypes.set_last_error(0)
+        assert not get_token_information(token, 1, None, 0, ctypes.byref(required))
+        assert ctypes.get_last_error() == 122
+        token_buffer = ctypes.create_string_buffer(required.value)
+        assert get_token_information(
+            token, 1, token_buffer, required.value, ctypes.byref(required)
+        )
+        token_user = ctypes.cast(token_buffer, ctypes.POINTER(TokenUser)).contents
+        user_sid = wintypes.LPVOID(token_user.User.Sid)
+        assert user_sid.value
+        return token_buffer, user_sid
+    finally:
+        assert close_handle(token)
+
+
+def _windows_descriptor_is_exact_owner_only(
+    security_descriptor: object, user_sid: object
+) -> bool:
+    import ctypes
+    from ctypes import wintypes
+
+    class AclSizeInformation(ctypes.Structure):
+        _fields_ = [
+            ("AceCount", wintypes.DWORD),
+            ("AclBytesInUse", wintypes.DWORD),
+            ("AclBytesFree", wintypes.DWORD),
+        ]
+
+    class AccessAllowedAce(ctypes.Structure):
+        _fields_ = [
+            ("AceType", ctypes.c_ubyte),
+            ("AceFlags", ctypes.c_ubyte),
+            ("AceSize", wintypes.WORD),
+            ("Mask", wintypes.DWORD),
+            ("SidStart", wintypes.DWORD),
+        ]
+
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    get_security_descriptor_owner = advapi32.GetSecurityDescriptorOwner
+    get_security_descriptor_owner.argtypes = [
+        wintypes.LPVOID,
+        ctypes.POINTER(wintypes.LPVOID),
+        ctypes.POINTER(wintypes.BOOL),
+    ]
+    get_security_descriptor_owner.restype = wintypes.BOOL
+    get_security_descriptor_dacl = advapi32.GetSecurityDescriptorDacl
+    get_security_descriptor_dacl.argtypes = [
+        wintypes.LPVOID,
+        ctypes.POINTER(wintypes.BOOL),
+        ctypes.POINTER(wintypes.LPVOID),
+        ctypes.POINTER(wintypes.BOOL),
+    ]
+    get_security_descriptor_dacl.restype = wintypes.BOOL
+    get_security_descriptor_control = advapi32.GetSecurityDescriptorControl
+    get_security_descriptor_control.argtypes = [
+        wintypes.LPVOID,
+        ctypes.POINTER(wintypes.WORD),
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    get_security_descriptor_control.restype = wintypes.BOOL
+    get_acl_information = advapi32.GetAclInformation
+    get_acl_information.argtypes = [
+        wintypes.LPVOID,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        ctypes.c_int,
+    ]
+    get_acl_information.restype = wintypes.BOOL
+    get_ace = advapi32.GetAce
+    get_ace.argtypes = [
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.LPVOID),
+    ]
+    get_ace.restype = wintypes.BOOL
+    equal_sid = advapi32.EqualSid
+    equal_sid.argtypes = [wintypes.LPVOID, wintypes.LPVOID]
+    equal_sid.restype = wintypes.BOOL
+
+    descriptor = wintypes.LPVOID(security_descriptor)
+    sid = wintypes.LPVOID(getattr(user_sid, "value", user_sid))
+    owner = wintypes.LPVOID()
+    owner_defaulted = wintypes.BOOL()
+    dacl_present = wintypes.BOOL()
+    dacl = wintypes.LPVOID()
+    dacl_defaulted = wintypes.BOOL()
+    if not get_security_descriptor_owner(
+        descriptor, ctypes.byref(owner), ctypes.byref(owner_defaulted)
+    ):
+        return False
+    if not get_security_descriptor_dacl(
+        descriptor,
+        ctypes.byref(dacl_present),
+        ctypes.byref(dacl),
+        ctypes.byref(dacl_defaulted),
+    ):
+        return False
+    control = wintypes.WORD()
+    revision = wintypes.DWORD()
+    if not get_security_descriptor_control(
+        descriptor, ctypes.byref(control), ctypes.byref(revision)
+    ):
+        return False
+    information = AclSizeInformation()
+    if not get_acl_information(
+        dacl, ctypes.byref(information), ctypes.sizeof(information), 2
+    ):
+        return False
+    ace_pointer = wintypes.LPVOID()
+    if not get_ace(dacl, 0, ctypes.byref(ace_pointer)) or not ace_pointer.value:
+        return False
+    ace = ctypes.cast(ace_pointer, ctypes.POINTER(AccessAllowedAce)).contents
+    ace_sid = wintypes.LPVOID(ace_pointer.value + AccessAllowedAce.SidStart.offset)
+    return bool(
+        owner.value
+        and not owner_defaulted.value
+        and dacl_present.value
+        and dacl.value
+        and not dacl_defaulted.value
+        and control.value & 0x1000
+        and information.AceCount == 1
+        and ace.AceType == 0
+        and ace.AceFlags == 0
+        and ace.Mask == 0x001F01FF
+        and equal_sid(owner, sid)
+        and equal_sid(ace_sid, sid)
+    )
+
+
+def _windows_set_test_dacl(path: Path, sddl: str, *, protected: bool) -> None:
+    import ctypes
+    from ctypes import wintypes
+
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    convert = advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW
+    convert.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.LPVOID),
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    convert.restype = wintypes.BOOL
+    get_dacl = advapi32.GetSecurityDescriptorDacl
+    get_dacl.argtypes = [
+        wintypes.LPVOID,
+        ctypes.POINTER(wintypes.BOOL),
+        ctypes.POINTER(wintypes.LPVOID),
+        ctypes.POINTER(wintypes.BOOL),
+    ]
+    get_dacl.restype = wintypes.BOOL
+    set_security_info = advapi32.SetSecurityInfo
+    set_security_info.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_int,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.LPVOID,
+        wintypes.LPVOID,
+        wintypes.LPVOID,
+    ]
+    set_security_info.restype = wintypes.DWORD
+    local_free = kernel32.LocalFree
+    local_free.argtypes = [wintypes.LPVOID]
+    local_free.restype = wintypes.LPVOID
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    create_file.restype = wintypes.HANDLE
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = [wintypes.HANDLE]
+    close_handle.restype = wintypes.BOOL
+
+    security_descriptor = wintypes.LPVOID()
+    assert convert(sddl, 1, ctypes.byref(security_descriptor), None)
+    try:
+        present = wintypes.BOOL()
+        dacl = wintypes.LPVOID()
+        defaulted = wintypes.BOOL()
+        assert get_dacl(
+            security_descriptor,
+            ctypes.byref(present),
+            ctypes.byref(dacl),
+            ctypes.byref(defaulted),
+        )
+        assert present.value and dacl.value
+        handle = create_file(
+            str(path), 0x00020000 | 0x00040000, 0x00000007, None, 3, 0x00000080, None
+        )
+        invalid_handle = ctypes.c_void_p(-1).value
+        value = int(handle) if handle is not None else None
+        assert value not in {None, invalid_handle}
+        try:
+            assert set_security_info(
+                handle,
+                1,
+                0x00000004 | (0x80000000 if protected else 0x20000000),
+                None,
+                None,
+                dacl,
+                None,
+            ) == 0
+        finally:
+            assert close_handle(handle)
+    finally:
+        assert not local_free(security_descriptor)
+
+
+def _windows_security_sddl(path: Path) -> str:
+    import ctypes
+    from ctypes import wintypes
+
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    get_named_security_info = advapi32.GetNamedSecurityInfoW
+    get_named_security_info.argtypes = [
+        wintypes.LPWSTR,
+        ctypes.c_int,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.LPVOID),
+        ctypes.POINTER(wintypes.LPVOID),
+        ctypes.POINTER(wintypes.LPVOID),
+        ctypes.POINTER(wintypes.LPVOID),
+        ctypes.POINTER(wintypes.LPVOID),
+    ]
+    get_named_security_info.restype = wintypes.DWORD
+    convert = advapi32.ConvertSecurityDescriptorToStringSecurityDescriptorW
+    convert.argtypes = [
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.LPWSTR),
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    convert.restype = wintypes.BOOL
+    local_free = kernel32.LocalFree
+    local_free.argtypes = [wintypes.LPVOID]
+    local_free.restype = wintypes.LPVOID
+
+    security_descriptor = wintypes.LPVOID()
+    assert get_named_security_info(
+        str(path), 1, 0x00000001 | 0x00000004, None, None, None, None,
+        ctypes.byref(security_descriptor),
+    ) == 0
+    output = wintypes.LPWSTR()
+    try:
+        assert convert(
+            security_descriptor,
+            1,
+            0x00000001 | 0x00000004,
+            ctypes.byref(output),
+            None,
+        )
+        assert output.value is not None
+        return output.value
+    finally:
+        if output:
+            assert not local_free(output)
+        if security_descriptor.value:
+            assert not local_free(security_descriptor)
+
+
 @pytest.mark.skipif(os.name != "nt", reason="Windows process handle accounting only")
 def test_windows_failed_audit_opens_close_all_native_handles(tmp_path: Path) -> None:
     """Catches leaking retained parent/final handles when a Windows native open fails."""
@@ -635,6 +954,137 @@ def test_windows_failed_audit_opens_close_all_native_handles(tmp_path: Path) -> 
         assert raised.value.__cause__ is None
         assert raised.value.__context__ is None
     assert handle_count() <= before + 2
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows native security descriptors are unavailable")
+def test_windows_final_open_supplies_atomic_owner_only_descriptor_and_native_disposition(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches null final descriptors, shared opens, or ignoring native create/open results."""
+    import ctypes
+    from ctypes import wintypes
+
+    from pyquality import security
+
+    token_buffer, user_sid = _windows_current_user_sid()
+    assert ctypes.sizeof(token_buffer) > 0
+    real_nt_create_file = security._nt_create_file
+    real_set_entries = security._set_entries_in_acl
+    real_local_free = security._local_free
+    final_calls: list[tuple[int, int, int, bool]] = []
+    allocated_acls: list[int] = []
+    freed_allocations: list[int] = []
+
+    def recording_nt_create_file(
+        handle: object,
+        desired_access: int,
+        object_attributes: object,
+        io_status: object,
+        allocation_size: object,
+        attributes: int,
+        share_access: int,
+        disposition: int,
+        options: int,
+        extended_attributes: object,
+        extended_attributes_length: int,
+    ) -> int:
+        native_attributes = ctypes.cast(
+            object_attributes, ctypes.POINTER(security._ObjectAttributes)
+        ).contents
+        is_final = bool(options & security._FILE_NON_DIRECTORY_FILE)
+        descriptor_ok = bool(
+            native_attributes.SecurityDescriptor
+            and _windows_descriptor_is_exact_owner_only(
+                native_attributes.SecurityDescriptor, user_sid
+            )
+        )
+        status = real_nt_create_file(
+            handle,
+            desired_access,
+            object_attributes,
+            io_status,
+            allocation_size,
+            attributes,
+            share_access,
+            disposition,
+            options,
+            extended_attributes,
+            extended_attributes_length,
+        )
+        if is_final and status >= 0:
+            information = ctypes.cast(
+                io_status, ctypes.POINTER(security._IoStatusBlock)
+            ).contents.Information
+            final_calls.append((share_access, disposition, information, descriptor_ok))
+        return status
+
+    def recording_set_entries(
+        count: int, entries: object, old_acl: object, new_acl: object
+    ) -> int:
+        result = real_set_entries(count, entries, old_acl, new_acl)
+        if result == 0:
+            pointer = ctypes.cast(new_acl, ctypes.POINTER(wintypes.LPVOID)).contents.value
+            assert pointer
+            allocated_acls.append(pointer)
+        return result
+
+    def recording_local_free(pointer: object) -> object:
+        value = ctypes.cast(pointer, wintypes.LPVOID).value
+        if value:
+            freed_allocations.append(value)
+        return real_local_free(pointer)
+
+    monkeypatch.setattr(security, "_nt_create_file", recording_nt_create_file)
+    monkeypatch.setattr(security, "_set_entries_in_acl", recording_set_entries)
+    monkeypatch.setattr(security, "_local_free", recording_local_free)
+
+    path = tmp_path / "audit.jsonl"
+    logger = AuditLogger(path)
+    logger.emit(AuditEvent(event_type="transition", metadata={"intent_id": "created"}))
+    logger.emit(AuditEvent(event_type="transition", metadata={"intent_id": "opened"}))
+
+    assert final_calls == [(0, security._FILE_OPEN_IF, 2, True), (0, security._FILE_OPEN_IF, 1, True)]
+    assert allocated_acls
+    assert all(freed_allocations.count(pointer) >= allocated_acls.count(pointer) for pointer in allocated_acls)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows native DACL APIs are unavailable")
+def test_windows_existing_permissive_audit_fails_without_dacl_or_file_mutation(
+    tmp_path: Path,
+) -> None:
+    """Catches retroactively hardening and appending to a permissive existing audit file."""
+    path = tmp_path / "audit.jsonl"
+    original = b"preexisting\n"
+    path.write_bytes(original)
+    _windows_set_test_dacl(path, "D:(A;;FA;;;WD)", protected=False)
+    before = _windows_security_sddl(path)
+
+    with pytest.raises(AuditWriteError) as raised:
+        AuditLogger(path).emit(
+            AuditEvent(event_type="transition", metadata={"intent_id": "must-fail"})
+        )
+
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert _windows_security_sddl(path) == before
+    assert path.read_bytes() == original
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows native DACL APIs are unavailable")
+def test_windows_valid_presecured_existing_audit_emits_without_descriptor_change(
+    tmp_path: Path,
+) -> None:
+    """Catches rejecting an exact owner-only existing file or rewriting its descriptor."""
+    path = tmp_path / "audit.jsonl"
+    logger = AuditLogger(path)
+    logger.emit(AuditEvent(event_type="transition", metadata={"intent_id": "seed"}))
+    before = _windows_security_sddl(path)
+
+    logger.emit(AuditEvent(event_type="transition", metadata={"intent_id": "existing"}))
+
+    assert _windows_security_sddl(path) == before
+    records = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    assert [record["metadata"]["intent_id"] for record in records] == ["seed", "existing"]
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows handle security APIs are unavailable")
@@ -759,7 +1209,7 @@ def test_windows_locked_audit_append_denies_live_rename_and_delete(
 def test_audit_recovers_partial_tail_and_serializes_multi_process_emits(tmp_path: Path) -> None:
     """Catches inter-process interleaving and a crash tail that makes future JSONL unreadable."""
     path = tmp_path / "audit.jsonl"
-    path.write_bytes(b'{"event_type":"partial"')
+    _prepare_existing_audit(path, b'{"event_type":"partial"')
     context = multiprocessing.get_context("spawn")
     processes = [
         context.Process(
