@@ -837,7 +837,7 @@ if os.name == "nt":
     _LOCKFILE_EXCLUSIVE_LOCK = 0x00000002
     _DUPLICATE_SAME_ACCESS = 0x00000002
     _TOKEN_QUERY = 0x00000008
-    _TOKEN_USER = 1
+    _TOKEN_OWNER = 4
     _ERROR_INSUFFICIENT_BUFFER = 122
     _SE_FILE_OBJECT = 1
     _OWNER_SECURITY_INFORMATION = 0x00000001
@@ -912,11 +912,8 @@ if os.name == "nt":
             ("Trustee", _Trustee),
         ]
 
-    class _SidAndAttributes(ctypes.Structure):
-        _fields_ = [("Sid", wintypes.LPVOID), ("Attributes", wintypes.DWORD)]
-
-    class _TokenUser(ctypes.Structure):
-        _fields_ = [("User", _SidAndAttributes)]
+    class _TokenOwner(ctypes.Structure):
+        _fields_ = [("Owner", wintypes.LPVOID)]
 
     class _SecurityDescriptor(ctypes.Structure):
         _fields_ = [
@@ -1138,7 +1135,7 @@ if os.name == "nt":
                 _close_windows_handle(parent_handle)
                 parent_handle = next_handle
             _validate_windows_component(parts[-1])
-            with _windows_audit_security() as (security_descriptor, user_sid):
+            with _windows_audit_security() as (security_descriptor, owner_sid):
                 final_handle, open_result = _open_exclusive_windows_audit_file(
                     parent_handle,
                     parts[-1],
@@ -1147,7 +1144,7 @@ if os.name == "nt":
                 if open_result not in {_FILE_CREATED, _FILE_OPENED}:
                     raise OSError("native audit file returned an unexpected open result")
                 _validate_windows_handle(final_handle, directory=False)
-                _verify_windows_owner_only_dacl(final_handle, user_sid)
+                _verify_windows_owner_only_dacl(final_handle, owner_sid)
             descriptor = msvcrt.open_osfhandle(
                 final_handle, os.O_APPEND | os.O_RDWR | getattr(os, "O_BINARY", 0)
             )
@@ -1353,30 +1350,32 @@ if os.name == "nt":
         try:
             required = wintypes.DWORD()
             ctypes.set_last_error(0)
-            if _get_token_information(token, _TOKEN_USER, None, 0, ctypes.byref(required)):
-                raise OSError("token user query returned an invalid size result")
+            if _get_token_information(token, _TOKEN_OWNER, None, 0, ctypes.byref(required)):
+                raise OSError("token owner query returned an invalid size result")
             error = ctypes.get_last_error()
             if error != _ERROR_INSUFFICIENT_BUFFER or not required.value:
                 raise ctypes.WinError(error)
             token_buffer = ctypes.create_string_buffer(required.value)
             if not _get_token_information(
                 token,
-                _TOKEN_USER,
+                _TOKEN_OWNER,
                 token_buffer,
                 required.value,
                 ctypes.byref(required),
             ):
                 raise ctypes.WinError(ctypes.get_last_error())
-            token_user = ctypes.cast(token_buffer, ctypes.POINTER(_TokenUser)).contents
-            user_sid = wintypes.LPVOID(token_user.User.Sid)
-            if not user_sid.value or not _is_valid_sid(user_sid):
-                raise OSError("current user has an invalid security identifier")
+            token_owner = ctypes.cast(
+                token_buffer, ctypes.POINTER(_TokenOwner)
+            ).contents
+            owner_sid = wintypes.LPVOID(token_owner.Owner)
+            if not owner_sid.value or not _is_valid_sid(owner_sid):
+                raise OSError("process token owner has an invalid security identifier")
             trustee = _Trustee(
                 pMultipleTrustee=None,
                 MultipleTrusteeOperation=0,
                 TrusteeForm=_TRUSTEE_IS_SID,
                 TrusteeType=_TRUSTEE_IS_USER,
-                ptstrName=ctypes.cast(user_sid, wintypes.LPWSTR),
+                ptstrName=ctypes.cast(owner_sid, wintypes.LPWSTR),
             )
             explicit_access = _ExplicitAccess(
                 grfAccessPermissions=_FILE_ALL_ACCESS,
@@ -1396,7 +1395,7 @@ if os.name == "nt":
             if not _initialize_security_descriptor(descriptor_pointer, 1):
                 raise ctypes.WinError(ctypes.get_last_error())
             if not _set_security_descriptor_owner(
-                descriptor_pointer, user_sid, False
+                descriptor_pointer, owner_sid, False
             ):
                 raise ctypes.WinError(ctypes.get_last_error())
             if not _set_security_descriptor_dacl(
@@ -1407,14 +1406,14 @@ if os.name == "nt":
                 descriptor_pointer, _SE_DACL_PROTECTED, _SE_DACL_PROTECTED
             ):
                 raise ctypes.WinError(ctypes.get_last_error())
-            yield descriptor_pointer, user_sid
+            yield descriptor_pointer, owner_sid
         finally:
             if acl.value:
                 _local_free(acl)
             if token_value:
                 _close_windows_handle(token_value)
 
-    def _verify_windows_owner_only_dacl(handle: int, user_sid: wintypes.LPVOID) -> None:
+    def _verify_windows_owner_only_dacl(handle: int, owner_sid: wintypes.LPVOID) -> None:
         owner = wintypes.LPVOID()
         dacl = wintypes.LPVOID()
         security_descriptor = wintypes.LPVOID()
@@ -1434,7 +1433,7 @@ if os.name == "nt":
             if (
                 not owner.value
                 or not _is_valid_sid(owner)
-                or not _equal_sid(owner, user_sid)
+                or not _equal_sid(owner, owner_sid)
                 or not dacl.value
             ):
                 raise OSError("audit target owner or ACL is unsafe")
@@ -1468,7 +1467,7 @@ if os.name == "nt":
                 or ace.AceFlags != 0
                 or ace.Mask != _FILE_ALL_ACCESS
                 or not _is_valid_sid(ace_sid)
-                or not _equal_sid(ace_sid, user_sid)
+                or not _equal_sid(ace_sid, owner_sid)
             ):
                 raise OSError("audit target ACL contains an unsafe access entry")
         finally:

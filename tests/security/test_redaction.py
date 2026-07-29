@@ -620,15 +620,12 @@ def test_audit_rejects_final_and_parent_symlink_targets(
     assert not (outside_dir / "audit.jsonl").exists()
 
 
-def _windows_current_user_sid() -> tuple[object, object]:
+def _windows_current_owner_sid() -> tuple[object, object]:
     import ctypes
     from ctypes import wintypes
 
-    class SidAndAttributes(ctypes.Structure):
-        _fields_ = [("Sid", wintypes.LPVOID), ("Attributes", wintypes.DWORD)]
-
-    class TokenUser(ctypes.Structure):
-        _fields_ = [("User", SidAndAttributes)]
+    class TokenOwner(ctypes.Structure):
+        _fields_ = [("Owner", wintypes.LPVOID)]
 
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
@@ -659,16 +656,16 @@ def _windows_current_user_sid() -> tuple[object, object]:
     try:
         required = wintypes.DWORD()
         ctypes.set_last_error(0)
-        assert not get_token_information(token, 1, None, 0, ctypes.byref(required))
+        assert not get_token_information(token, 4, None, 0, ctypes.byref(required))
         assert ctypes.get_last_error() == 122
         token_buffer = ctypes.create_string_buffer(required.value)
         assert get_token_information(
-            token, 1, token_buffer, required.value, ctypes.byref(required)
+            token, 4, token_buffer, required.value, ctypes.byref(required)
         )
-        token_user = ctypes.cast(token_buffer, ctypes.POINTER(TokenUser)).contents
-        user_sid = wintypes.LPVOID(token_user.User.Sid)
-        assert user_sid.value
-        return token_buffer, user_sid
+        token_owner = ctypes.cast(token_buffer, ctypes.POINTER(TokenOwner)).contents
+        owner_sid = wintypes.LPVOID(token_owner.Owner)
+        assert owner_sid.value
+        return token_buffer, owner_sid
     finally:
         assert close_handle(token)
 
@@ -957,6 +954,80 @@ def test_windows_failed_audit_opens_close_all_native_handles(tmp_path: Path) -> 
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows native security descriptors are unavailable")
+def test_windows_audit_security_uses_process_token_owner_when_user_differs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catches using TokenUser as the descriptor owner and sole ACL trustee."""
+    import ctypes
+    from ctypes import wintypes
+
+    from pyquality import security
+
+    class SidAndAttributes(ctypes.Structure):
+        _fields_ = [("Sid", wintypes.LPVOID), ("Attributes", wintypes.DWORD)]
+
+    class TokenUser(ctypes.Structure):
+        _fields_ = [("User", SidAndAttributes)]
+
+    class TokenOwner(ctypes.Structure):
+        _fields_ = [("Owner", wintypes.LPVOID)]
+
+    owner_buffer, owner_sid = _windows_current_owner_sid()
+    assert ctypes.sizeof(owner_buffer) > 0
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    create_well_known_sid = advapi32.CreateWellKnownSid
+    create_well_known_sid.argtypes = [
+        ctypes.c_int,
+        wintypes.LPVOID,
+        wintypes.LPVOID,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    create_well_known_sid.restype = wintypes.BOOL
+    user_buffer = ctypes.create_string_buffer(68)
+    user_size = wintypes.DWORD(ctypes.sizeof(user_buffer))
+    assert create_well_known_sid(1, None, user_buffer, ctypes.byref(user_size))
+    user_sid = wintypes.LPVOID(ctypes.addressof(user_buffer))
+    assert not security._equal_sid(owner_sid, user_sid)
+    real_get_token_information = security._get_token_information
+
+    def divergent_token_information(
+        token: object,
+        information_class: int,
+        destination: object,
+        destination_size: int,
+        required_size: object,
+    ) -> bool:
+        if information_class == 1:
+            value = TokenUser(User=SidAndAttributes(Sid=user_sid, Attributes=0))
+        elif information_class == 4:
+            value = TokenOwner(Owner=owner_sid)
+        else:
+            return bool(
+                real_get_token_information(
+                    token,
+                    information_class,
+                    destination,
+                    destination_size,
+                    required_size,
+                )
+            )
+        size = ctypes.sizeof(value)
+        ctypes.cast(required_size, ctypes.POINTER(wintypes.DWORD)).contents.value = size
+        if not destination or destination_size < size:
+            ctypes.set_last_error(122)
+            return False
+        ctypes.memmove(destination, ctypes.byref(value), size)
+        return True
+
+    monkeypatch.setattr(security, "_get_token_information", divergent_token_information)
+
+    with security._windows_audit_security() as (descriptor, selected_owner_sid):
+        assert security._equal_sid(selected_owner_sid, owner_sid)
+        assert not security._equal_sid(selected_owner_sid, user_sid)
+        assert _windows_descriptor_is_exact_owner_only(descriptor.value, owner_sid)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows native security descriptors are unavailable")
 def test_windows_final_open_supplies_atomic_owner_only_descriptor_and_native_disposition(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -966,7 +1037,7 @@ def test_windows_final_open_supplies_atomic_owner_only_descriptor_and_native_dis
 
     from pyquality import security
 
-    token_buffer, user_sid = _windows_current_user_sid()
+    token_buffer, owner_sid = _windows_current_owner_sid()
     assert ctypes.sizeof(token_buffer) > 0
     real_nt_create_file = security._nt_create_file
     real_set_entries = security._set_entries_in_acl
@@ -995,7 +1066,7 @@ def test_windows_final_open_supplies_atomic_owner_only_descriptor_and_native_dis
         descriptor_ok = bool(
             native_attributes.SecurityDescriptor
             and _windows_descriptor_is_exact_owner_only(
-                native_attributes.SecurityDescriptor, user_sid
+                native_attributes.SecurityDescriptor, owner_sid
             )
         )
         status = real_nt_create_file(
