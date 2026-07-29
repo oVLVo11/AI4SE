@@ -7,7 +7,7 @@ import os
 import re
 import sqlite3
 import uuid
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
@@ -29,6 +29,7 @@ from pyquality.domain.models import (
     TaskResult,
     TaskStatus,
 )
+from pyquality.security import sanitize_audit_event
 from pyquality.storage.local_lock import LocalProjectLock
 
 
@@ -205,7 +206,12 @@ _LEASE_PROTOCOL = "os-file-v1"
 class SQLiteTaskRepository:
     """Owns atomic persistence of task state and recovery records."""
 
-    def __init__(self, db_path: Path) -> None:
+    def __init__(
+        self,
+        db_path: Path,
+        *,
+        audit_event_preparer: Callable[[AuditEvent], AuditEvent] | None = None,
+    ) -> None:
         raw_path = str(db_path)
         self._temporary_lock_directory: TemporaryDirectory[str] | None = None
         if raw_path == ":memory:":
@@ -228,6 +234,9 @@ class SQLiteTaskRepository:
                 / f".{lock_identity_path.name}.lease-locks"
             )
         self._held_leases: dict[str, tuple[str, str, LocalProjectLock]] = {}
+        self._audit_event_preparer = audit_event_preparer or (
+            lambda event: sanitize_audit_event(event, set())
+        )
         self._connection_lock = RLock()
         self._connection = sqlite3.connect(
             connection_path, isolation_level=None, check_same_thread=False
@@ -2284,16 +2293,24 @@ class SQLiteTaskRepository:
                 (consumed_at, intent_id),
             )
 
-    @staticmethod
     def _enqueue_audit_events(
+        self,
         connection: sqlite3.Connection,
         task_id: str,
         events: tuple[AuditEvent, ...],
     ) -> None:
         for event in events:
-            if event.task_id != task_id:
+            raw_event_json = _canonical_json(event.model_dump(mode="json"))
+            if len(raw_event_json.encode("utf-8")) > _MAX_AUDIT_OUTBOX_EVENT_BYTES:
+                raise StorageStateError("audit event exceeds durable outbox bound")
+            prepared = self._audit_event_preparer(event)
+            if (
+                not isinstance(prepared, AuditEvent)
+                or prepared.event_id != event.event_id
+                or prepared.task_id != task_id
+            ):
                 raise StorageStateError("audit event belongs to another task")
-            event_json = _canonical_json(event.model_dump(mode="json"))
+            event_json = _canonical_json(prepared.model_dump(mode="json"))
             if len(event_json.encode("utf-8")) > _MAX_AUDIT_OUTBOX_EVENT_BYTES:
                 raise StorageStateError("audit event exceeds durable outbox bound")
             connection.execute(
@@ -2301,10 +2318,10 @@ class SQLiteTaskRepository:
                    (event_id, task_id, event_json, created_at, delivered_at)
                    VALUES (?, ?, ?, ?, NULL)""",
                 (
-                    event.event_id,
+                    prepared.event_id,
                     task_id,
                     event_json,
-                    _dump_datetime(event.created_at or _utc_now()),
+                    _dump_datetime(prepared.created_at or _utc_now()),
                 ),
             )
 

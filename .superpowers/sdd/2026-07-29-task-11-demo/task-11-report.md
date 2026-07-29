@@ -194,3 +194,75 @@ The binding findings were:
 - Focused storage ordering/pruning, JSONL replay/scan boundaries, loop restart repair,
   completed-approval cold recovery, service export, security, component, and e2e slices
   were also GREEN before the pristine full run.
+
+## Formal review round 4 remediation
+
+Round 4 addressed two binding findings without modifying root course documents or
+reviewer-owned files:
+
+- raw `AuditEvent` payloads were serialized into SQLite before the JSONL sink's central
+  sanitizer ran, so a failed sink could leave nested sensitive fields, bearer tokens,
+  sensitive URL query values, absolute paths, and configured secrets at rest;
+- replay scanned the complete JSONL history on every append, while malformed unterminated
+  tails could require unbounded recovery memory and I/O.
+
+### Round-4 RED/GREEN evidence
+
+1. `test_pending_audit_outbox_stores_only_prepared_redacted_payload` was RED because
+   `AuditLogger.prepare` did not exist and the outbox stored the raw event before sink
+   delivery. GREEN injects the logger's central preparation function into SQLite and
+   asserts the failed-delivery row contains none of the configured secret, bearer token,
+   URL credential, absolute path, or nested sensitive metadata.
+2. Four audit-index tests were RED against the prior full-file scan: replay of a middle
+   historical ID read beyond the 64 KiB allowance; a 1 MiB unterminated tail was silently
+   read and truncated; and the receipt-commit and record-write crash seams did not exist.
+   GREEN replays an old ID without changing the log, refuses the huge malformed tail with
+   typed bounded behavior and no truncation, recovers append-before-index exactly once,
+   and retries pre-append failure as one observable line.
+3. A receipt-cap RED failed because no durable cardinality bound existed. GREEN caps
+   committed receipts at 16,384: an already indexed event remains replayable at the cap,
+   while the next distinct event fails closed with `AuditRecoveryRequired`.
+4. Follow-up regressions prove that corruption of the newest checkpoint slot falls back
+   to the prior valid slot plus bounded reconciliation, and service export emits only the
+   canonical JSONL records rather than adjacent index artifacts.
+
+### Round-4 protocol and bounds
+
+- `sanitize_audit_event` is the single preparation boundary shared by direct JSONL writes
+  and every SQLite enqueue path. The repository applies it inside the lifecycle
+  transaction before serialization, revalidates event identity, and enforces the 16 KiB
+  envelope both before and after preparation. `build_service` supplies the logger-bound
+  configured secret registry to the repository.
+- Under the hardened audit-file lock, recovery first inspects only the final byte. A
+  partial final record is repaired with at most 64 KiB of backward scanning; a larger
+  unterminated tail is left unchanged and raises `AuditRecoveryRequired`.
+- A file-identity-scoped sidecar index uses two fixed 64-byte checkpoint slots and
+  sharded receipts no larger than 512 bytes. Checkpoints carry generation, indexed JSONL
+  size, receipt count, and checksum. A damaged newest slot falls back to the older valid
+  slot, and unindexed reconciliation is capped at 256 KiB rather than scanning history.
+- Append and `fsync` precede durable receipt commit and checkpoint advancement. Therefore
+  append-before-index crashes are reconciled without a duplicate, while failures before
+  append leave no committed receipt and retry normally. Receipt lookup verifies the
+  exact bounded record bytes at the stored offset before treating an ID as delivered.
+- Audit, checkpoint, and receipt paths use the existing descriptor-relative no-follow,
+  owner-only open and file-locking discipline. Platform-native file identity isolates the
+  sidecar namespace, and export reads only the requested JSONL file.
+
+### Round-4 modified files
+
+- Runtime: `src/pyquality/application.py`, `src/pyquality/security.py`, and
+  `src/pyquality/storage/sqlite.py`.
+- Tests: `tests/security/test_redaction.py`, `tests/unit/test_service.py`, and
+  `tests/unit/test_storage.py`.
+
+### Round-4 final verification
+
+- `python -m pytest -p no:cacheprovider --basetemp "$env:TEMP\\pyquality-task11-r4-final-full"`:
+  507 passed, 8 skipped in 42.90 seconds.
+- `python -m ruff check src tests examples`: all checks passed.
+- `git diff --check`: exit 0; only the repository's existing LF/CRLF conversion warnings
+  were printed.
+- Focused sanitizer-at-rest, audit replay/crash/cap/checkpoint, security, storage,
+  service/export, loop, application, and component slices were GREEN before the pristine
+  full run. One earlier full-suite run had a single scheduling-sensitive cleanup failure;
+  that test passed immediately in isolation and the fresh full run above passed cleanly.

@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
 import re
 import stat
+import struct
 import time
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from collections.abc import Set as AbstractSet
@@ -32,6 +34,12 @@ _MAX_ITEMS = 128
 _MAX_TEXT_BYTES = 4_096
 _MAX_REDACTION_BYTES = 8_192
 _MAX_RECORD_BYTES = 16_384
+_MAX_TAIL_RECOVERY_BYTES = 64 * 1_024
+_MAX_INDEX_REBUILD_BYTES = 256 * 1_024
+_MAX_RECEIPT_BYTES = 512
+_MAX_AUDIT_RECEIPTS = 16_384
+_CHECKPOINT_MAGIC = b"PQAIDX1\0"
+_CHECKPOINT_SLOT = struct.Struct(">8sQQQ32s")
 _SENSITIVE_KEY_PARTS = frozenset(
     {"authorization", "api_key", "apikey", "token", "secret", "password", "credential"}
 )
@@ -73,6 +81,10 @@ class CredentialProviderError(CredentialError):
 
 class AuditWriteError(RuntimeError):
     pass
+
+
+class AuditRecoveryRequired(AuditWriteError):
+    """The bounded online protocol requires explicit rotation or offline repair."""
 
 
 class CredentialWarning(PublicModel):
@@ -633,13 +645,24 @@ class AuditLogger:
 
     def emit(self, event: AuditEvent) -> None:
         failed = False
+        recovery_required = False
         try:
             encoded = self._encode(event)
             self._append(encoded, event.event_id)
+        except AuditRecoveryRequired:
+            recovery_required = True
         except Exception:  # noqa: BLE001
             failed = True
+        if recovery_required:
+            raise AuditRecoveryRequired(
+                "audit stream requires explicit rotation or offline index rebuild"
+            )
         if failed:
             raise AuditWriteError("audit record could not be written")
+
+    def prepare(self, event: AuditEvent) -> AuditEvent:
+        """Return the exact bounded, allowlisted event safe for durable queuing."""
+        return sanitize_audit_event(event, self._secrets)
 
     def _encode(self, event: AuditEvent) -> bytes:
         record = self._record(event)
@@ -669,10 +692,43 @@ class AuditLogger:
         try:
             with _audit_file_lock(descriptor):
                 _recover_tail(descriptor)
-                if _audit_contains_event_id(descriptor, event_id):
-                    return
-                _write_all(descriptor, encoded)
-                os.fsync(descriptor)
+                index_root = _audit_index_root(self._path, descriptor)
+                checkpoint_path = index_root / "checkpoint"
+                checkpoint_descriptor = _open_audit(checkpoint_path, append=False)
+                try:
+                    checkpoint = _reconcile_audit_index(
+                        descriptor,
+                        checkpoint_descriptor,
+                        index_root,
+                    )
+                    receipt_descriptor = _open_audit(
+                        _audit_receipt_path(index_root, event_id)
+                    )
+                    try:
+                        receipt = _load_audit_receipt(receipt_descriptor)
+                        if receipt is not None:
+                            _verify_audit_receipt(descriptor, receipt, event_id)
+                            return
+                        if checkpoint[2] >= _MAX_AUDIT_RECEIPTS:
+                            raise AuditRecoveryRequired
+                        offset = os.lseek(descriptor, 0, os.SEEK_END)
+                        _write_audit_record(descriptor, encoded)
+                        _commit_audit_receipt(
+                            receipt_descriptor,
+                            event_id,
+                            offset,
+                            encoded,
+                        )
+                        _store_audit_checkpoint(
+                            checkpoint_descriptor,
+                            checkpoint,
+                            offset + len(encoded),
+                            checkpoint[2] + 1,
+                        )
+                    finally:
+                        os.close(receipt_descriptor)
+                finally:
+                    os.close(checkpoint_descriptor)
         finally:
             os.close(descriptor)
 
@@ -707,19 +763,46 @@ def sanitize_audit_metadata(
     return _approved_metadata(metadata, secrets)
 
 
+def sanitize_audit_event(event: AuditEvent, secrets: set[str]) -> AuditEvent:
+    """Apply the audit envelope boundary before either queuing or delivery."""
+    metadata, duration, outcome = _approved_metadata(event.metadata, secrets)
+    if duration is not None:
+        metadata["duration"] = duration
+    if outcome is not None:
+        metadata["outcome"] = outcome
+    return event.model_copy(
+        update={
+            "task_id": _audit_scalar(event.task_id, secrets, 1_024),
+            "iteration_id": _audit_scalar(event.iteration_id, secrets, 1_024),
+            "component": _audit_scalar(event.component, secrets, 1_024),
+            "event_type": _audit_scalar(event.event_type, secrets, 1_024),
+            "metadata": metadata,
+        }
+    )
+
+
 def _audit_scalar(value: object, secrets: set[str], limit: int) -> object:
     clean = redact(value, secrets, set())
+    if isinstance(clean, str) and _is_absolute_path_text(clean):
+        clean = _REDACTED
     return _truncate_text(clean, limit) if isinstance(clean, str) else clean
 
 
-def _open_audit(path: Path) -> int:
+def _is_absolute_path_text(value: str) -> bool:
+    return (
+        value.startswith(("/", "\\"))
+        or re.match(r"^[A-Za-z]:[\\/]", value) is not None
+    )
+
+
+def _open_audit(path: Path, *, append: bool = True) -> int:
     absolute = path.absolute()
     if os.name == "nt":
-        return _open_windows_audit(absolute)
-    return _open_posix_audit(absolute)
+        return _open_windows_audit(absolute, append=append)
+    return _open_posix_audit(absolute, append=append)
 
 
-def _open_posix_audit(path: Path) -> int:
+def _open_posix_audit(path: Path, *, append: bool = True) -> int:
     no_follow = getattr(os, "O_NOFOLLOW", None)
     directory = getattr(os, "O_DIRECTORY", None)
     if no_follow is None or directory is None:
@@ -742,7 +825,9 @@ def _open_posix_audit(path: Path) -> int:
             if created:
                 os.fchmod(parent_descriptor, 0o700)
 
-        flags = os.O_APPEND | os.O_CREAT | os.O_RDWR | no_follow | getattr(os, "O_CLOEXEC", 0)
+        flags = os.O_CREAT | os.O_RDWR | no_follow | getattr(os, "O_CLOEXEC", 0)
+        if append:
+            flags |= os.O_APPEND
         descriptor = os.open(parts[-1], flags, 0o600, dir_fd=parent_descriptor)
     finally:
         os.close(parent_descriptor)
@@ -791,62 +876,247 @@ def _write_all(descriptor: int, data: bytes) -> None:
         offset += written
 
 
+def _write_audit_record(descriptor: int, encoded: bytes) -> None:
+    """Append and durably publish JSONL before committing its receipt."""
+    _write_all(descriptor, encoded)
+    os.fsync(descriptor)
+
+
 def _recover_tail(descriptor: int) -> None:
     size = os.lseek(descriptor, 0, os.SEEK_END)
     if size == 0:
         return
+    os.lseek(descriptor, size - 1, os.SEEK_SET)
+    if os.read(descriptor, 1) == b"\n":
+        return
     position = size
-    tail = b""
-    while position:
-        take = min(4096, position)
+    remaining = min(size, _MAX_TAIL_RECOVERY_BYTES)
+    while position and remaining:
+        take = min(4096, position, remaining)
         position -= take
+        remaining -= take
         os.lseek(descriptor, position, os.SEEK_SET)
         chunk = os.read(descriptor, take)
-        tail = chunk + tail
-        index = tail.rfind(b"\n")
+        index = chunk.rfind(b"\n")
         if index >= 0:
-            if position + len(tail) != size or not tail.endswith(b"\n"):
-                os.ftruncate(descriptor, position + index + 1)
+            os.ftruncate(descriptor, position + index + 1)
             return
-    os.ftruncate(descriptor, 0)
+    if position == 0:
+        os.ftruncate(descriptor, 0)
+        return
+    raise AuditRecoveryRequired
 
 
-def _audit_contains_event_id(descriptor: int, event_id: str) -> bool:
-    """Scan locked JSONL records with bounded memory for an exact top-level ID."""
-    record = bytearray()
-    oversized = False
-    os.lseek(descriptor, 0, os.SEEK_SET)
-    while True:
-        chunk = os.read(descriptor, 64 * 1_024)
+def _audit_index_root(path: Path, descriptor: int) -> Path:
+    identity = _audit_stream_identity(descriptor)
+    return path.absolute().parent / f".pyquality-audit-index-{identity}"
+
+
+def _audit_receipt_path(index_root: Path, event_id: str) -> Path:
+    return index_root / "receipts" / event_id[:2] / event_id
+
+
+def _read_at(descriptor: int, offset: int, length: int) -> bytes:
+    os.lseek(descriptor, offset, os.SEEK_SET)
+    output = bytearray()
+    while len(output) < length:
+        chunk = os.read(descriptor, length - len(output))
         if not chunk:
-            return False
-        offset = 0
-        while offset < len(chunk):
-            newline = chunk.find(b"\n", offset)
-            terminated = newline >= 0
-            end = newline if terminated else len(chunk)
-            fragment = chunk[offset:end]
-            if not oversized:
-                if len(record) + len(fragment) <= _MAX_RECORD_BYTES:
-                    record.extend(fragment)
-                else:
-                    record.clear()
-                    oversized = True
-            if not terminated:
-                break
-            if not oversized and _audit_record_has_event_id(record, event_id):
-                return True
-            record.clear()
-            oversized = False
-            offset = newline + 1
+            break
+        output.extend(chunk)
+    return bytes(output)
 
 
-def _audit_record_has_event_id(record: bytearray, event_id: str) -> bool:
+def _replace_descriptor(descriptor: int, payload: bytes) -> None:
+    os.ftruncate(descriptor, 0)
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    _write_all(descriptor, payload)
+    os.fsync(descriptor)
+
+
+def _checkpoint_digest(
+    generation: int, indexed_size: int, receipt_count: int
+) -> bytes:
+    return hashlib.sha256(
+        struct.pack(">QQQ", generation, indexed_size, receipt_count)
+    ).digest()
+
+
+def _load_audit_checkpoint(descriptor: int) -> tuple[int, int, int] | None:
+    candidates: list[tuple[int, int, int]] = []
+    for slot in range(2):
+        encoded = _read_at(
+            descriptor,
+            slot * _CHECKPOINT_SLOT.size,
+            _CHECKPOINT_SLOT.size,
+        )
+        if len(encoded) != _CHECKPOINT_SLOT.size:
+            continue
+        magic, generation, indexed_size, receipt_count, digest = (
+            _CHECKPOINT_SLOT.unpack(encoded)
+        )
+        if (
+            magic == _CHECKPOINT_MAGIC
+            and receipt_count <= _MAX_AUDIT_RECEIPTS
+            and digest
+            == _checkpoint_digest(generation, indexed_size, receipt_count)
+        ):
+            candidates.append((generation, indexed_size, receipt_count))
+    return max(candidates, default=None)
+
+
+def _store_audit_checkpoint(
+    descriptor: int,
+    previous: tuple[int, int, int] | None,
+    indexed_size: int,
+    receipt_count: int,
+) -> tuple[int, int, int]:
+    generation = 1 if previous is None else previous[0] + 1
+    payload = _CHECKPOINT_SLOT.pack(
+        _CHECKPOINT_MAGIC,
+        generation,
+        indexed_size,
+        receipt_count,
+        _checkpoint_digest(generation, indexed_size, receipt_count),
+    )
+    os.lseek(descriptor, (generation % 2) * _CHECKPOINT_SLOT.size, os.SEEK_SET)
+    _write_all(descriptor, payload)
+    os.fsync(descriptor)
+    return generation, indexed_size, receipt_count
+
+
+def _load_audit_receipt(descriptor: int) -> dict[str, object] | None:
+    size = os.lseek(descriptor, 0, os.SEEK_END)
+    if size == 0:
+        return None
+    if size > _MAX_RECEIPT_BYTES:
+        raise OSError("audit receipt exceeds bound")
+    encoded = _read_at(descriptor, 0, size)
     try:
-        payload = json.loads(record)
+        receipt = json.loads(encoded)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise OSError("audit receipt is malformed") from error
+    if (
+        not isinstance(receipt, dict)
+        or receipt.get("version") != 1
+        or re.fullmatch(r"[0-9a-f]{64}", receipt.get("event_id", "")) is None
+        or type(receipt.get("offset")) is not int
+        or receipt["offset"] < 0
+        or type(receipt.get("length")) is not int
+        or not 1 <= receipt["length"] <= _MAX_RECORD_BYTES + 1
+        or re.fullmatch(r"[0-9a-f]{64}", receipt.get("digest", "")) is None
+    ):
+        raise OSError("audit receipt is invalid")
+    return receipt
+
+
+def _receipt_payload(event_id: str, offset: int, encoded: bytes) -> bytes:
+    return (
+        _stable_json(
+            {
+                "digest": hashlib.sha256(encoded).hexdigest(),
+                "event_id": event_id,
+                "length": len(encoded),
+                "offset": offset,
+                "version": 1,
+            }
+        ).encode("utf-8")
+        + b"\n"
+    )
+
+
+def _commit_audit_receipt(
+    descriptor: int,
+    event_id: str,
+    offset: int,
+    encoded: bytes,
+) -> None:
+    """Durably index only a JSONL record that was already fsynced."""
+    _replace_descriptor(descriptor, _receipt_payload(event_id, offset, encoded))
+
+
+def _verify_audit_receipt(
+    audit_descriptor: int,
+    receipt: Mapping[str, object],
+    event_id: str,
+) -> None:
+    if receipt["event_id"] != event_id:
+        raise OSError("audit receipt identity mismatch")
+    offset = receipt["offset"]
+    length = receipt["length"]
+    assert isinstance(offset, int) and isinstance(length, int)
+    encoded = _read_at(audit_descriptor, offset, length)
+    if (
+        len(encoded) != length
+        or hashlib.sha256(encoded).hexdigest() != receipt["digest"]
+    ):
+        raise OSError("audit receipt does not match visible log")
+
+
+def _event_id_from_record(encoded: bytes) -> str | None:
+    if len(encoded) > _MAX_RECORD_BYTES + 1 or not encoded.endswith(b"\n"):
+        return None
+    try:
+        payload = json.loads(encoded)
     except (UnicodeDecodeError, json.JSONDecodeError):
-        return False
-    return isinstance(payload, dict) and payload.get("event_id") == event_id
+        return None
+    event_id = payload.get("event_id") if isinstance(payload, dict) else None
+    return event_id if isinstance(event_id, str) and re.fullmatch(r"[0-9a-f]{64}", event_id) else None
+
+
+def _reconcile_audit_index(
+    audit_descriptor: int,
+    checkpoint_descriptor: int,
+    index_root: Path,
+) -> tuple[int, int, int]:
+    """Index a complete bounded suffix or fail without guessing about older IDs."""
+    checkpoint = _load_audit_checkpoint(checkpoint_descriptor)
+    audit_size = os.lseek(audit_descriptor, 0, os.SEEK_END)
+    indexed_size = 0 if checkpoint is None else checkpoint[1]
+    receipt_count = 0 if checkpoint is None else checkpoint[2]
+    if indexed_size > audit_size:
+        raise AuditRecoveryRequired
+    unindexed = audit_size - indexed_size
+    if unindexed > _MAX_INDEX_REBUILD_BYTES:
+        raise AuditRecoveryRequired
+    suffix = _read_at(audit_descriptor, indexed_size, unindexed)
+    if len(suffix) != unindexed or (suffix and not suffix.endswith(b"\n")):
+        raise OSError("audit index suffix is incomplete")
+    offset = indexed_size
+    for encoded in suffix.splitlines(keepends=True):
+        event_id = _event_id_from_record(encoded)
+        if event_id is not None:
+            if receipt_count >= _MAX_AUDIT_RECEIPTS:
+                raise AuditRecoveryRequired
+            receipt_descriptor = _open_audit(
+                _audit_receipt_path(index_root, event_id)
+            )
+            try:
+                existing = _load_audit_receipt(receipt_descriptor)
+                if existing is not None:
+                    _verify_audit_receipt(audit_descriptor, existing, event_id)
+                    if existing["offset"] != offset:
+                        raise OSError("audit log already contains a duplicate event id")
+                else:
+                    _commit_audit_receipt(
+                        receipt_descriptor,
+                        event_id,
+                        offset,
+                        encoded,
+                    )
+            finally:
+                os.close(receipt_descriptor)
+            receipt_count += 1
+        offset += len(encoded)
+    if checkpoint is None or unindexed:
+        checkpoint = _store_audit_checkpoint(
+            checkpoint_descriptor,
+            checkpoint,
+            audit_size,
+            receipt_count,
+        )
+    assert checkpoint is not None
+    return checkpoint
 
 
 if os.name == "nt":
@@ -1156,7 +1426,7 @@ if os.name == "nt":
     _is_valid_sid.argtypes = [wintypes.LPVOID]
     _is_valid_sid.restype = wintypes.BOOL
 
-    def _open_windows_audit(path: Path) -> int:
+    def _open_windows_audit(path: Path, *, append: bool = True) -> int:
         root_handle: int | None = None
         parent_handle: int | None = None
         final_handle: int | None = None
@@ -1193,9 +1463,10 @@ if os.name == "nt":
                     raise OSError("native audit file returned an unexpected open result")
                 _validate_windows_handle(final_handle, directory=False)
                 _verify_windows_owner_only_dacl(final_handle, owner_sid)
-            descriptor = msvcrt.open_osfhandle(
-                final_handle, os.O_APPEND | os.O_RDWR | getattr(os, "O_BINARY", 0)
-            )
+            descriptor_flags = os.O_RDWR | getattr(os, "O_BINARY", 0)
+            if append:
+                descriptor_flags |= os.O_APPEND
+            descriptor = msvcrt.open_osfhandle(final_handle, descriptor_flags)
             final_handle = None
             os.fchmod(descriptor, 0o600)
             return descriptor
@@ -1376,6 +1647,16 @@ if os.name == "nt":
             or any(character in name for character in ("/", "\\", ":", "\0"))
         ):
             raise OSError("audit path contains an invalid component")
+
+    def _audit_stream_identity(descriptor: int) -> str:
+        information = _ByHandleFileInformation()
+        handle = msvcrt.get_osfhandle(descriptor)
+        if not _get_file_information(
+            wintypes.HANDLE(handle), ctypes.byref(information)
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+        file_index = (information.nFileIndexHigh << 32) | information.nFileIndexLow
+        return f"{information.dwVolumeSerialNumber:08x}-{file_index:016x}"
 
     def _validate_windows_handle(handle: int, *, directory: bool) -> None:
         information = _ByHandleFileInformation()
@@ -1574,8 +1855,12 @@ if os.name == "nt":
 else:
     import fcntl
 
-    def _open_windows_audit(path: Path) -> int:
-        del path
+    def _audit_stream_identity(descriptor: int) -> str:
+        information = os.fstat(descriptor)
+        return f"{information.st_dev:x}-{information.st_ino:x}"
+
+    def _open_windows_audit(path: Path, *, append: bool = True) -> int:
+        del path, append
         raise OSError("Windows native audit opens are unavailable")
 
     def _lock_descriptor(descriptor: int) -> None:

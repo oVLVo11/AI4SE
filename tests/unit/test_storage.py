@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -16,6 +17,7 @@ from pyquality.domain.models import (
     TaskResult,
     TaskStatus,
 )
+from pyquality.security import AuditLogger, AuditWriteError
 from pyquality.storage.sqlite import (
     AuditOutboxRecord,
     GreenCandidate,
@@ -457,6 +459,78 @@ def test_oversized_audit_event_is_rejected_before_durable_outbox_commit(
 
     assert repo.resume_snapshot(task.id).iterations == ()
     assert repo.pending_audit_events(limit=8) == ()
+
+
+def test_pending_audit_outbox_stores_only_prepared_redacted_payload(
+    tmp_path: Path,
+) -> None:
+    """A sink outage must not turn SQLite into a raw secret or prompt store."""
+    known_secret = "registered-provider-secret"
+    sink_target = tmp_path / "audit-target"
+    sink_target.mkdir()
+    logger = AuditLogger(sink_target, secrets={known_secret})
+    repository = SQLiteTaskRepository(
+        tmp_path / "audit-safe.sqlite",
+        audit_event_preparer=logger.prepare,
+    )
+    task = repository.create_task("C:/work/audit-safe", "fix", round_limit=8)
+    _start(repository, task.id)
+    assert repository.acquire_project_lease(task.id, owner_token=OWNER_A)
+    private_path = "C:/Users/private/repository/source.py"
+    raw_event = _audit_event(
+        task.id,
+        "6" * 64,
+        f"Bearer {known_secret}",
+        {
+            "intent_id": f"Bearer {known_secret}",
+            "approval_id": private_path,
+            "status": (
+                "https://example.invalid/callback?token=token-value"
+                f"&key={known_secret}"
+            ),
+            "payload": {
+                "prompt": "raw prompt body",
+                "credential": "credential-value",
+            },
+        },
+    )
+
+    repository.append_iteration(
+        task.id,
+        sequence=1,
+        context_digest="a" * 64,
+        audit_events=(raw_event,),
+        owner_token=OWNER_A,
+    )
+    pending = repository.pending_audit_events(limit=1)
+    assert len(pending) == 1
+    with pytest.raises(AuditWriteError):
+        logger.emit(pending[0].event)
+    with repository._connection_lock:
+        event_json = repository._connection.execute(
+            "SELECT event_json FROM audit_outbox WHERE event_id = ?",
+            (raw_event.event_id,),
+        ).fetchone()[0]
+
+    for forbidden in (
+        known_secret,
+        "token-value",
+        private_path,
+        "raw prompt body",
+        "credential-value",
+    ):
+        assert forbidden not in event_json
+    stored = json.loads(event_json)
+    assert stored["event_type"] == "Bearer [REDACTED]"
+    assert stored["metadata"] == {
+        "approval_id": "[REDACTED]",
+        "intent_id": "Bearer [REDACTED]",
+        "status": (
+            "https://example.invalid/callback?token=%5BREDACTED%5D"
+            "&key=%5BREDACTED%5D"
+        ),
+    }
+    repository.close()
 
 
 def test_r0_green_candidate_schema_migrates_valid_and_drops_oversized(

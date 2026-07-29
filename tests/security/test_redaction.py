@@ -433,6 +433,195 @@ def test_audit_logger_replay_of_same_event_id_is_observable_once(
     assert "source body" not in json.dumps(records[0])
 
 
+def test_audit_replay_of_old_event_uses_bounded_historical_log_io(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Exactly-once replay must not rescan all prior JSONL records under the lock."""
+    from pyquality import security
+
+    path = tmp_path / "audit.jsonl"
+    logger = AuditLogger(path)
+    events = [
+        AuditEvent(
+            event_id=f"{index:064x}",
+            event_type="transition",
+            metadata={"intent_id": f"intent-{index}-" + ("x" * 4_000)},
+        )
+        for index in range(96)
+    ]
+    for event in events:
+        logger.emit(event)
+    before = path.read_bytes()
+    real_read = security.os.read
+    bytes_read = 0
+
+    def bounded_read(descriptor: int, count: int) -> bytes:
+        nonlocal bytes_read
+        chunk = real_read(descriptor, count)
+        bytes_read += len(chunk)
+        return chunk
+
+    monkeypatch.setattr(security.os, "read", bounded_read)
+
+    logger.emit(events[48])
+
+    assert path.read_bytes() == before
+    assert bytes_read <= 64 * 1_024
+
+
+def test_huge_unterminated_audit_tail_fails_with_bounded_recovery_io(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Tail repair must not read or retain an attacker-sized malformed suffix."""
+    from pyquality import security
+
+    path = tmp_path / "audit.jsonl"
+    malformed = b"x" * (1024 * 1024)
+    _prepare_existing_audit(path, malformed)
+    real_read = security.os.read
+    bytes_read = 0
+
+    def bounded_read(descriptor: int, count: int) -> bytes:
+        nonlocal bytes_read
+        chunk = real_read(descriptor, count)
+        bytes_read += len(chunk)
+        return chunk
+
+    monkeypatch.setattr(security.os, "read", bounded_read)
+
+    with pytest.raises(AuditWriteError) as raised:
+        AuditLogger(path).emit(
+            AuditEvent(event_id="d" * 64, event_type="transition")
+        )
+
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert bytes_read <= 128 * 1_024
+    assert path.read_bytes() == malformed
+
+
+def test_append_before_receipt_crash_replays_without_duplicate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A crash after JSONL fsync must rebuild its receipt from only the new suffix."""
+    from pyquality import security
+
+    path = tmp_path / "audit.jsonl"
+    logger = AuditLogger(path)
+    event = AuditEvent(
+        event_id="e" * 64,
+        event_type="task_terminal",
+        metadata={"status": "succeeded"},
+    )
+    commit_receipt = security._commit_audit_receipt
+
+    def fail_receipt(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise OSError("receipt fsync failed")
+
+    monkeypatch.setattr(security, "_commit_audit_receipt", fail_receipt)
+    with pytest.raises(AuditWriteError):
+        logger.emit(event)
+    assert len(path.read_bytes().splitlines()) == 1
+
+    monkeypatch.setattr(security, "_commit_audit_receipt", commit_receipt)
+    logger.emit(event)
+
+    records = [json.loads(line) for line in path.read_bytes().splitlines()]
+    assert [record["event_id"] for record in records] == [event.event_id]
+
+
+def test_failed_log_append_cannot_commit_index_before_visible_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A pre-append failure must leave no receipt capable of suppressing the retry."""
+    from pyquality import security
+
+    path = tmp_path / "audit.jsonl"
+    logger = AuditLogger(path)
+    event = AuditEvent(event_id="f" * 64, event_type="transition")
+    write_record = security._write_audit_record
+
+    def fail_record(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise OSError("audit append failed")
+
+    monkeypatch.setattr(security, "_write_audit_record", fail_record)
+    with pytest.raises(AuditWriteError):
+        logger.emit(event)
+    assert path.read_bytes() == b""
+
+    monkeypatch.setattr(security, "_write_audit_record", write_record)
+    logger.emit(event)
+
+    assert json.loads(path.read_text(encoding="utf-8"))["event_id"] == event.event_id
+
+
+def test_audit_receipt_index_has_explicit_rotation_cap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Per-event receipts must have a durable count ceiling, not unbounded disk growth."""
+    from pyquality import security
+
+    monkeypatch.setattr(security, "_MAX_AUDIT_RECEIPTS", 2)
+    path = tmp_path / "audit.jsonl"
+    logger = AuditLogger(path)
+    events = [
+        AuditEvent(event_id=str(index) * 64, event_type="transition")
+        for index in range(1, 4)
+    ]
+    logger.emit(events[0])
+    logger.emit(events[1])
+    logger.emit(events[0])
+
+    with pytest.raises(security.AuditRecoveryRequired):
+        logger.emit(events[2])
+
+    records = [json.loads(line) for line in path.read_bytes().splitlines()]
+    assert [record["event_id"] for record in records] == [
+        events[0].event_id,
+        events[1].event_id,
+    ]
+
+
+def test_corrupt_latest_checkpoint_recovers_from_prior_slot_without_rescan(
+    tmp_path: Path,
+) -> None:
+    """A torn newest checkpoint must retain the prior durable recovery frontier."""
+    from pyquality import security
+
+    path = tmp_path / "audit.jsonl"
+    logger = AuditLogger(path)
+    first = AuditEvent(event_id="7" * 64, event_type="transition")
+    second = AuditEvent(event_id="8" * 64, event_type="transition")
+    logger.emit(first)
+    descriptor = security._open_audit(path)
+    try:
+        index_root = security._audit_index_root(path, descriptor)
+    finally:
+        os.close(descriptor)
+    checkpoint_path = index_root / "checkpoint"
+    checkpoint_descriptor = security._open_audit(checkpoint_path, append=False)
+    try:
+        checkpoint = security._load_audit_checkpoint(checkpoint_descriptor)
+    finally:
+        os.close(checkpoint_descriptor)
+    assert checkpoint is not None
+    newest_slot = checkpoint[0] % 2
+    encoded = bytearray(checkpoint_path.read_bytes())
+    encoded[newest_slot * security._CHECKPOINT_SLOT.size] ^= 0xFF
+    checkpoint_path.write_bytes(encoded)
+
+    logger.emit(second)
+    logger.emit(first)
+
+    records = [json.loads(line) for line in path.read_bytes().splitlines()]
+    assert [record["event_id"] for record in records] == [
+        first.event_id,
+        second.event_id,
+    ]
+
+
 def test_audit_id_scan_ignores_nested_id_in_oversized_legacy_record(
     tmp_path: Path,
 ) -> None:
@@ -1193,7 +1382,14 @@ def test_windows_final_open_supplies_atomic_owner_only_descriptor_and_native_dis
     logger.emit(AuditEvent(event_type="transition", metadata={"intent_id": "created"}))
     logger.emit(AuditEvent(event_type="transition", metadata={"intent_id": "opened"}))
 
-    assert final_calls == [(0, security._FILE_OPEN_IF, 2, True), (0, security._FILE_OPEN_IF, 1, True)]
+    assert final_calls == [
+        (0, security._FILE_OPEN_IF, 2, True),  # audit stream created
+        (0, security._FILE_OPEN_IF, 2, True),  # checkpoint created
+        (0, security._FILE_OPEN_IF, 2, True),  # first receipt created
+        (0, security._FILE_OPEN_IF, 1, True),  # audit stream reopened
+        (0, security._FILE_OPEN_IF, 1, True),  # checkpoint reopened
+        (0, security._FILE_OPEN_IF, 2, True),  # second receipt created
+    ]
     assert allocated_acls
     assert all(freed_allocations.count(pointer) >= allocated_acls.count(pointer) for pointer in allocated_acls)
 

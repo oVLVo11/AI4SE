@@ -18,3 +18,14 @@ payloads are bounded, and the JSONL exact-ID scan uses 64 KiB reads with a 16 Ki
 cap. Final verification: 499 passed, 8 skipped in 37.07 seconds; full Ruff and diff-check
 clean. Required commit subject: `fix: recover finish evidence and audit outbox`; frozen
 cumulative package is generated from `b8f2fe2` after that commit.
+
+Formal review round 4: the SQLite audit outbox now persists only centrally prepared,
+redacted events, using the logger-bound known-secret registry on every enqueue path. The
+JSONL sink replaces whole-history replay scans with a hardened file-identity sidecar:
+fixed checksummed checkpoint slots, bounded sharded receipts, append-first crash recovery,
+64 KiB partial-tail repair, 256 KiB unindexed reconciliation, and a 16,384-receipt cap.
+Huge malformed tails and unrecoverable legacy deltas fail closed with typed errors, while
+replay remains exactly once across sink/repository acknowledgement crashes. Final
+verification: 507 passed, 8 skipped in 42.90 seconds; full Ruff and diff-check clean.
+Required commit subject: `fix: sanitize outbox and bound audit replay`; the frozen
+cumulative package is generated from `b8f2fe2` after that commit.

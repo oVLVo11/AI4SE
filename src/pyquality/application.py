@@ -38,7 +38,11 @@ def build_service(
     settings = load_settings(root, None)
     runtime_dir = root / ".pyquality"
     runtime_dir.mkdir(mode=0o700, exist_ok=True)
-    repository = SQLiteTaskRepository(state_path or runtime_dir / "state.sqlite")
+    audit = AuditLogger(audit_path or runtime_dir / "audit.jsonl")
+    repository = SQLiteTaskRepository(
+        state_path or runtime_dir / "state.sqlite",
+        audit_event_preparer=audit.prepare,
+    )
     backend = keyring.get_keyring()
     credentials = CredentialService(backend, service_name="pyquality")
     selected_provider = provider or os.environ.get("PYQUALITY_PROVIDER", "openai")
@@ -61,7 +65,6 @@ def build_service(
         )
     policy = PolicyEngine(root)
     runner = SubprocessRunner()
-    audit = AuditLogger(audit_path or runtime_dir / "audit.jsonl")
     loop = AgentLoop(
         repository=repository,
         policy=policy,

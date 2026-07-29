@@ -9,7 +9,7 @@ import pytest
 
 from pyquality.config import Settings
 from pyquality.domain.models import ApprovalDecision, AuditEvent, TaskResult, TaskStatus
-from pyquality.security import CredentialStatus
+from pyquality.security import AuditLogger, CredentialStatus
 from pyquality.service import HarnessService, PreflightError, ProjectBusyError
 from pyquality.storage.sqlite import SQLiteTaskRepository
 
@@ -1381,6 +1381,32 @@ def test_export_audit_returns_only_redacted_structured_events(
         ),
     )
     assert "prompt" not in events[0].model_dump_json()
+
+
+def test_export_audit_reads_only_jsonl_and_never_sidecar_receipts(
+    repository: SQLiteTaskRepository, tmp_path: Path
+) -> None:
+    """Receipt/checkpoint implementation records are not public audit events."""
+    audit = tmp_path / "audit.jsonl"
+    logger = AuditLogger(audit)
+    logger.emit(
+        AuditEvent(
+            event_id="9" * 64,
+            task_id="task-1",
+            component="loop",
+            event_type="transition",
+            metadata={"intent_id": "safe"},
+        )
+    )
+    assert len(tuple(tmp_path.glob(".pyquality-audit-index-*"))) == 1
+    service = make_service(repository, audit_path=audit)
+
+    events = service.export_audit()
+
+    assert [(event.event_id, event.event_type) for event in events] == [
+        ("9" * 64, "transition")
+    ]
+    service.close()
 
 
 def test_export_audit_recursively_redacts_nested_auth_urls_and_known_secrets(
