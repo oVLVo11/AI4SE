@@ -173,6 +173,24 @@ def test_green_and_finish_audit_events_are_bounded_and_path_free(loop_fixture) -
     encoded = "".join(event.model_dump_json() for event in events)
     assert str(harness.repo_root) not in encoded
     assert "assert 0 == 1" not in encoded
+    lifecycle_before_resume = [
+        event.event_type
+        for event in harness.audit.events
+        if event.event_type
+        in {"quality_candidate_ready", "finish_verification", "task_terminal"}
+    ]
+    assert lifecycle_before_resume == [
+        "quality_candidate_ready",
+        "finish_verification",
+        "task_terminal",
+    ]
+    harness.loop.resume(harness.task_id)
+    assert [
+        event.event_type
+        for event in harness.audit.events
+        if event.event_type
+        in {"quality_candidate_ready", "finish_verification", "task_terminal"}
+    ] == lifecycle_before_resume
 
 
 def test_later_failed_quality_clears_green_candidate_before_finish(loop_fixture) -> None:

@@ -414,7 +414,6 @@ class AgentLoop:
                 )
             current_decision = self._policy.evaluate(action)
             if candidate.repository_digest != current_decision.repository_snapshot_digest:
-                self._repository.clear_green_candidate(task_id, owner_token=self._owner())
                 return self._reject_finish(
                     task_id,
                     sequence,
@@ -437,7 +436,9 @@ class AgentLoop:
             snapshot = self._repository.resume_snapshot(task_id)
             post_verifier = self._policy.evaluate(action)
             if self._deadline_reached(snapshot):
-                self._repository.clear_green_candidate(task_id, owner_token=self._owner())
+                terminal = self._make_result(
+                    task_id, TaskStatus.BUDGET_EXHAUSTED, "Deadline exhausted."
+                ).model_copy(update={"iterations": sequence})
                 self._append_cycle(
                     task_id,
                     sequence,
@@ -445,12 +446,15 @@ class AgentLoop:
                     action_json,
                     post_verifier,
                     report=quality,
+                    clear_green_candidate=True,
+                    terminal_result=terminal,
                 )
-                return self._terminal(
-                    task_id, TaskStatus.BUDGET_EXHAUSTED, "Deadline exhausted."
+                self._audit_after_commit(
+                    "finish_verification", task_id, {"outcome": "late"}
                 )
+                self._audit_after_commit("task_terminal", task_id, {"status": terminal.status.value})
+                return terminal
             if post_verifier.repository_snapshot_digest != candidate.repository_digest:
-                self._repository.clear_green_candidate(task_id, owner_token=self._owner())
                 return self._reject_finish(
                     task_id,
                     sequence,
@@ -671,7 +675,11 @@ class AgentLoop:
                 )
             if iteration.quality_outcome == "passed":
                 if self._repository.green_candidate(task_id) is None:
-                    self._restore_approved_candidate(task_id, iteration, approval)
+                    recovered = _recovered_tool_result(action, approval.expected_after_digests)
+                    self._changed(task_id).update(recovered.changed_paths)
+                    return self._verify_approved_effect(
+                        task_id, approval, recovered, already_completed=True
+                    )
                 return None
             findings = tuple(
                 item.finding
@@ -842,14 +850,12 @@ class AgentLoop:
             )
         self._persist_approved_outcome(task_id, approval, tool_result, report)
         if report.succeeded:
-            iteration = self._repository.resume_snapshot(task_id).iterations
-            approved_iteration = next(
-                item for item in iteration if item.id == approval.iteration_id
-            )
-            self._restore_approved_candidate(task_id, approved_iteration, approval)
             candidate = self._repository.green_candidate(task_id)
             assert candidate is not None
             self._feedback[task_id] = self._candidate_feedback(task_id, candidate)
+            self._audit_after_commit(
+                "quality_candidate_ready", task_id, {"digest": candidate.report_digest}
+            )
             return None
         self._repository.clear_green_candidate(task_id, owner_token=self._owner())
         snapshot = self._repository.resume_snapshot(task_id)
@@ -863,27 +869,6 @@ class AgentLoop:
             return self._terminal(task_id, status, _summary(status))
         self._feedback[task_id] = self._compose(report.findings)
         return None
-
-    def _restore_approved_candidate(
-        self,
-        task_id: str,
-        iteration,
-        approval: ApprovalRecord,
-    ) -> None:
-        current = self._policy.evaluate(
-            Action(kind="finish", arguments={}, rationale="Confirm verified completion.")
-        )
-        self._repository.save_green_candidate(
-            GreenCandidate(
-                task_id=task_id,
-                iteration=iteration.sequence,
-                report_digest=iteration.tool_result_digest or approval.result_digest or "0" * 64,
-                repository_digest=current.repository_snapshot_digest,
-                summary="Full pytest and Ruff passed; finish is permitted.",
-                changed_paths=tuple(sorted(self._changed(task_id))),
-            ),
-            owner_token=self._owner(),
-        )
 
     def _persist_approved_outcome(
         self,
@@ -1061,7 +1046,11 @@ class AgentLoop:
                 {"outcome": "passed" if report.succeeded else "failed"},
             )
             if report.succeeded:
-                return self._saved_result(self._repository.resume_snapshot(task_id))
+                result = self._saved_result(self._repository.resume_snapshot(task_id))
+                self._audit_after_commit(
+                    "task_terminal", task_id, {"status": result.status.value}
+                )
+                return result
 
         blocked = any(
             finding.category in {"missing_tool_dependency", "infrastructure"}
@@ -1111,6 +1100,7 @@ class AgentLoop:
             action_json,
             decision,
             findings=(finding,),
+            clear_green_candidate=True,
         )
         self._feedback[task_id] = self._compose((finding,))
         return self._stop_after_cycle(task_id)

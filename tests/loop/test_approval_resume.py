@@ -37,9 +37,14 @@ from pyquality.web.app import create_app
 def test_service_approval_decision_resumes_real_loop_to_terminal(
     loop_fixture, decision: ApprovalDecision
 ) -> None:
+    continuation = (
+        [finish_json()]
+        if decision is ApprovalDecision.APPROVE
+        else [quality_json(), finish_json()]
+    )
     harness = loop_fixture(
-        responses=[dependency_patch_json(), quality_json(), finish_json()],
-        reports=[successful_report(), successful_report(), successful_report()],
+        responses=[dependency_patch_json(), *continuation],
+        reports=[successful_report(), successful_report()],
     )
     service = HarnessService(
         repository=harness.repository,
@@ -64,8 +69,8 @@ def test_waiting_future_is_not_published_until_capacity_allows_approval(
     loop_fixture,
 ) -> None:
     harness = loop_fixture(
-        responses=[dependency_patch_json(), quality_json(), finish_json()],
-        reports=[successful_report(), successful_report(), successful_report()],
+        responses=[dependency_patch_json(), finish_json()],
+        reports=[successful_report(), successful_report()],
     )
     service = HarnessService(
         repository=harness.repository,
@@ -106,9 +111,14 @@ def test_waiting_future_is_not_published_until_capacity_allows_approval(
 def test_web_recovers_approval_dispatch_after_service_and_repository_restart(
     loop_fixture, decision: ApprovalDecision
 ) -> None:
+    continuation = (
+        [finish_json()]
+        if decision is ApprovalDecision.APPROVE
+        else [quality_json(), finish_json()]
+    )
     harness = loop_fixture(
-        responses=[dependency_patch_json(), quality_json(), finish_json()],
-        reports=[successful_report(), successful_report(), successful_report()],
+        responses=[dependency_patch_json(), *continuation],
+        reports=[successful_report(), successful_report()],
     )
     service = HarnessService(
         repository=harness.repository,
@@ -278,9 +288,14 @@ def test_web_recovers_running_task_after_worker_and_pre_release_cleanup_failures
 def test_service_approval_submit_failure_keeps_recoverable_decision_and_lease(
     loop_fixture, decision: ApprovalDecision
 ) -> None:
+    continuation = (
+        [finish_json()]
+        if decision is ApprovalDecision.APPROVE
+        else [quality_json(), finish_json()]
+    )
     harness = loop_fixture(
-        responses=[dependency_patch_json(), quality_json(), finish_json()],
-        reports=[successful_report(), successful_report(), successful_report()],
+        responses=[dependency_patch_json(), *continuation],
+        reports=[successful_report(), successful_report()],
     )
     service = HarnessService(
         repository=harness.repository,
@@ -367,6 +382,17 @@ def test_approval_pauses_and_executes_once(loop_fixture) -> None:
     assert second == first
     assert harness.dispatcher.dispatch_count(action) == 1
     assert harness.dispatcher.approved_flags == [True]
+    lifecycle = [
+        event.event_type
+        for event in harness.audit.events
+        if event.event_type
+        in {"quality_candidate_ready", "finish_verification", "task_terminal"}
+    ]
+    assert lifecycle == [
+        "quality_candidate_ready",
+        "finish_verification",
+        "task_terminal",
+    ]
 
     try:
         harness.loop.decide_approval(approval.id, ApprovalDecision.REJECT)
@@ -427,8 +453,8 @@ def test_repository_drift_blocks_approved_action_before_dispatch(loop_fixture) -
 def test_recovery_marks_already_applied_intent_complete_without_replay(loop_fixture) -> None:
     action = dependency_patch_json()
     harness = loop_fixture(
-        responses=[action, quality_json(), finish_json()],
-        reports=[successful_report(), successful_report(), successful_report()],
+        responses=[action, finish_json()],
+        reports=[successful_report(), successful_report()],
         round_limit=3,
     )
     harness.loop.run(harness.task_id)
@@ -451,7 +477,7 @@ def test_recovery_marks_already_applied_intent_complete_without_replay(loop_fixt
 
     assert result.status is TaskStatus.SUCCEEDED
     assert harness.dispatcher.actions == []
-    assert len(harness.pipeline.calls) == 3
+    assert len(harness.pipeline.calls) == 2
     recovered = harness.repository.resume_snapshot(harness.task_id).decided_approval
     assert recovered.execution_state == "completed"
 
@@ -479,8 +505,8 @@ def test_applied_intent_evidence_wins_over_the_expected_repository_snapshot_chan
 
     action = dependency_patch_json()
     harness = loop_fixture(
-        responses=[action, quality_json(), finish_json()],
-        reports=[successful_report(), successful_report(), successful_report()],
+        responses=[action, finish_json()],
+        reports=[successful_report(), successful_report()],
         round_limit=3,
         policy_factory=policy_factory,
     )
@@ -512,8 +538,8 @@ def test_recovery_replays_intent_only_when_original_snapshot_is_still_current(
 ) -> None:
     action = dependency_patch_json()
     harness = loop_fixture(
-        responses=[action, quality_json(), finish_json()],
-        reports=[successful_report(), successful_report(), successful_report()],
+        responses=[action, finish_json()],
+        reports=[successful_report(), successful_report()],
         round_limit=3,
     )
     harness.loop.run(harness.task_id)

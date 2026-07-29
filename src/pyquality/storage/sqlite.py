@@ -184,6 +184,7 @@ _RESERVED_STATUSES = frozenset(
     {TaskStatus.CREATED, TaskStatus.RUNNING, TaskStatus.WAITING_APPROVAL}
 )
 _PROJECT_RESERVATION_MIGRATION = "project-reservations-v1"
+_GREEN_CANDIDATE_MIGRATION = "green-candidates-v2"
 _ALLOWED_TRANSITIONS = {
     TaskStatus.CREATED: frozenset({TaskStatus.RUNNING}),
     TaskStatus.RUNNING: frozenset({TaskStatus.WAITING_APPROVAL, *_TERMINAL_STATUSES}),
@@ -676,6 +677,24 @@ class SQLiteTaskRepository:
             if any(value is not None for value in existing[:4]) or existing_findings:
                 if existing != proposed:
                     raise StorageStateError("iteration outcome is already completed")
+                if green_candidate is not None:
+                    if (
+                        green_candidate.task_id != task_id
+                        or green_candidate.iteration != row["sequence"]
+                        or quality_outcome != "passed"
+                    ):
+                        raise StorageStateError("green candidate does not match passing iteration")
+                    self._upsert_green_candidate(connection, green_candidate)
+                if approval_id is not None:
+                    approval = self._require_approval(connection, approval_id)
+                    if approval["task_id"] != task_id:
+                        raise StorageStateError("approval belongs to another task")
+                    connection.execute(
+                        """UPDATE approvals SET execution_state = 'completed',
+                           result_digest = ?, executed_at = COALESCE(executed_at, ?)
+                           WHERE id = ?""",
+                        (tool_result_digest, _dump_datetime(_utc_now()), approval_id),
+                    )
                 return _iteration_from_row(row)
             connection.execute(
                 """UPDATE iterations
@@ -1908,7 +1927,63 @@ class SQLiteTaskRepository:
             "project_reservations", "migrated", "INTEGER NOT NULL DEFAULT 0"
         )
         self._ensure_column("project_reservations", "creation_nonce", "TEXT")
+        self._migrate_green_candidates()
         self._migrate_project_reservations()
+
+    def _migrate_green_candidates(self) -> None:
+        """Rebuild the released R0 table with bounded, iteration-bound evidence."""
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            completed = self._connection.execute(
+                "SELECT 1 FROM schema_migrations WHERE name = ?",
+                (_GREEN_CANDIDATE_MIGRATION,),
+            ).fetchone()
+            if completed is not None:
+                self._connection.commit()
+                return
+            rows = tuple(self._connection.execute("SELECT * FROM green_candidates"))
+            self._connection.execute("ALTER TABLE green_candidates RENAME TO green_candidates_r0")
+            self._connection.execute(
+                """CREATE TABLE green_candidates (
+                    task_id TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
+                    iteration INTEGER NOT NULL,
+                    report_digest TEXT NOT NULL,
+                    repository_digest TEXT NOT NULL,
+                    summary TEXT NOT NULL,
+                    changed_paths_json TEXT NOT NULL,
+                    FOREIGN KEY(task_id, iteration)
+                        REFERENCES iterations(task_id, sequence) ON DELETE CASCADE
+                )"""
+            )
+            for row in rows:
+                try:
+                    candidate = GreenCandidate(
+                        task_id=row["task_id"],
+                        iteration=row["iteration"],
+                        report_digest=row["report_digest"],
+                        repository_digest=row["repository_digest"],
+                        summary=row["summary"],
+                        changed_paths=tuple(json.loads(row["changed_paths_json"])),
+                    )
+                except (ValueError, TypeError, json.JSONDecodeError):
+                    continue
+                passing = self._connection.execute(
+                    """SELECT 1 FROM iterations WHERE task_id = ? AND sequence = ?
+                       AND quality_outcome = 'passed'""",
+                    (candidate.task_id, candidate.iteration),
+                ).fetchone()
+                if passing is not None:
+                    self._upsert_green_candidate(self._connection, candidate)
+            self._connection.execute("DROP TABLE green_candidates_r0")
+            self._connection.execute(
+                "INSERT INTO schema_migrations (name, completed_at) VALUES (?, ?)",
+                (_GREEN_CANDIDATE_MIGRATION, _dump_datetime(_utc_now())),
+            )
+        except Exception:
+            self._connection.rollback()
+            raise
+        else:
+            self._connection.commit()
 
     def _migrate_project_reservations(self) -> None:
         """Atomically backfill reservations and record durable completion."""

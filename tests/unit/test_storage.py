@@ -200,6 +200,62 @@ def test_finish_iteration_and_terminal_result_rollback_together(
     assert repo.green_candidate(task.id) == _candidate(task.id)
 
 
+def test_r0_green_candidate_schema_migrates_valid_and_drops_oversized(
+    tmp_path: Path,
+) -> None:
+    """Opening the released R0 table must retain only bounded passing-iteration evidence."""
+    database = tmp_path / "r0-green.sqlite"
+    seeded = SQLiteTaskRepository(database)
+    valid = seeded.create_task("C:/work/r0-valid", "fix", round_limit=8)
+    invalid = seeded.create_task("C:/work/r0-invalid", "fix", round_limit=8)
+    for task in (valid, invalid):
+        seeded.append_iteration(
+            task.id,
+            sequence=1,
+            context_digest="a" * 64,
+            quality_outcome="passed",
+        )
+    seeded.close()
+    connection = sqlite3.connect(database)
+    connection.execute(
+        "DELETE FROM schema_migrations WHERE name = 'green-candidates-v2'"
+    )
+    connection.execute("DROP TABLE green_candidates")
+    connection.execute(
+        """CREATE TABLE green_candidates (
+            task_id TEXT PRIMARY KEY,
+            iteration INTEGER NOT NULL,
+            report_digest TEXT NOT NULL,
+            repository_digest TEXT NOT NULL,
+            summary TEXT NOT NULL,
+            changed_paths_json TEXT NOT NULL
+        )"""
+    )
+    connection.executemany(
+        "INSERT INTO green_candidates VALUES (?, 1, ?, ?, ?, ?)",
+        (
+            (valid.id, "a" * 64, "b" * 64, "passed", '["calculator.py"]'),
+            (invalid.id, "c" * 64, "d" * 64, "x" * 1025, '["calculator.py"]'),
+        ),
+    )
+    connection.commit()
+    connection.close()
+
+    reopened = SQLiteTaskRepository(database)
+    try:
+        assert reopened.green_candidate(valid.id) == GreenCandidate(
+            task_id=valid.id,
+            iteration=1,
+            report_digest="a" * 64,
+            repository_digest="b" * 64,
+            summary="passed",
+            changed_paths=("calculator.py",),
+        )
+        assert reopened.green_candidate(invalid.id) is None
+    finally:
+        reopened.close()
+
+
 @pytest.fixture
 def repo(tmp_path: Path) -> SQLiteTaskRepository:
     return SQLiteTaskRepository(tmp_path / "state.sqlite")
