@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import multiprocessing
 import os
+import shutil
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from urllib.parse import unquote
@@ -19,6 +21,33 @@ class AuditEvent(_AuditEvent):
     """Test fixture that supplies a fresh valid ID unless a replay ID is explicit."""
 
     event_id: str = Field(default_factory=lambda: uuid4().hex + uuid4().hex)
+
+
+@pytest.fixture
+def r4_tmp_path(tmp_path: Path) -> Path:
+    """Remove owner-only R4 roots while the creating Windows token is still live."""
+    yield tmp_path
+    if os.name == "nt":
+        from pyquality import security
+
+        for directory, _, filenames in os.walk(tmp_path, topdown=False):
+            for filename in filenames:
+                target = Path(directory) / filename
+                descriptor: int | None = None
+                try:
+                    descriptor = security._open_audit(
+                        target,
+                        append=False,
+                        create=False,
+                    )
+                except OSError:
+                    target.unlink(missing_ok=True)
+                else:
+                    try:
+                        security._remove_open_audit(target, descriptor)
+                    finally:
+                        os.close(descriptor)
+    shutil.rmtree(tmp_path)
 
 
 def _set_process_environment(root: str) -> None:
@@ -98,6 +127,99 @@ def _replay_alias_once(
     AuditLogger(Path(path), **options).emit(
         AuditEvent(event_id=event_id, event_type="transition")
     )
+
+
+def _write_secure_test_file(path: Path, payloads: list[tuple[int, bytes]]) -> None:
+    from pyquality import security
+
+    descriptor = security._open_audit(path, append=False)
+    try:
+        for offset, payload in payloads:
+            os.lseek(descriptor, offset, os.SEEK_SET)
+            security._write_all(descriptor, payload)
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _build_released_r4_audit_index(
+    path: Path,
+    index_base: Path,
+    *,
+    event_count: int,
+) -> tuple[list[AuditEvent], list[bytes], Path, Path]:
+    """Materialize the released 90b9c45 checkpoint and JSON receipt layout."""
+    from pyquality import security
+
+    logger = AuditLogger(path, index_root=index_base)
+    events = [
+        AuditEvent(
+            event_id=f"{index + 1_000:064x}",
+            event_type="transition",
+            metadata={"status": "x" * 4_096},
+        )
+        for index in range(event_count)
+    ]
+    records = [logger._encode(event) for event in events]
+    _prepare_existing_audit(path, b"".join(records))
+    audit_descriptor = security._open_audit(path)
+    try:
+        identity = security._audit_stream_identity(audit_descriptor)
+        new_root = security._audit_index_root(path, audit_descriptor, index_base)
+    finally:
+        os.close(audit_descriptor)
+    legacy_root = path.absolute().parent / f".pyquality-audit-index-{identity}"
+    security._ensure_secure_audit_directory(legacy_root)
+    offsets: list[int] = []
+    position = 0
+    for record in records:
+        offsets.append(position)
+        position += len(record)
+    newest_generation = max(2, event_count)
+    prior_count = max(0, event_count - 1)
+    prior_size = offsets[-1] if records else 0
+    checkpoint_payloads = []
+    for generation, indexed_size, receipt_count in (
+        (newest_generation - 1, prior_size, prior_count),
+        (newest_generation, position, event_count),
+    ):
+        payload = security._CHECKPOINT_SLOT.pack(
+            security._CHECKPOINT_MAGIC,
+            generation,
+            indexed_size,
+            receipt_count,
+            security._checkpoint_digest(generation, indexed_size, receipt_count),
+        )
+        checkpoint_payloads.append(
+            ((generation % 2) * security._CHECKPOINT_SLOT.size, payload)
+        )
+    _write_secure_test_file(legacy_root / "checkpoint", checkpoint_payloads)
+    security._ensure_secure_audit_directory(legacy_root / "receipts")
+    for shard in {event.event_id[:2] for event in events}:
+        security._ensure_secure_audit_directory(
+            legacy_root / "receipts" / shard
+        )
+    for event, record, offset in zip(events, records, offsets, strict=True):
+        receipt = (
+            json.dumps(
+                {
+                    "digest": hashlib.sha256(record).hexdigest(),
+                    "event_id": event.event_id,
+                    "length": len(record),
+                    "offset": offset,
+                    "version": 1,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            + b"\n"
+        )
+        _write_secure_test_file(
+            legacy_root / "receipts" / event.event_id[:2] / event.event_id,
+            [(0, receipt)],
+        )
+    return events, records, legacy_root, new_root
 
 
 def test_redacts_nested_headers_urls_and_exception_text(tmp_path: Path) -> None:
@@ -1460,6 +1582,312 @@ def test_configured_index_root_is_shared_by_hardlink_alias_processes(
 
     assert process.exitcode == 0
     assert path.read_bytes() == before
+
+
+def test_released_r4_large_index_migrates_without_historical_log_scan(
+    r4_tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Upgrade must replay an old R4 ID beyond the bounded suffix without rescanning JSONL."""
+    from pyquality import security
+
+    tmp_path = r4_tmp_path
+    path = tmp_path / "legacy" / "audit.jsonl"
+    index_base = tmp_path / "new-index"
+    events, _, legacy_root, new_root = _build_released_r4_audit_index(
+        path,
+        index_base,
+        event_count=66,
+    )
+    before = path.read_bytes()
+    assert len(before) > security._MAX_INDEX_REBUILD_BYTES
+    audit_stat = path.stat()
+    read_requests: list[tuple[int, int]] = []
+    real_read_at = security._read_at
+
+    def bounded_read_at(descriptor: int, offset: int, length: int) -> bytes:
+        information = os.fstat(descriptor)
+        if (information.st_dev, information.st_ino) == (
+            audit_stat.st_dev,
+            audit_stat.st_ino,
+        ):
+            read_requests.append((offset, length))
+        return real_read_at(descriptor, offset, length)
+
+    monkeypatch.setattr(security, "_read_at", bounded_read_at)
+
+    AuditLogger(path, index_root=index_base).emit(events[0])
+
+    assert path.read_bytes() == before
+    assert read_requests
+    assert max(length for _, length in read_requests) <= security._MAX_RECORD_BYTES + 1
+    assert all(length != len(before) for _, length in read_requests)
+    assert (new_root / "migration").is_file()
+    assert security._audit_receipt_path(new_root, events[0].event_id).is_file()
+    assert legacy_root.is_dir()
+
+
+@pytest.mark.parametrize(
+    "defect",
+    [
+        "permissive",
+        "foreign_owner",
+        "corrupt_checkpoint",
+        "over_cap",
+        "receipt_mismatch",
+    ],
+)
+def test_invalid_released_r4_index_fails_closed_without_copying(
+    r4_tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    defect: str,
+) -> None:
+    """Invalid R4 evidence must not be ignored in favor of a silent small-log rebuild."""
+    from pyquality import security
+
+    tmp_path = r4_tmp_path
+    path = tmp_path / defect / "audit.jsonl"
+    index_base = tmp_path / f"new-{defect}"
+    events, _, legacy_root, new_root = _build_released_r4_audit_index(
+        path,
+        index_base,
+        event_count=2,
+    )
+    checkpoint_path = legacy_root / "checkpoint"
+    first_receipt = security._audit_receipt_path(legacy_root, events[0].event_id)
+    if defect == "permissive":
+        if os.name == "nt":
+            _windows_set_test_dacl(
+                checkpoint_path,
+                "D:(A;;FA;;;WD)",
+                protected=False,
+            )
+        else:
+            os.chmod(checkpoint_path, 0o644)
+    elif defect == "foreign_owner":
+        real_validate = security._validate_existing_secure_audit_directory
+
+        def reject_foreign_owner(candidate: Path) -> None:
+            if candidate == legacy_root.absolute():
+                raise OSError("simulated foreign owner")
+            real_validate(candidate)
+
+        monkeypatch.setattr(
+            security,
+            "_validate_existing_secure_audit_directory",
+            reject_foreign_owner,
+        )
+    elif defect == "corrupt_checkpoint":
+        encoded = bytearray(checkpoint_path.read_bytes())
+        encoded[0] ^= 0xFF
+        encoded[security._CHECKPOINT_SLOT.size] ^= 0xFF
+        _write_secure_test_file(checkpoint_path, [(0, bytes(encoded))])
+    elif defect == "over_cap":
+        monkeypatch.setattr(security, "_MAX_AUDIT_RECEIPTS", 1)
+    else:
+        receipt_descriptor = security._open_audit(
+            first_receipt,
+            append=False,
+            create=False,
+        )
+        try:
+            receipt = json.loads(
+                security._read_at(
+                    receipt_descriptor,
+                    0,
+                    security._MAX_RECEIPT_BYTES,
+                )
+            )
+        finally:
+            os.close(receipt_descriptor)
+        receipt["digest"] = "0" * 64
+        payload = (
+            json.dumps(
+                receipt,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            + b"\n"
+        )
+        _write_secure_test_file(first_receipt, [(0, payload)])
+
+    with pytest.raises(security.AuditRecoveryRequired) as raised:
+        AuditLogger(path, index_root=index_base).emit(events[0])
+
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert str(legacy_root) not in str(raised.value)
+    assert not (new_root / "migration").exists()
+    assert not security._audit_receipt_path(new_root, events[0].event_id).exists()
+
+
+def test_r4_candidate_rejects_a_wrong_encoded_stream_identity(
+    r4_tmp_path: Path,
+) -> None:
+    """A legacy directory name for another inode must never become migration authority."""
+    from pyquality import security
+
+    tmp_path = r4_tmp_path
+    expected_identity = "1a-2b"
+    wrong_root = tmp_path / ".pyquality-audit-index-3c-4d"
+
+    with pytest.raises(security.AuditRecoveryRequired):
+        security._validate_r4_audit_index_identity(
+            wrong_root,
+            expected_identity,
+        )
+
+
+def test_released_r4_directory_link_is_not_followed(r4_tmp_path: Path) -> None:
+    """Migration must not follow a linked R4 namespace component to attacker data."""
+    from pyquality import security
+
+    tmp_path = r4_tmp_path
+    path = tmp_path / "linked-legacy" / "audit.jsonl"
+    index_base = tmp_path / "linked-new"
+    events, _, legacy_root, new_root = _build_released_r4_audit_index(
+        path,
+        index_base,
+        event_count=2,
+    )
+    outside = tmp_path / "outside-legacy"
+    legacy_root.rename(outside)
+    try:
+        legacy_root.symlink_to(outside, target_is_directory=True)
+    except OSError as error:
+        outside.rename(legacy_root)
+        pytest.skip(f"directory link creation unavailable: {error.__class__.__name__}")
+
+    with pytest.raises(security.AuditRecoveryRequired):
+        AuditLogger(path, index_root=index_base).emit(events[0])
+
+    assert not (new_root / "migration").exists()
+    assert outside.is_dir()
+
+
+def test_released_r4_conflicts_with_existing_committed_r5_data(
+    r4_tmp_path: Path,
+) -> None:
+    """A partially populated R5 root must not silently merge a released R4 namespace."""
+    from pyquality import security
+
+    tmp_path = r4_tmp_path
+    path = tmp_path / "conflict" / "audit.jsonl"
+    index_base = tmp_path / "conflict-new"
+    events, records, legacy_root, new_root = _build_released_r4_audit_index(
+        path,
+        index_base,
+        event_count=2,
+    )
+    security._ensure_secure_audit_index_root(index_base, new_root)
+    receipt_descriptor = security._open_audit(
+        security._audit_receipt_path(new_root, events[0].event_id),
+        append=False,
+    )
+    try:
+        security._commit_audit_receipt(
+            receipt_descriptor,
+            events[0].event_id,
+            0,
+            records[0],
+        )
+    finally:
+        os.close(receipt_descriptor)
+    checkpoint_descriptor = security._open_audit(
+        new_root / "checkpoint",
+        append=False,
+    )
+    try:
+        security._store_audit_checkpoint(
+            checkpoint_descriptor,
+            None,
+            indexed_size=len(records[0]),
+            committed_receipt_count=1,
+        )
+    finally:
+        os.close(checkpoint_descriptor)
+
+    with pytest.raises(security.AuditRecoveryRequired) as raised:
+        AuditLogger(path, index_root=index_base).emit(events[1])
+
+    assert str(legacy_root) not in str(raised.value)
+    assert not security._audit_receipt_path(new_root, events[1].event_id).exists()
+    assert not (new_root / "migration").exists()
+
+
+@pytest.mark.parametrize(
+    "stage",
+    [
+        "before_marker",
+        "before_receipt_copy",
+        "after_receipt_fsync",
+        "before_completed_marker",
+    ],
+)
+def test_r4_migration_interruption_resumes_and_hardlink_alias_converges(
+    r4_tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stage: str,
+) -> None:
+    """Every migration crash point must resume idempotently before alias replay."""
+    from pyquality import security
+
+    tmp_path = r4_tmp_path
+    left = tmp_path / f"left-{stage}"
+    right = tmp_path / f"right-{stage}"
+    left.mkdir()
+    right.mkdir()
+    path = left / "audit.jsonl"
+    alias = right / "audit-alias.jsonl"
+    index_base = tmp_path / f"new-{stage}"
+    events, _, _, new_root = _build_released_r4_audit_index(
+        path,
+        index_base,
+        event_count=4,
+    )
+    before = path.read_bytes()
+    try:
+        os.link(path, alias)
+    except OSError as error:
+        pytest.skip(f"hardlink creation unavailable: {error.__class__.__name__}")
+    faulted = False
+
+    def migration_fault(current_stage: str) -> None:
+        nonlocal faulted
+        if current_stage == stage and not faulted:
+            faulted = True
+            raise OSError(f"simulated migration crash at {stage}")
+
+    with monkeypatch.context() as fault:
+        fault.setattr(
+            security,
+            "_audit_migration_fault",
+            migration_fault,
+            raising=False,
+        )
+        with pytest.raises(AuditWriteError):
+            AuditLogger(path, index_root=index_base).emit(events[0])
+    assert faulted
+    assert path.read_bytes() == before
+
+    AuditLogger(path, index_root=index_base).emit(events[0])
+    context = multiprocessing.get_context("spawn")
+    process = context.Process(
+        target=_replay_alias_once,
+        args=(
+            str(alias),
+            events[-1].event_id,
+            str(tmp_path / f"environment-{stage}"),
+            str(index_base),
+        ),
+    )
+    process.start()
+    process.join(20)
+
+    assert process.exitcode == 0
+    assert path.read_bytes() == before
+    assert (new_root / "migration").is_file()
 
 
 def test_configured_index_namespace_rejects_directory_link(

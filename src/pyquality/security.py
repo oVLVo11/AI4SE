@@ -44,6 +44,9 @@ _CHECKPOINT_SLOT = struct.Struct(">8sQQQ32s")
 _CHECKPOINT_V2_MAGIC = b"PQAIDX2\0"
 _CHECKPOINT_V2_REGION_OFFSET = _CHECKPOINT_SLOT.size * 2
 _CHECKPOINT_V2_SLOT = struct.Struct(">8sQQQQ32s32s24x")
+_R4_MIGRATION_MAGIC = b"PQAMIG1\0"
+_R4_MIGRATION_TARGET_FORMAT = 2
+_R4_MIGRATION_SLOT = struct.Struct(">8sQ64sQQQQB32s111x")
 _RECEIPT_MAGIC = b"PQARCP2\0"
 _RECEIPT_SLOT_OFFSET = 256
 _RECEIPT_SLOT = struct.Struct(">8sQQI32s32s32s")
@@ -111,6 +114,24 @@ class _AuditCheckpoint(NamedTuple):
     committed_receipt_count: int
     pending_event_id: str | None
     pending_start_offset: int | None
+
+
+class _R4MigrationState(NamedTuple):
+    generation: int
+    source_identity: str
+    target_format: int
+    next_cursor: int
+    receipt_count: int
+    indexed_size: int
+    completed: bool
+
+
+class _R4Receipt(NamedTuple):
+    path: Path
+    event_id: str
+    offset: int
+    length: int
+    digest: str
 
 
 class CredentialWarning(PublicModel):
@@ -786,6 +807,11 @@ class AuditLogger:
                     self._index_base,
                 )
                 _ensure_secure_audit_index_root(self._index_base, index_root)
+                _migrate_released_r4_audit_index(
+                    self._path,
+                    descriptor,
+                    index_root,
+                )
                 checkpoint_path = index_root / "checkpoint"
                 checkpoint_descriptor = _open_audit(checkpoint_path, append=False)
                 try:
@@ -1642,6 +1668,725 @@ def _reconcile_audit_index(
     return checkpoint
 
 
+def _audit_migration_fault(stage: str) -> None:
+    """Test seam for migration durability boundaries."""
+    del stage
+
+
+def _r4_migration_digest(
+    generation: int,
+    source_identity: bytes,
+    target_format: int,
+    next_cursor: int,
+    receipt_count: int,
+    indexed_size: int,
+    completed: bool,
+) -> bytes:
+    return hashlib.sha256(
+        struct.pack(
+            ">Q64sQQQQB",
+            generation,
+            source_identity,
+            target_format,
+            next_cursor,
+            receipt_count,
+            indexed_size,
+            completed,
+        )
+    ).digest()
+
+
+def _load_r4_migration_state(
+    descriptor: int,
+    *,
+    source_identity: str,
+    audit_size: int,
+) -> _R4MigrationState:
+    size = os.lseek(descriptor, 0, os.SEEK_END)
+    if size == 0 or size > _R4_MIGRATION_SLOT.size * 2:
+        raise AuditRecoveryRequired
+    candidates: list[_R4MigrationState] = []
+    future_format = False
+    for slot in range(2):
+        encoded = _read_at(
+            descriptor,
+            slot * _R4_MIGRATION_SLOT.size,
+            _R4_MIGRATION_SLOT.size,
+        )
+        if len(encoded) != _R4_MIGRATION_SLOT.size:
+            continue
+        (
+            magic,
+            generation,
+            encoded_identity,
+            target_format,
+            next_cursor,
+            receipt_count,
+            indexed_size,
+            completed,
+            digest,
+        ) = _R4_MIGRATION_SLOT.unpack(encoded)
+        if magic.startswith(b"PQAMIG") and magic != _R4_MIGRATION_MAGIC:
+            future_format = True
+        identity_bytes = encoded_identity.rstrip(b"\0")
+        try:
+            decoded_identity = identity_bytes.decode("ascii")
+        except UnicodeDecodeError:
+            continue
+        if (
+            magic == _R4_MIGRATION_MAGIC
+            and generation > 0
+            and encoded_identity == identity_bytes.ljust(64, b"\0")
+            and decoded_identity == source_identity
+            and re.fullmatch(r"[0-9a-f]+-[0-9a-f]+", decoded_identity)
+            is not None
+            and target_format == _R4_MIGRATION_TARGET_FORMAT
+            and next_cursor <= receipt_count <= _MAX_AUDIT_RECEIPTS
+            and indexed_size <= audit_size
+            and completed in {0, 1}
+            and (not completed or next_cursor == receipt_count)
+            and digest
+            == _r4_migration_digest(
+                generation,
+                encoded_identity,
+                target_format,
+                next_cursor,
+                receipt_count,
+                indexed_size,
+                bool(completed),
+            )
+        ):
+            candidates.append(
+                _R4MigrationState(
+                    generation,
+                    decoded_identity,
+                    target_format,
+                    next_cursor,
+                    receipt_count,
+                    indexed_size,
+                    bool(completed),
+                )
+            )
+    if future_format or not candidates:
+        raise AuditRecoveryRequired
+    return max(candidates, key=lambda state: state.generation)
+
+
+def _store_r4_migration_state(
+    descriptor: int,
+    previous: _R4MigrationState | None,
+    *,
+    source_identity: str,
+    next_cursor: int,
+    receipt_count: int,
+    indexed_size: int,
+    completed: bool,
+) -> _R4MigrationState:
+    try:
+        identity = source_identity.encode("ascii")
+    except UnicodeEncodeError as error:
+        raise AuditRecoveryRequired from error
+    if (
+        re.fullmatch(r"[0-9a-f]+-[0-9a-f]+", source_identity) is None
+        or not 1 <= len(identity) <= 64
+        or next_cursor > receipt_count
+        or receipt_count > _MAX_AUDIT_RECEIPTS
+        or indexed_size < 0
+        or (completed and next_cursor != receipt_count)
+    ):
+        raise AuditRecoveryRequired
+    generation = 1 if previous is None else previous.generation + 1
+    encoded_identity = identity.ljust(64, b"\0")
+    payload = _R4_MIGRATION_SLOT.pack(
+        _R4_MIGRATION_MAGIC,
+        generation,
+        encoded_identity,
+        _R4_MIGRATION_TARGET_FORMAT,
+        next_cursor,
+        receipt_count,
+        indexed_size,
+        completed,
+        _r4_migration_digest(
+            generation,
+            encoded_identity,
+            _R4_MIGRATION_TARGET_FORMAT,
+            next_cursor,
+            receipt_count,
+            indexed_size,
+            completed,
+        ),
+    )
+    os.lseek(
+        descriptor,
+        ((generation - 1) % 2) * _R4_MIGRATION_SLOT.size,
+        os.SEEK_SET,
+    )
+    _write_all(descriptor, payload)
+    os.fsync(descriptor)
+    return _R4MigrationState(
+        generation,
+        source_identity,
+        _R4_MIGRATION_TARGET_FORMAT,
+        next_cursor,
+        receipt_count,
+        indexed_size,
+        completed,
+    )
+
+
+def _validate_r4_audit_index_identity(
+    candidate_root: Path,
+    expected_identity: str,
+) -> None:
+    prefix = ".pyquality-audit-index-"
+    encoded_identity = candidate_root.name[len(prefix) :] if candidate_root.name.startswith(prefix) else ""
+    if (
+        re.fullmatch(r"[0-9a-f]+-[0-9a-f]+", expected_identity) is None
+        or encoded_identity != expected_identity
+    ):
+        raise AuditRecoveryRequired
+
+
+def _r4_candidate_exists(candidate_root: Path) -> bool:
+    try:
+        os.lstat(candidate_root)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        raise AuditRecoveryRequired from None
+    return True
+
+
+def _validate_secure_r4_directory(path: Path) -> None:
+    try:
+        _validate_existing_secure_audit_directory(path.absolute())
+    except OSError:
+        raise AuditRecoveryRequired from None
+
+
+def _open_secure_r4_file(path: Path) -> int:
+    try:
+        if os.name == "nt":
+            return _open_audit(path, append=False, create=False)
+        return _open_posix_r4_audit(path.absolute())
+    except OSError:
+        raise AuditRecoveryRequired from None
+
+
+def _bounded_r4_directory_entries(
+    path: Path,
+    *,
+    limit: int,
+) -> list[tuple[str, bool, bool]]:
+    entries: list[tuple[str, bool, bool]] = []
+    try:
+        with os.scandir(path) as iterator:
+            for entry in iterator:
+                if len(entries) >= limit:
+                    raise AuditRecoveryRequired
+                entries.append(
+                    (
+                        entry.name,
+                        entry.is_dir(follow_symlinks=False),
+                        entry.is_file(follow_symlinks=False),
+                    )
+                )
+    except AuditRecoveryRequired:
+        raise
+    except OSError:
+        raise AuditRecoveryRequired from None
+    return entries
+
+
+def _enumerate_r4_receipts(
+    source_root: Path,
+    expected_count: int,
+) -> tuple[_R4Receipt, ...]:
+    receipts_root = source_root / "receipts"
+    if expected_count == 0 and not _r4_candidate_exists(receipts_root):
+        return ()
+    _validate_secure_r4_directory(receipts_root)
+    shard_entries = _bounded_r4_directory_entries(receipts_root, limit=257)
+    receipt_paths: list[Path] = []
+    for shard, is_directory, is_file in sorted(shard_entries):
+        if (
+            not is_directory
+            or is_file
+            or re.fullmatch(r"[0-9a-f]{2}", shard) is None
+        ):
+            raise AuditRecoveryRequired
+        shard_root = receipts_root / shard
+        _validate_secure_r4_directory(shard_root)
+        remaining_limit = _MAX_AUDIT_RECEIPTS - len(receipt_paths) + 1
+        file_entries = _bounded_r4_directory_entries(
+            shard_root,
+            limit=remaining_limit,
+        )
+        for name, child_is_directory, child_is_file in sorted(file_entries):
+            if (
+                child_is_directory
+                or not child_is_file
+                or re.fullmatch(r"[0-9a-f]{64}", name) is None
+                or not name.startswith(shard)
+            ):
+                raise AuditRecoveryRequired
+            receipt_paths.append(shard_root / name)
+            if len(receipt_paths) > _MAX_AUDIT_RECEIPTS:
+                raise AuditRecoveryRequired
+    if len(receipt_paths) != expected_count:
+        raise AuditRecoveryRequired
+    return tuple(
+        _load_r4_receipt_metadata(path)
+        for path in sorted(receipt_paths, key=lambda item: (item.parent.name, item.name))
+    )
+
+
+def _load_r4_receipt_metadata(path: Path) -> _R4Receipt:
+    descriptor = _open_secure_r4_file(path)
+    try:
+        try:
+            receipt = _load_audit_receipt(descriptor)
+        except OSError:
+            raise AuditRecoveryRequired from None
+    finally:
+        os.close(descriptor)
+    if receipt is None or receipt.get("version") != 1:
+        raise AuditRecoveryRequired
+    event_id = receipt.get("event_id")
+    offset = receipt.get("offset")
+    length = receipt.get("length")
+    digest = receipt.get("digest")
+    if (
+        event_id != path.name
+        or not isinstance(event_id, str)
+        or type(offset) is not int
+        or type(length) is not int
+        or not isinstance(digest, str)
+    ):
+        raise AuditRecoveryRequired
+    return _R4Receipt(path, event_id, offset, length, digest)
+
+
+def _read_verified_r4_record(
+    audit_descriptor: int,
+    receipt: _R4Receipt,
+    *,
+    indexed_size: int,
+) -> bytes:
+    if receipt.offset + receipt.length > indexed_size:
+        raise AuditRecoveryRequired
+    encoded = _read_at(audit_descriptor, receipt.offset, receipt.length)
+    if (
+        len(encoded) != receipt.length
+        or hashlib.sha256(encoded).hexdigest() != receipt.digest
+        or _event_id_from_record(encoded) != receipt.event_id
+    ):
+        raise AuditRecoveryRequired
+    return encoded
+
+
+def _load_released_r4_index(
+    source_root: Path,
+    audit_descriptor: int,
+    audit_size: int,
+) -> tuple[_AuditCheckpoint, tuple[_R4Receipt, ...]]:
+    _validate_secure_r4_directory(source_root)
+    checkpoint_descriptor = _open_secure_r4_file(source_root / "checkpoint")
+    try:
+        if not 0 < os.lseek(checkpoint_descriptor, 0, os.SEEK_END) <= _CHECKPOINT_SLOT.size * 2:
+            raise AuditRecoveryRequired
+        try:
+            checkpoint = _load_audit_checkpoint(
+                checkpoint_descriptor,
+                audit_size=audit_size,
+            )
+        except OSError:
+            raise AuditRecoveryRequired from None
+    finally:
+        os.close(checkpoint_descriptor)
+    if checkpoint is None or checkpoint.pending_event_id is not None:
+        raise AuditRecoveryRequired
+    receipts = _enumerate_r4_receipts(
+        source_root,
+        checkpoint.committed_receipt_count,
+    )
+    for receipt in receipts:
+        _read_verified_r4_record(
+            audit_descriptor,
+            receipt,
+            indexed_size=checkpoint.indexed_size,
+        )
+    return checkpoint, receipts
+
+
+def _open_existing_migration_target(path: Path) -> int | None:
+    try:
+        return _open_existing_audit(path, append=False)
+    except OSError:
+        raise AuditRecoveryRequired from None
+
+
+def _load_existing_target_checkpoint(
+    index_root: Path,
+    audit_size: int,
+) -> tuple[_AuditCheckpoint | None, bool]:
+    descriptor = _open_existing_migration_target(index_root / "checkpoint")
+    if descriptor is None:
+        return None, False
+    try:
+        try:
+            checkpoint = _load_audit_checkpoint(
+                descriptor,
+                audit_size=audit_size,
+            )
+        except OSError:
+            raise AuditRecoveryRequired from None
+        is_v2 = checkpoint is not None and _audit_checkpoint_is_v2(
+            descriptor,
+            checkpoint,
+        )
+        return checkpoint, is_v2
+    finally:
+        os.close(descriptor)
+
+
+def _audit_checkpoint_is_v2(
+    descriptor: int,
+    expected: _AuditCheckpoint,
+) -> bool:
+    pending_event_id = expected.pending_event_id
+    pending_bytes = (
+        bytes(32) if pending_event_id is None else bytes.fromhex(pending_event_id)
+    )
+    pending_start = (
+        0 if expected.pending_start_offset is None else expected.pending_start_offset
+    )
+    for slot in range(2):
+        encoded = _read_at(
+            descriptor,
+            _CHECKPOINT_V2_REGION_OFFSET + slot * _CHECKPOINT_V2_SLOT.size,
+            _CHECKPOINT_V2_SLOT.size,
+        )
+        if len(encoded) != _CHECKPOINT_V2_SLOT.size:
+            continue
+        (
+            magic,
+            generation,
+            indexed_size,
+            receipt_count,
+            stored_pending_start,
+            stored_pending_event_id,
+            digest,
+        ) = _CHECKPOINT_V2_SLOT.unpack(encoded)
+        if (
+            magic == _CHECKPOINT_V2_MAGIC
+            and generation == expected.generation
+            and indexed_size == expected.indexed_size
+            and receipt_count == expected.committed_receipt_count
+            and stored_pending_start == pending_start
+            and stored_pending_event_id == pending_bytes
+            and digest
+            == _checkpoint_v2_digest(
+                generation,
+                indexed_size,
+                receipt_count,
+                stored_pending_start,
+                stored_pending_event_id,
+            )
+        ):
+            return True
+    return False
+
+
+def _assert_target_uncommitted(index_root: Path, audit_size: int) -> None:
+    checkpoint, _ = _load_existing_target_checkpoint(index_root, audit_size)
+    if checkpoint is not None and (
+        checkpoint.indexed_size
+        or checkpoint.committed_receipt_count
+        or checkpoint.pending_event_id is not None
+    ):
+        raise AuditRecoveryRequired
+
+
+def _assert_target_receipts_absent(receipts: tuple[_R4Receipt, ...], index_root: Path) -> None:
+    for receipt in receipts:
+        descriptor = _open_existing_migration_target(
+            _audit_receipt_path(index_root, receipt.event_id)
+        )
+        if descriptor is not None:
+            os.close(descriptor)
+            raise AuditRecoveryRequired
+
+
+def _target_checkpoint_matches_migration(
+    checkpoint: _AuditCheckpoint | None,
+    is_v2: bool,
+    state: _R4MigrationState,
+) -> bool:
+    return bool(
+        checkpoint is not None
+        and is_v2
+        and checkpoint.indexed_size == state.indexed_size
+        and checkpoint.committed_receipt_count == state.receipt_count
+        and checkpoint.pending_event_id is None
+    )
+
+
+def _verify_target_migration_checkpoint(
+    index_root: Path,
+    state: _R4MigrationState,
+    audit_size: int,
+) -> None:
+    checkpoint, is_v2 = _load_existing_target_checkpoint(index_root, audit_size)
+    if not _target_checkpoint_matches_migration(checkpoint, is_v2, state):
+        raise AuditRecoveryRequired
+
+
+def _copy_r4_receipt(
+    audit_descriptor: int,
+    receipt: _R4Receipt,
+    *,
+    indexed_size: int,
+    index_root: Path,
+) -> None:
+    current = _load_r4_receipt_metadata(receipt.path)
+    if current != receipt:
+        raise AuditRecoveryRequired
+    encoded = _read_verified_r4_record(
+        audit_descriptor,
+        current,
+        indexed_size=indexed_size,
+    )
+    target_path = _audit_receipt_path(index_root, receipt.event_id)
+    target_descriptor = _open_existing_migration_target(target_path)
+    if target_descriptor is None:
+        target_descriptor = _open_audit(target_path, append=False)
+    try:
+        try:
+            existing = _load_audit_receipt(
+                target_descriptor,
+                allow_torn=True,
+            )
+        except OSError:
+            raise AuditRecoveryRequired from None
+        if existing is None:
+            _commit_audit_receipt(
+                target_descriptor,
+                receipt.event_id,
+                receipt.offset,
+                encoded,
+            )
+        elif (
+            existing.get("version") != 2
+            or existing.get("offset") != receipt.offset
+            or existing.get("length") != receipt.length
+            or existing.get("digest") != receipt.digest
+        ):
+            raise AuditRecoveryRequired
+        else:
+            try:
+                _verify_audit_receipt(
+                    audit_descriptor,
+                    existing,
+                    receipt.event_id,
+                )
+            except OSError:
+                raise AuditRecoveryRequired from None
+    finally:
+        os.close(target_descriptor)
+    _sync_audit_directory_chain(index_root, target_path.parent)
+
+
+def _publish_r4_migration_checkpoint(
+    index_root: Path,
+    state: _R4MigrationState,
+    audit_size: int,
+) -> None:
+    checkpoint_path = index_root / "checkpoint"
+    descriptor = _open_existing_migration_target(checkpoint_path)
+    if descriptor is None:
+        descriptor = _open_audit(checkpoint_path, append=False)
+    try:
+        try:
+            checkpoint = _load_audit_checkpoint(
+                descriptor,
+                audit_size=audit_size,
+            )
+        except OSError:
+            raise AuditRecoveryRequired from None
+        is_v2 = checkpoint is not None and _audit_checkpoint_is_v2(
+            descriptor,
+            checkpoint,
+        )
+        if not _target_checkpoint_matches_migration(
+            checkpoint,
+            is_v2,
+            state,
+        ):
+            if checkpoint is not None and (
+                checkpoint.indexed_size
+                or checkpoint.committed_receipt_count
+                or checkpoint.pending_event_id is not None
+            ):
+                raise AuditRecoveryRequired
+            _store_audit_checkpoint(
+                descriptor,
+                checkpoint,
+                state.indexed_size,
+                state.receipt_count,
+            )
+    finally:
+        os.close(descriptor)
+    _sync_audit_directory_chain(index_root, index_root)
+
+
+def _sync_audit_directory_chain(index_root: Path, leaf: Path) -> None:
+    if os.name == "nt":
+        return
+    absolute_root = index_root.absolute()
+    absolute_leaf = leaf.absolute()
+    try:
+        absolute_leaf.relative_to(absolute_root)
+    except ValueError as error:
+        raise OSError("audit durability path escaped its identity root") from error
+    current = absolute_leaf
+    while True:
+        _sync_posix_audit_directory(current)
+        if current == absolute_root:
+            return
+        current = current.parent
+
+
+def _prepare_r4_migration(
+    marker_descriptor: int | None,
+    state: _R4MigrationState | None,
+    source_checkpoint: _AuditCheckpoint,
+    receipts: tuple[_R4Receipt, ...],
+    *,
+    source_identity: str,
+    index_root: Path,
+    marker_path: Path,
+    audit_size: int,
+) -> tuple[int, _R4MigrationState]:
+    if state is not None:
+        if (
+            state.receipt_count
+            != source_checkpoint.committed_receipt_count
+            or state.indexed_size != source_checkpoint.indexed_size
+            or marker_descriptor is None
+        ):
+            raise AuditRecoveryRequired
+        _sync_audit_directory_chain(index_root, index_root)
+        return marker_descriptor, state
+    _assert_target_uncommitted(index_root, audit_size)
+    _assert_target_receipts_absent(receipts, index_root)
+    _audit_migration_fault("before_marker")
+    descriptor = _open_audit(marker_path, append=False)
+    try:
+        if os.lseek(descriptor, 0, os.SEEK_END):
+            raise AuditRecoveryRequired
+        initial = _store_r4_migration_state(
+            descriptor,
+            None,
+            source_identity=source_identity,
+            next_cursor=0,
+            receipt_count=source_checkpoint.committed_receipt_count,
+            indexed_size=source_checkpoint.indexed_size,
+            completed=False,
+        )
+        _sync_audit_directory_chain(index_root, index_root)
+        return descriptor, initial
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def _migrate_released_r4_audit_index(
+    audit_path: Path,
+    audit_descriptor: int,
+    index_root: Path,
+) -> None:
+    source_identity = _audit_stream_identity(audit_descriptor)
+    audit_size = os.lseek(audit_descriptor, 0, os.SEEK_END)
+    marker_path = index_root / "migration"
+    marker_descriptor = _open_existing_migration_target(marker_path)
+    state: _R4MigrationState | None = None
+    try:
+        if marker_descriptor is not None:
+            try:
+                state = _load_r4_migration_state(
+                    marker_descriptor,
+                    source_identity=source_identity,
+                    audit_size=audit_size,
+                )
+            except OSError:
+                raise AuditRecoveryRequired from None
+            if state.completed:
+                _verify_target_migration_checkpoint(
+                    index_root,
+                    state,
+                    audit_size,
+                )
+                return
+
+        source_root = (
+            audit_path.absolute().parent
+            / f".pyquality-audit-index-{source_identity}"
+        )
+        _validate_r4_audit_index_identity(source_root, source_identity)
+        if not _r4_candidate_exists(source_root):
+            if state is not None:
+                raise AuditRecoveryRequired
+            return
+        source_checkpoint, receipts = _load_released_r4_index(
+            source_root,
+            audit_descriptor,
+            audit_size,
+        )
+        marker_descriptor, state = _prepare_r4_migration(
+            marker_descriptor,
+            state,
+            source_checkpoint,
+            receipts,
+            source_identity=source_identity,
+            index_root=index_root,
+            marker_path=marker_path,
+            audit_size=audit_size,
+        )
+        for cursor in range(state.next_cursor, state.receipt_count):
+            _audit_migration_fault("before_receipt_copy")
+            _copy_r4_receipt(
+                audit_descriptor,
+                receipts[cursor],
+                indexed_size=state.indexed_size,
+                index_root=index_root,
+            )
+            _audit_migration_fault("after_receipt_fsync")
+            state = _store_r4_migration_state(
+                marker_descriptor,
+                state,
+                source_identity=source_identity,
+                next_cursor=cursor + 1,
+                receipt_count=state.receipt_count,
+                indexed_size=state.indexed_size,
+                completed=False,
+            )
+        _publish_r4_migration_checkpoint(index_root, state, audit_size)
+        _audit_migration_fault("before_completed_marker")
+        _store_r4_migration_state(
+            marker_descriptor,
+            state,
+            source_identity=source_identity,
+            next_cursor=state.receipt_count,
+            receipt_count=state.receipt_count,
+            indexed_size=state.indexed_size,
+            completed=True,
+        )
+    finally:
+        if marker_descriptor is not None:
+            os.close(marker_descriptor)
+
+
 if os.name == "nt":
     import ctypes
     import msvcrt
@@ -2214,6 +2959,50 @@ if os.name == "nt":
             if root_handle is not None:
                 _close_windows_handle(root_handle)
 
+    def _validate_existing_secure_audit_directory(path: Path) -> None:
+        """Validate an existing directory without following any reparse point."""
+        root = Path(path.anchor)
+        parts = path.relative_to(root).parts
+        if not parts:
+            raise OSError("audit directory has no secure component")
+        descriptor = _open_windows_root(str(root))
+        try:
+            _validate_windows_handle(descriptor, directory=True)
+            with _windows_audit_security() as (_, owner_sid):
+                for index, part in enumerate(parts):
+                    _validate_windows_component(part)
+                    final = index == len(parts) - 1
+                    next_descriptor = _nt_open_relative(
+                        descriptor,
+                        part,
+                        desired_access=(
+                            _FILE_READ_ATTRIBUTES
+                            | (_READ_CONTROL if final else 0)
+                        ),
+                        disposition=_FILE_OPEN,
+                        attributes=_FILE_ATTRIBUTE_DIRECTORY,
+                        options=(
+                            _FILE_DIRECTORY_FILE | _FILE_OPEN_REPARSE_POINT
+                        ),
+                    )
+                    try:
+                        _validate_windows_handle(
+                            next_descriptor,
+                            directory=True,
+                        )
+                        if final:
+                            _verify_windows_owner_only_dacl(
+                                next_descriptor,
+                                owner_sid,
+                            )
+                    except Exception:
+                        _close_windows_handle(next_descriptor)
+                        raise
+                    _close_windows_handle(descriptor)
+                    descriptor = next_descriptor
+        finally:
+            _close_windows_handle(descriptor)
+
     def _nt_open_relative(
         parent: int,
         name: str,
@@ -2556,6 +3345,63 @@ else:
         finally:
             os.close(parent_descriptor)
 
+    def _open_existing_posix_audit_directory(path: Path) -> int:
+        no_follow = getattr(os, "O_NOFOLLOW", None)
+        directory = getattr(os, "O_DIRECTORY", None)
+        if no_follow is None or directory is None:
+            raise OSError("descriptor-relative no-follow opens are unavailable")
+        root = Path(path.anchor)
+        parts = path.relative_to(root).parts
+        flags = (
+            os.O_RDONLY
+            | directory
+            | no_follow
+            | getattr(os, "O_CLOEXEC", 0)
+        )
+        descriptor = os.open(root, flags)
+        try:
+            for part in parts:
+                if part in {"", ".", ".."} or "/" in part or "\\" in part:
+                    raise OSError("audit directory has an invalid component")
+                next_descriptor = os.open(
+                    part,
+                    flags,
+                    dir_fd=descriptor,
+                )
+                os.close(descriptor)
+                descriptor = next_descriptor
+            return descriptor
+        except Exception:
+            os.close(descriptor)
+            raise
+
+    def _open_posix_r4_audit(path: Path) -> int:
+        """Open released evidence read-only without repairing its permissions."""
+        no_follow = getattr(os, "O_NOFOLLOW", None)
+        if no_follow is None or path.name in {"", ".", ".."}:
+            raise OSError("legacy audit path has no file component")
+        parent_descriptor = _open_existing_posix_audit_directory(path.parent)
+        try:
+            descriptor = os.open(
+                path.name,
+                os.O_RDONLY | no_follow | getattr(os, "O_CLOEXEC", 0),
+                dir_fd=parent_descriptor,
+            )
+        finally:
+            os.close(parent_descriptor)
+        try:
+            information = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(information.st_mode)
+                or information.st_uid != os.geteuid()
+                or information.st_mode & 0o077
+            ):
+                raise OSError("legacy audit evidence is not owner-only")
+            return descriptor
+        except Exception:
+            os.close(descriptor)
+            raise
+
     def _open_windows_audit(
         path: Path,
         *,
@@ -2592,6 +3438,22 @@ else:
             information = os.fstat(descriptor)
             if information.st_uid != os.geteuid() or information.st_mode & 0o077:
                 raise OSError("audit index root is not owner-only")
+        finally:
+            os.close(descriptor)
+
+    def _validate_existing_secure_audit_directory(path: Path) -> None:
+        descriptor = _open_existing_posix_audit_directory(path)
+        try:
+            information = os.fstat(descriptor)
+            if information.st_uid != os.geteuid() or information.st_mode & 0o077:
+                raise OSError("audit directory is not owner-only")
+        finally:
+            os.close(descriptor)
+
+    def _sync_posix_audit_directory(path: Path) -> None:
+        descriptor = _open_existing_posix_audit_directory(path)
+        try:
+            os.fsync(descriptor)
         finally:
             os.close(descriptor)
 
