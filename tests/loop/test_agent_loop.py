@@ -17,6 +17,7 @@ from conftest import (
     successful_report,
 )
 
+from pyquality.context import ContextBuilder
 from pyquality.domain.models import ApprovalDecision, TaskStatus, ToolResult
 from pyquality.feedback import FeedbackPacket
 from pyquality.llm import Message, OpenAICompatibleLLM, ScriptedLLM
@@ -131,6 +132,24 @@ def test_green_candidate_survives_crash_and_resume_consumes_finish(loop_fixture)
     assert result.status is TaskStatus.SUCCEEDED
     assert "quality is green" in resumed.calls[0][-1].content.casefold()
     assert harness.repository.green_candidate(harness.task_id) is None
+
+
+def test_green_context_is_byte_truncated_and_never_contains_absolute_path(
+    loop_fixture,
+) -> None:
+    """Long candidate paths must stay bounded and may never expose the host repository path."""
+    long_relative = "src/" + "nested/" * 80 + "calc.py"
+    report = successful_report().model_copy(update={"changed_paths": (long_relative,)})
+    client = ScriptedLLM([quality_json(), finish_json()])
+    harness = loop_fixture(llm=client, reports=[report, successful_report()])
+    harness.loop._context_builder = ContextBuilder(source_bytes=64, total_bytes=360)
+
+    assert harness.loop.run(harness.task_id).status is TaskStatus.SUCCEEDED
+
+    green_prompt = client.calls[1][-1].content
+    assert len(green_prompt.encode("utf-8")) <= 360
+    assert "[context truncated]" in green_prompt
+    assert str(harness.repo_root) not in green_prompt
 
 
 def test_green_and_finish_audit_events_are_bounded_and_path_free(loop_fixture) -> None:
