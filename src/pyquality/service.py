@@ -20,6 +20,7 @@ from .storage.sqlite import (
     ProjectReservationError,
     SQLiteTaskRepository,
     StorageStateError,
+    TaskCreationConflictError,
     TaskRecord,
 )
 
@@ -125,19 +126,25 @@ class HarnessService:
     def create_task(self, repo_path: Path | str, request: str) -> TaskView:
         root = self._preflight(Path(repo_path), request)
         canonical = str(root)
+        task_id = uuid4().hex
         if not self._capacity.acquire(blocking=False):
             raise PreflightError("global execution capacity is exhausted")
         record: TaskRecord | None = None
         placeholder: Future[TaskResult] = Future()
         reservation_conflict = False
+        creation_conflict = False
         try:
+            self._reconcile_stale_repository_mapping(canonical)
             with self._lock:
                 if canonical in self._active_repositories:
                     raise ProjectBusyError(
                         "repository is busy: it already has active work"
                     )
                 record = self._repository.create_task_with_project_reservation(
-                    canonical, request, self._settings.round_limit
+                    canonical,
+                    request,
+                    self._settings.round_limit,
+                    task_id=task_id,
                 )
                 self._active_repositories[canonical] = record.id
                 self._task_repositories[record.id] = canonical
@@ -150,18 +157,28 @@ class HarnessService:
                 rollback_new_task=False,
             )
             reservation_conflict = True
+        except TaskCreationConflictError:
+            self._compensate_setup_failure(
+                None,
+                None,
+                None,
+                rollback_new_task=False,
+            )
+            creation_conflict = True
         except Exception:
             self._compensate_setup_failure(
-                record.id if record is not None else None,
+                task_id,
                 None,
-                placeholder if record is not None else None,
-                rollback_new_task=record is not None,
+                placeholder,
+                rollback_new_task=True,
             )
             raise
         if reservation_conflict:
             raise ProjectBusyError(
                 "repository is busy: it already has active work"
             )
+        if creation_conflict:
+            raise PreflightError("task creation is unavailable")
         assert record is not None
         self._prepare_submission(
             record.id,
@@ -249,14 +266,14 @@ class HarnessService:
         return self.start_task(task_id, resume=True)
 
     def cancel_task(self, task_id: str) -> None:
-        missing = False
+        storage_failed = False
         try:
             cancelled = self._repository.cancel_created_task(task_id)
         except StorageStateError:
-            missing = True
+            storage_failed = True
             cancelled = False
-        if missing:
-            raise PreflightError("task does not exist")
+        if storage_failed:
+            raise PreflightError("task cancellation is unavailable")
         if not cancelled:
             raise PreflightError("running task cannot be cancelled")
         with self._lock:
@@ -306,6 +323,28 @@ class HarnessService:
             if not status.present:
                 raise PreflightError("provider credential is not configured")
         return root
+
+    def _reconcile_stale_repository_mapping(self, canonical: str) -> None:
+        with self._lock:
+            mapped_task = self._active_repositories.get(canonical)
+        if mapped_task is None:
+            return
+        try:
+            durable_status = self._repository.resume_snapshot(mapped_task).task.status
+        except StorageStateError:
+            stale = True
+        except Exception:  # noqa: BLE001 - an unreadable mapping stays busy.
+            return
+        else:
+            stale = durable_status in _TERMINAL
+        if not stale:
+            return
+        with self._lock:
+            if self._active_repositories.get(canonical) != mapped_task:
+                return
+            self._active_repositories.pop(canonical, None)
+            if self._task_repositories.get(mapped_task) == canonical:
+                self._task_repositories.pop(mapped_task, None)
 
     def _snapshot(self, task_id: str):
         try:

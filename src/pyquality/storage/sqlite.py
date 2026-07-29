@@ -39,6 +39,10 @@ class ProjectReservationError(StorageStateError):
     """Raised when durable non-terminal work already reserves a project."""
 
 
+class TaskCreationConflictError(StorageStateError):
+    """Raised when a caller-owned creation identity names different work."""
+
+
 class LeaseRecoveryBlocked(StorageStateError):
     """Raised when durable lease evidence predates the safe lock protocol."""
 
@@ -210,6 +214,8 @@ class SQLiteTaskRepository:
         request: str,
         round_limit: int,
         deadline: datetime | None = None,
+        *,
+        task_id: str | None = None,
     ) -> TaskRecord:
         """Atomically create work only when the project has no non-terminal task."""
         return self._create_task(
@@ -218,6 +224,7 @@ class SQLiteTaskRepository:
             round_limit,
             deadline,
             reserve_project=True,
+            task_id=task_id,
         )
 
     def _create_task(
@@ -228,11 +235,40 @@ class SQLiteTaskRepository:
         deadline: datetime | None,
         *,
         reserve_project: bool,
+        task_id: str | None = None,
     ) -> TaskRecord:
         project_id = _new_id()
-        task_id = _new_id()
+        task_id = task_id if task_id is not None else _new_id()
         created_at = _utc_now()
         with self._transaction() as connection:
+            existing = connection.execute(
+                """SELECT tasks.*, projects.canonical_path,
+                          project_reservations.task_id AS reservation_task_id,
+                          project_reservations.migrated AS reservation_migrated
+                   FROM tasks
+                   JOIN projects ON projects.id = tasks.project_id
+                   LEFT JOIN project_reservations
+                     ON project_reservations.task_id = tasks.id
+                   WHERE tasks.id = ?""",
+                (task_id,),
+            ).fetchone()
+            if existing is not None:
+                exact_reserved_replay = (
+                    reserve_project
+                    and existing["canonical_path"] == canonical_path
+                    and existing["request"] == request
+                    and existing["round_limit"] == round_limit
+                    and existing["deadline"] == _dump_datetime(deadline)
+                    and existing["status"] == TaskStatus.CREATED.value
+                    and existing["result_json"] is None
+                    and existing["reservation_task_id"] == task_id
+                    and existing["reservation_migrated"] == 0
+                )
+                if exact_reserved_replay:
+                    return _task_from_row(existing)
+                raise TaskCreationConflictError(
+                    "task creation identity conflicts with stored work"
+                )
             row = connection.execute(
                 "SELECT id FROM projects WHERE canonical_path = ?", (canonical_path,)
             ).fetchone()
@@ -1140,31 +1176,37 @@ class SQLiteTaskRepository:
 
     def cancel_created_task(self, task_id: str) -> bool:
         """Atomically delete only an untouched task that is still CREATED."""
-        with self._transaction() as connection:
-            task = self._require_task(connection, task_id)
-            evidence = connection.execute(
-                """SELECT
-                     (SELECT COUNT(*) FROM iterations WHERE task_id = ?) AS iterations,
-                     (SELECT COUNT(*) FROM approvals WHERE task_id = ?) AS approvals,
-                     (SELECT COUNT(*) FROM project_leases WHERE task_id = ?) AS leases""",
-                (task_id, task_id, task_id),
-            ).fetchone()
-            if (
-                task["status"] != TaskStatus.CREATED.value
-                or evidence["iterations"]
-                or evidence["approvals"]
-                or evidence["leases"]
-            ):
-                return False
-            connection.execute(
-                "DELETE FROM project_reservations WHERE task_id = ?", (task_id,)
-            )
-            connection.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
-            connection.execute(
-                """DELETE FROM projects WHERE id = ?
-                   AND NOT EXISTS (SELECT 1 FROM tasks WHERE project_id = ?)""",
-                (task["project_id"], task["project_id"]),
-            )
+        sqlite_failed = False
+        try:
+            with self._transaction() as connection:
+                task = self._require_task(connection, task_id)
+                evidence = connection.execute(
+                    """SELECT
+                         (SELECT COUNT(*) FROM iterations WHERE task_id = ?) AS iterations,
+                         (SELECT COUNT(*) FROM approvals WHERE task_id = ?) AS approvals,
+                         (SELECT COUNT(*) FROM project_leases WHERE task_id = ?) AS leases""",
+                    (task_id, task_id, task_id),
+                ).fetchone()
+                if (
+                    task["status"] != TaskStatus.CREATED.value
+                    or evidence["iterations"]
+                    or evidence["approvals"]
+                    or evidence["leases"]
+                ):
+                    return False
+                connection.execute(
+                    "DELETE FROM project_reservations WHERE task_id = ?", (task_id,)
+                )
+                connection.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+                connection.execute(
+                    """DELETE FROM projects WHERE id = ?
+                       AND NOT EXISTS (SELECT 1 FROM tasks WHERE project_id = ?)""",
+                    (task["project_id"], task["project_id"]),
+                )
+        except sqlite3.Error:
+            sqlite_failed = True
+        if sqlite_failed:
+            raise StorageStateError("task cancellation is unavailable")
         return True
 
     def rollback_running_task(self, task_id: str, *, owner_token: str) -> bool:

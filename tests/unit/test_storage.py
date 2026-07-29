@@ -46,6 +46,68 @@ OWNER_A = "runner-a"
 OWNER_B = "runner-b"
 
 
+def test_creation_identity_replay_is_idempotent_for_exact_reserved_task(
+    repo: SQLiteTaskRepository,
+) -> None:
+    task_id = "caller-owned-creation-identity"
+
+    first = repo.create_task_with_project_reservation(
+        "C:/work/creation-replay",
+        "same request",
+        round_limit=8,
+        task_id=task_id,
+    )
+    replay = repo.create_task_with_project_reservation(
+        "C:/work/creation-replay",
+        "same request",
+        round_limit=8,
+        task_id=task_id,
+    )
+
+    assert first == replay
+    assert replay.id == task_id
+    with repo._connection_lock:
+        counts = repo._connection.execute(
+            """SELECT
+                 (SELECT COUNT(*) FROM tasks WHERE id = ?) AS tasks,
+                 (SELECT COUNT(*) FROM project_reservations
+                  WHERE task_id = ? AND migrated = 0) AS reservations""",
+            (task_id, task_id),
+        ).fetchone()
+    assert tuple(counts) == (1, 1)
+
+
+def test_creation_identity_conflict_preserves_original_reserved_task(
+    repo: SQLiteTaskRepository,
+) -> None:
+    task_id = "conflicting-creation-identity"
+    original = repo.create_task_with_project_reservation(
+        "C:/work/creation-conflict",
+        "original request",
+        round_limit=8,
+        task_id=task_id,
+    )
+
+    with pytest.raises(StorageStateError) as captured:
+        repo.create_task_with_project_reservation(
+            "C:/work/creation-conflict",
+            "sensitive conflicting request",
+            round_limit=8,
+            task_id=task_id,
+        )
+
+    assert str(captured.value) == "task creation identity conflicts with stored work"
+    assert captured.value.__cause__ is None
+    assert captured.value.__context__ is None
+    assert repo.resume_snapshot(task_id).task == original
+    with repo._connection_lock:
+        reservation = repo._connection.execute(
+            "SELECT task_id FROM project_reservations WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+    assert reservation["task_id"] == task_id
+
+
 def test_cancel_created_task_deletes_reserved_task_and_unused_project(
     repo: SQLiteTaskRepository,
 ) -> None:
@@ -215,6 +277,37 @@ def test_cancel_created_task_unknown_task_raises_sanitized_error(
 
     assert str(captured.value) == "task does not exist"
     assert unknown not in str(captured.value)
+
+
+def test_cancel_sqlite_error_is_normalized_without_sensitive_chain(
+    repo: SQLiteTaskRepository,
+) -> None:
+    task = repo.create_task_with_project_reservation(
+        "C:/work/cancel-sqlite-error", "keep after abort", round_limit=8
+    )
+    sensitive = "cancel-sqlite-sensitive-token"
+    with repo._connection_lock:
+        repo._connection.execute(
+            """CREATE TRIGGER abort_cancel_with_sensitive_message
+                BEFORE DELETE ON tasks
+                BEGIN SELECT RAISE(ABORT, 'cancel-sqlite-sensitive-token'); END"""
+        )
+
+    with pytest.raises(StorageStateError) as captured:
+        repo.cancel_created_task(task.id)
+
+    assert type(captured.value) is StorageStateError
+    assert str(captured.value) == "task cancellation is unavailable"
+    assert sensitive not in str(captured.value)
+    assert captured.value.__cause__ is None
+    assert captured.value.__context__ is None
+    assert repo.task_exists(task.id) is True
+    with repo._connection_lock:
+        reservation = repo._connection.execute(
+            "SELECT task_id FROM project_reservations WHERE task_id = ?",
+            (task.id,),
+        ).fetchone()
+    assert reservation["task_id"] == task.id
 
 
 def test_rollback_running_task_deletes_owned_task_lease_reservation_and_project(

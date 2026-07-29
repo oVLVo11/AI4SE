@@ -352,6 +352,95 @@ def test_create_submit_failure_completes_cleanup_when_lease_release_raises(
     service.close()
 
 
+def test_post_commit_create_failure_cancels_exact_caller_owned_task(
+    repository: SQLiteTaskRepository,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = tmp_path / "post-commit-create"
+    project.mkdir()
+    service = make_service(repository)
+    original_create = repository.create_task_with_project_reservation
+    committed_ids: list[str] = []
+
+    def commit_then_fail(*args, **kwargs):
+        record = original_create(*args, **kwargs)
+        committed_ids.append(record.id)
+        raise RuntimeError("primary post-commit failure")
+
+    monkeypatch.setattr(
+        repository, "create_task_with_project_reservation", commit_then_fail
+    )
+
+    with pytest.raises(RuntimeError, match="primary post-commit failure") as captured:
+        service.create_task(project, "first")
+
+    task_id = committed_ids[-1]
+    assert captured.value.__cause__ is None
+    assert captured.value.__context__ is None
+    assert repository.task_exists(task_id) is False
+    with repository._connection_lock:
+        counts = repository._connection.execute(
+            """SELECT
+                 (SELECT COUNT(*) FROM tasks) AS tasks,
+                 (SELECT COUNT(*) FROM project_reservations) AS reservations"""
+        ).fetchone()
+    assert tuple(counts) == (0, 0)
+    assert service._futures == {}
+    assert service._pending_owners == {}
+    assert service._task_repositories == {}
+    assert service._active_repositories == {}
+    assert service._capacity.acquire(blocking=False) is True
+    service._capacity.release()
+
+    monkeypatch.setattr(
+        repository, "create_task_with_project_reservation", original_create
+    )
+    replacement = service.create_task(project, "replacement")
+    assert service.start_task(replacement.id).result(timeout=2).status is TaskStatus.SUCCEEDED
+    service.close()
+
+
+def test_creation_identity_conflict_never_deletes_preexisting_task(
+    repository: SQLiteTaskRepository,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_project = tmp_path / "identity-owner"
+    new_project = tmp_path / "identity-collision"
+    original_project.mkdir()
+    new_project.mkdir()
+    task_id = "service-owned-identity-collision"
+    original = repository.create_task_with_project_reservation(
+        str(original_project.resolve()),
+        "original",
+        round_limit=8,
+        task_id=task_id,
+    )
+    service = make_service(repository)
+
+    class FixedIdentity:
+        hex = task_id
+
+    monkeypatch.setattr("pyquality.service.uuid4", lambda: FixedIdentity())
+
+    with pytest.raises(PreflightError, match="task creation is unavailable") as captured:
+        service.create_task(new_project, "different work")
+
+    assert captured.value.__cause__ is None
+    assert captured.value.__context__ is None
+    assert repository.resume_snapshot(task_id).task == original
+    with repository._connection_lock:
+        reservation = repository._connection.execute(
+            "SELECT task_id FROM project_reservations WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+    assert reservation["task_id"] == task_id
+    assert service._capacity.acquire(blocking=False) is True
+    service._capacity.release()
+    service.close()
+
+
 def test_incomplete_create_rollback_keeps_running_task_recoverable_and_frees_capacity(
     repository: SQLiteTaskRepository,
     tmp_path: Path,
@@ -629,7 +718,43 @@ def test_cancel_rejects_an_already_submitted_task(
     release.set()
 
 
-def test_cancel_race_loses_without_deleting_live_runner_state(
+def test_cancel_sqlite_error_becomes_sanitized_preflight_error(
+    repository: SQLiteTaskRepository,
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "cancel-sqlite-error"
+    project.mkdir()
+    task = repository.create_task_with_project_reservation(
+        str(project.resolve()), "keep after abort", round_limit=8
+    )
+    service = make_service(repository)
+    sensitive = "cancel-service-sensitive-token"
+    with repository._connection_lock:
+        repository._connection.execute(
+            """CREATE TRIGGER abort_service_cancel_with_sensitive_message
+                BEFORE DELETE ON tasks
+                BEGIN SELECT RAISE(ABORT, 'cancel-service-sensitive-token'); END"""
+        )
+
+    with pytest.raises(PreflightError) as captured:
+        service.cancel_task(task.id)
+
+    assert type(captured.value) is PreflightError
+    assert str(captured.value) == "task cancellation is unavailable"
+    assert sensitive not in str(captured.value)
+    assert captured.value.__cause__ is None
+    assert captured.value.__context__ is None
+    assert repository.task_exists(task.id) is True
+    with repository._connection_lock:
+        reservation = repository._connection.execute(
+            "SELECT task_id FROM project_reservations WHERE task_id = ?",
+            (task.id,),
+        ).fetchone()
+    assert reservation["task_id"] == task.id
+    service.close()
+
+
+def test_cancel_race_loses_then_reconciles_stale_registry_after_winner_finishes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     db_path = tmp_path / "state.sqlite"
@@ -732,11 +857,91 @@ def test_cancel_race_loses_without_deleting_live_runner_state(
                 ).fetchone()
             assert reservation["task_id"] == task.id
 
+            with pytest.raises(ProjectBusyError, match="active work"):
+                cancellation_service.create_task(project, "too early")
+
         release_worker.set()
         assert runner_future.result(timeout=2).status is TaskStatus.SUCCEEDED
+        with cancellation_repository._connection_lock:
+            reservation = cancellation_repository._connection.execute(
+                "SELECT task_id FROM project_reservations WHERE project_id = ?",
+                (task.project_id,),
+            ).fetchone()
+        assert reservation is None
+
+        replacement = cancellation_service.create_task(project, "replacement")
+        assert (
+            cancellation_service.start_task(replacement.id)
+            .result(timeout=2)
+            .status
+            is TaskStatus.SUCCEEDED
+        )
     finally:
         allow_cancellation.set()
         release_worker.set()
+        runner_service.close()
+        cancellation_service.close()
+        runner_repository.close()
+        cancellation_repository.close()
+
+
+def test_stale_cancel_registry_keeps_waiting_winner_busy(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "state.sqlite"
+    project = tmp_path / "waiting-winner"
+    project.mkdir()
+    cancellation_repository = SQLiteTaskRepository(db_path)
+    runner_repository = SQLiteTaskRepository(db_path)
+    task = cancellation_repository.create_task_with_project_reservation(
+        str(project.resolve()), "wait for approval", round_limit=8
+    )
+
+    class WaitingLoop(StubLoop):
+        def run(self, task_id: str) -> TaskResult:
+            return TaskResult(
+                task_id=task_id,
+                status=TaskStatus.WAITING_APPROVAL,
+                iterations=1,
+                verification_summary="Waiting for approval.",
+            )
+
+    cancellation_service = make_service(cancellation_repository)
+    runner_service = HarnessService(
+        repository=runner_repository,
+        loop=WaitingLoop(runner_repository),
+        settings=Settings(global_concurrency=1),
+        verifier_finder=lambda name: name,
+    )
+    canonical = str(project.resolve())
+    with cancellation_service._lock:
+        cancellation_service._task_repositories[task.id] = canonical
+        cancellation_service._active_repositories[canonical] = task.id
+
+    try:
+        assert (
+            runner_service.start_task(task.id).result(timeout=2).status
+            is TaskStatus.WAITING_APPROVAL
+        )
+
+        with pytest.raises(PreflightError, match="running"):
+            cancellation_service.cancel_task(task.id)
+        with pytest.raises(ProjectBusyError, match="active work"):
+            cancellation_service.create_task(project, "must stay busy")
+
+        assert (
+            cancellation_repository.resume_snapshot(task.id).task.status
+            is TaskStatus.WAITING_APPROVAL
+        )
+        assert cancellation_service._task_repositories[task.id] == canonical
+        assert cancellation_service._active_repositories[canonical] == task.id
+        with cancellation_repository._connection_lock:
+            reservation = cancellation_repository._connection.execute(
+                "SELECT task_id FROM project_reservations WHERE project_id = ?",
+                (task.project_id,),
+            ).fetchone()
+        assert reservation["task_id"] == task.id
+    finally:
         runner_service.close()
         cancellation_service.close()
         runner_repository.close()
