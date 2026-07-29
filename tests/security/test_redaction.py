@@ -87,6 +87,19 @@ def _emit_with_signals(path: str, environment_root: str, started: object, finish
         finished.set()  # type: ignore[attr-defined]
 
 
+def _replay_alias_once(
+    path: str,
+    event_id: str,
+    environment_root: str,
+    index_root: str | None = None,
+) -> None:
+    _set_process_environment(environment_root)
+    options = {} if index_root is None else {"index_root": Path(index_root)}
+    AuditLogger(Path(path), **options).emit(
+        AuditEvent(event_id=event_id, event_type="transition")
+    )
+
+
 def test_redacts_nested_headers_urls_and_exception_text(tmp_path: Path) -> None:
     """Catches a recursive branch that preserves a credential in nested request data."""
     del tmp_path
@@ -531,6 +544,55 @@ def test_append_before_receipt_crash_replays_without_duplicate(
     assert [record["event_id"] for record in records] == [event.event_id]
 
 
+@pytest.mark.parametrize("written_bytes", [0, 1, 47])
+def test_torn_receipt_update_retains_prior_valid_slot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    written_bytes: int,
+) -> None:
+    """A failed zero/partial/nonempty replacement must not destroy the durable receipt."""
+    from pyquality import security
+
+    path = tmp_path / "audit.jsonl"
+    event = AuditEvent(event_id="6" * 64, event_type="transition")
+    logger = AuditLogger(path)
+    logger.emit(event)
+    encoded = path.read_bytes()
+    audit_descriptor = security._open_audit(path)
+    try:
+        index_root = security._audit_index_root(path, audit_descriptor)
+    finally:
+        os.close(audit_descriptor)
+    receipt_descriptor = security._open_audit(
+        security._audit_receipt_path(index_root, event.event_id),
+        append=False,
+    )
+    real_write_all = security._write_all
+
+    def torn_write(descriptor: int, payload: bytes) -> None:
+        if written_bytes:
+            os.write(descriptor, payload[:written_bytes])
+        raise OSError("simulated torn receipt write")
+
+    monkeypatch.setattr(security, "_write_all", torn_write)
+    try:
+        with pytest.raises(OSError, match="torn receipt"):
+            security._commit_audit_receipt(
+                receipt_descriptor,
+                event.event_id,
+                0,
+                encoded,
+            )
+    finally:
+        os.close(receipt_descriptor)
+        monkeypatch.setattr(security, "_write_all", real_write_all)
+
+    logger.emit(event)
+
+    records = [json.loads(line) for line in path.read_bytes().splitlines()]
+    assert [record["event_id"] for record in records] == [event.event_id]
+
+
 def test_failed_log_append_cannot_commit_index_before_visible_record(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -582,6 +644,73 @@ def test_audit_receipt_index_has_explicit_rotation_cap(
         events[0].event_id,
         events[1].event_id,
     ]
+
+
+def test_receipt_capacity_rejection_creates_no_rejected_id_sidecar(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Capacity must be reserved before opening a distinct receipt with create semantics."""
+    from pyquality import security
+
+    monkeypatch.setattr(security, "_MAX_AUDIT_RECEIPTS", 1)
+    path = tmp_path / "audit.jsonl"
+    accepted = AuditEvent(event_id="1" * 64, event_type="transition")
+    rejected = AuditEvent(event_id="2" * 64, event_type="transition")
+    logger = AuditLogger(path)
+    logger.emit(accepted)
+    descriptor = security._open_audit(path)
+    try:
+        index_root = security._audit_index_root(path, descriptor)
+    finally:
+        os.close(descriptor)
+
+    with pytest.raises(security.AuditRecoveryRequired):
+        logger.emit(rejected)
+
+    assert not security._audit_receipt_path(index_root, rejected.event_id).exists()
+    assert [
+        item.name
+        for item in (index_root / "receipts").rglob("*")
+        if item.is_file()
+    ] == [accepted.event_id]
+
+
+def test_concurrent_receipt_capacity_allows_one_id_without_orphan_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The audit-stream lock must serialize capacity reservation and receipt creation."""
+    from pyquality import security
+
+    monkeypatch.setattr(security, "_MAX_AUDIT_RECEIPTS", 1)
+    path = tmp_path / "audit.jsonl"
+    events = [
+        AuditEvent(event_id=character * 64, event_type="transition")
+        for character in ("3", "4")
+    ]
+
+    def emit(event: AuditEvent) -> str:
+        try:
+            AuditLogger(path).emit(event)
+        except security.AuditRecoveryRequired:
+            return "rejected"
+        return "accepted"
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        outcomes = list(executor.map(emit, events))
+
+    assert sorted(outcomes) == ["accepted", "rejected"]
+    descriptor = security._open_audit(path)
+    try:
+        index_root = security._audit_index_root(path, descriptor)
+    finally:
+        os.close(descriptor)
+    receipt_files = [
+        item
+        for item in (index_root / "receipts").rglob("*")
+        if item.is_file()
+    ]
+    assert len(receipt_files) == 1
+    assert len(path.read_bytes().splitlines()) == 1
 
 
 def test_corrupt_latest_checkpoint_recovers_from_prior_slot_without_rescan(
@@ -792,6 +921,135 @@ def test_audit_multi_process_hardlink_aliases_share_one_complete_record_stream(t
         assert process.exitcode == 0
     records = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
     assert {record["metadata"]["intent_id"] for record in records} == {f"alias-{index}" for index in range(60)}
+
+
+def test_default_index_replays_large_stream_through_cross_process_hardlink_alias(
+    tmp_path: Path,
+) -> None:
+    """Default sidecar identity must not depend on the audit file's lexical parent."""
+    from pyquality import security
+
+    left = tmp_path / "left"
+    right = tmp_path / "right"
+    left.mkdir()
+    right.mkdir()
+    path = left / "audit.jsonl"
+    logger = AuditLogger(path)
+    events = [
+        AuditEvent(
+            event_id=f"{index:064x}",
+            event_type="transition",
+            metadata={"status": "x" * 4_096},
+        )
+        for index in range(72)
+    ]
+    for event in events:
+        logger.emit(event)
+    assert path.stat().st_size > security._MAX_INDEX_REBUILD_BYTES
+    before = path.read_bytes()
+    alias = right / "audit-alias.jsonl"
+    try:
+        os.link(path, alias)
+    except OSError as error:
+        pytest.skip(f"hardlink creation unavailable: {error.__class__.__name__}")
+
+    context = multiprocessing.get_context("spawn")
+    process = context.Process(
+        target=_replay_alias_once,
+        args=(
+            str(alias),
+            events[-1].event_id,
+            str(tmp_path / "different-environment"),
+        ),
+    )
+    process.start()
+    process.join(20)
+
+    assert process.exitcode == 0
+    assert path.read_bytes() == before
+
+
+def test_configured_index_root_is_shared_by_hardlink_alias_processes(
+    tmp_path: Path,
+) -> None:
+    """A configured secure global root must key receipts by the opened stream identity."""
+    left = tmp_path / "configured-left"
+    right = tmp_path / "configured-right"
+    left.mkdir()
+    right.mkdir()
+    path = left / "audit.jsonl"
+    index_root = tmp_path / "shared-index"
+    logger = AuditLogger(path, index_root=index_root)
+    events = [
+        AuditEvent(
+            event_id=f"{index + 100:064x}",
+            event_type="transition",
+            metadata={"status": "y" * 4_096},
+        )
+        for index in range(72)
+    ]
+    for event in events:
+        logger.emit(event)
+    before = path.read_bytes()
+    alias = right / "audit-alias.jsonl"
+    try:
+        os.link(path, alias)
+    except OSError as error:
+        pytest.skip(f"hardlink creation unavailable: {error.__class__.__name__}")
+
+    context = multiprocessing.get_context("spawn")
+    process = context.Process(
+        target=_replay_alias_once,
+        args=(
+            str(alias),
+            events[-1].event_id,
+            str(tmp_path / "configured-environment"),
+            str(index_root),
+        ),
+    )
+    process.start()
+    process.join(20)
+
+    assert process.exitcode == 0
+    assert path.read_bytes() == before
+
+
+def test_configured_index_namespace_rejects_directory_link(
+    tmp_path: Path,
+) -> None:
+    """The shared namespace and identity leaf must be reached without following links."""
+    outside = tmp_path / "outside-index"
+    outside.mkdir()
+    linked_root = tmp_path / "linked-index"
+    try:
+        linked_root.symlink_to(outside, target_is_directory=True)
+    except OSError as error:
+        pytest.skip(f"directory link creation unavailable: {error.__class__.__name__}")
+    audit = tmp_path / "audit.jsonl"
+
+    with pytest.raises(AuditWriteError):
+        AuditLogger(audit, index_root=linked_root).emit(
+            AuditEvent(event_id="5" * 64, event_type="transition")
+        )
+
+    assert tuple(outside.iterdir()) == ()
+    assert audit.read_bytes() == b""
+
+
+def test_configured_index_uses_distinct_opened_file_identities(
+    tmp_path: Path,
+) -> None:
+    """Equal event IDs in distinct streams must not share a lexical receipt namespace."""
+    index_base = tmp_path / "identity-index"
+    event = AuditEvent(event_id="a" * 64, event_type="transition")
+    first = tmp_path / "first" / "audit.jsonl"
+    second = tmp_path / "second" / "audit.jsonl"
+
+    AuditLogger(first, index_root=index_base).emit(event)
+    AuditLogger(second, index_root=index_base).emit(event)
+
+    assert first.read_bytes() == second.read_bytes()
+    assert len([item for item in index_base.iterdir() if item.is_dir()]) == 2
 
 
 def test_audit_file_lock_excludes_live_hardlink_alias_writer_with_different_environment_root(

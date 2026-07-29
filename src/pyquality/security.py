@@ -16,6 +16,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
+from threading import RLock
 from typing import Literal
 from urllib.parse import quote, urlsplit, urlunsplit
 
@@ -40,6 +41,20 @@ _MAX_RECEIPT_BYTES = 512
 _MAX_AUDIT_RECEIPTS = 16_384
 _CHECKPOINT_MAGIC = b"PQAIDX1\0"
 _CHECKPOINT_SLOT = struct.Struct(">8sQQQ32s")
+_RECEIPT_MAGIC = b"PQARCP2\0"
+_RECEIPT_SLOT_OFFSET = 256
+_RECEIPT_SLOT = struct.Struct(">8sQQI32s32s32s")
+_DEFAULT_STATE_HOME = (
+    Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
+    if os.name == "nt"
+    else Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state"))
+)
+_DEFAULT_AUDIT_INDEX_BASE = Path(
+    os.environ.get(
+        "PYQUALITY_AUDIT_INDEX_ROOT",
+        _DEFAULT_STATE_HOME / "pyquality" / "audit-index",
+    )
+)
 _SENSITIVE_KEY_PARTS = frozenset(
     {"authorization", "api_key", "apikey", "token", "secret", "password", "credential"}
 )
@@ -98,6 +113,40 @@ class CredentialStatus(PublicModel):
     warning: CredentialWarning | None = None
 
 
+class KnownSecretRegistry(AbstractSet[str]):
+    """Process-local secrets known to every live redaction boundary."""
+
+    def __init__(self, secrets: Iterable[str] = ()) -> None:
+        self._lock = RLock()
+        self._values: set[str] = set()
+        for secret in secrets:
+            self.register(secret)
+
+    def register(self, secret: str) -> None:
+        if not isinstance(secret, str) or not secret:
+            raise ValueError("known secret must be non-empty text")
+        with self._lock:
+            self._values.add(secret)
+
+    def snapshot(self) -> set[str]:
+        with self._lock:
+            return set(self._values)
+
+    def __contains__(self, value: object) -> bool:
+        with self._lock:
+            return value in self._values
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(tuple(sorted(self.snapshot())))
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._values)
+
+    def __repr__(self) -> str:
+        return f"KnownSecretRegistry(count={len(self)})"
+
+
 @dataclass(frozen=True, repr=False)
 class CredentialUse[T]:
     value: T
@@ -108,11 +157,18 @@ class CredentialUse[T]:
 
 
 class CredentialService:
-    def __init__(self, backend: object, *, service_name: str) -> None:
+    def __init__(
+        self,
+        backend: object,
+        *,
+        service_name: str,
+        secret_registry: KnownSecretRegistry | None = None,
+    ) -> None:
         if not isinstance(service_name, str) or not service_name:
             raise ValueError("service_name must be non-empty text")
         self._backend = backend
         self._service_name = service_name
+        self._secret_registry = secret_registry
 
     def set(self, account: str, secret: str) -> None:
         self._valid_account(account)
@@ -166,6 +222,8 @@ class CredentialService:
             raise CredentialBackendError("credential backend read failed")
         if not isinstance(secret, str) or not secret:
             raise CredentialNotFoundError("credential is not available from the selected source")
+        if self._secret_registry is not None:
+            self._secret_registry.register(secret)
         provider_failed = False
         value: object = None
         try:
@@ -631,17 +689,35 @@ def _json_size(value: object) -> int:
 
 
 class AuditLogger:
-    def __init__(self, path: Path, *, secrets: set[str] | None = None) -> None:
+    def __init__(
+        self,
+        path: Path,
+        *,
+        secrets: set[str] | None = None,
+        secret_registry: KnownSecretRegistry | None = None,
+        index_root: Path | None = None,
+    ) -> None:
         failed = False
         audit_path: Path | None = None
+        audit_index_base: Path | None = None
         try:
             audit_path = Path(path)
+            audit_index_base = (
+                _DEFAULT_AUDIT_INDEX_BASE
+                if index_root is None
+                else Path(index_root)
+            )
         except OSError:
             failed = True
-        if failed or audit_path is None:
+        if failed or audit_path is None or audit_index_base is None:
             raise AuditWriteError("audit path is invalid")
         self._path = audit_path
-        self._secrets = set(secrets or ())
+        self._index_base = audit_index_base
+        self._secrets = (
+            secret_registry if secret_registry is not None else KnownSecretRegistry()
+        )
+        for secret in secrets or ():
+            self._secrets.register(secret)
 
     def emit(self, event: AuditEvent) -> None:
         failed = False
@@ -662,7 +738,7 @@ class AuditLogger:
 
     def prepare(self, event: AuditEvent) -> AuditEvent:
         """Return the exact bounded, allowlisted event safe for durable queuing."""
-        return sanitize_audit_event(event, self._secrets)
+        return sanitize_audit_event(event, self._secrets.snapshot())
 
     def _encode(self, event: AuditEvent) -> bytes:
         record = self._record(event)
@@ -675,13 +751,14 @@ class AuditLogger:
         return encoded + b"\n"
 
     def _record(self, event: AuditEvent) -> dict[str, object]:
-        metadata, duration, outcome = _approved_metadata(event.metadata, self._secrets)
+        secrets = self._secrets.snapshot()
+        metadata, duration, outcome = _approved_metadata(event.metadata, secrets)
         return {
             "event_id": event.event_id,
-            "task_id": _audit_scalar(event.task_id, self._secrets, 1_024),
-            "iteration": _audit_scalar(event.iteration_id, self._secrets, 1_024),
-            "component": _audit_scalar(event.component, self._secrets, 1_024),
-            "event_type": _audit_scalar(event.event_type, self._secrets, 1_024),
+            "task_id": _audit_scalar(event.task_id, secrets, 1_024),
+            "iteration": _audit_scalar(event.iteration_id, secrets, 1_024),
+            "component": _audit_scalar(event.component, secrets, 1_024),
+            "event_type": _audit_scalar(event.event_type, secrets, 1_024),
             "duration": duration,
             "outcome": outcome,
             "metadata": metadata,
@@ -692,7 +769,12 @@ class AuditLogger:
         try:
             with _audit_file_lock(descriptor):
                 _recover_tail(descriptor)
-                index_root = _audit_index_root(self._path, descriptor)
+                index_root = _audit_index_root(
+                    self._path,
+                    descriptor,
+                    self._index_base,
+                )
+                _ensure_secure_audit_index_root(self._index_base, index_root)
                 checkpoint_path = index_root / "checkpoint"
                 checkpoint_descriptor = _open_audit(checkpoint_path, append=False)
                 try:
@@ -701,9 +783,15 @@ class AuditLogger:
                         checkpoint_descriptor,
                         index_root,
                     )
-                    receipt_descriptor = _open_audit(
-                        _audit_receipt_path(index_root, event_id)
+                    receipt_path = _audit_receipt_path(index_root, event_id)
+                    receipt_descriptor = _open_existing_audit(
+                        receipt_path,
+                        append=False,
                     )
+                    if receipt_descriptor is None:
+                        if checkpoint[2] >= _MAX_AUDIT_RECEIPTS:
+                            raise AuditRecoveryRequired
+                        receipt_descriptor = _open_audit(receipt_path, append=False)
                     try:
                         receipt = _load_audit_receipt(receipt_descriptor)
                         if receipt is not None:
@@ -795,14 +883,33 @@ def _is_absolute_path_text(value: str) -> bool:
     )
 
 
-def _open_audit(path: Path, *, append: bool = True) -> int:
+def _open_audit(
+    path: Path,
+    *,
+    append: bool = True,
+    create: bool = True,
+) -> int:
     absolute = path.absolute()
     if os.name == "nt":
-        return _open_windows_audit(absolute, append=append)
-    return _open_posix_audit(absolute, append=append)
+        return _open_windows_audit(absolute, append=append, create=create)
+    return _open_posix_audit(absolute, append=append, create=create)
 
 
-def _open_posix_audit(path: Path, *, append: bool = True) -> int:
+def _open_existing_audit(path: Path, *, append: bool = True) -> int | None:
+    try:
+        return _open_audit(path, append=append, create=False)
+    except OSError as error:
+        if error.errno not in {2, 3}:
+            raise
+    return None
+
+
+def _open_posix_audit(
+    path: Path,
+    *,
+    append: bool = True,
+    create: bool = True,
+) -> int:
     no_follow = getattr(os, "O_NOFOLLOW", None)
     directory = getattr(os, "O_DIRECTORY", None)
     if no_follow is None or directory is None:
@@ -817,15 +924,21 @@ def _open_posix_audit(path: Path, *, append: bool = True) -> int:
         for index, part in enumerate(parts[:-1]):
             if part in {"", ".", ".."} or "/" in part or "\\" in part:
                 raise OSError("audit path contains an invalid component")
-            next_descriptor, created = _open_or_create_posix_directory(
-                parent_descriptor, part, directory_flags
-            )
+            if create:
+                next_descriptor, created = _open_or_create_posix_directory(
+                    parent_descriptor, part, directory_flags
+                )
+            else:
+                next_descriptor = os.open(part, directory_flags, dir_fd=parent_descriptor)
+                created = False
             os.close(parent_descriptor)
             parent_descriptor = next_descriptor
             if created:
                 os.fchmod(parent_descriptor, 0o700)
 
-        flags = os.O_CREAT | os.O_RDWR | no_follow | getattr(os, "O_CLOEXEC", 0)
+        flags = os.O_RDWR | no_follow | getattr(os, "O_CLOEXEC", 0)
+        if create:
+            flags |= os.O_CREAT
         if append:
             flags |= os.O_APPEND
         descriptor = os.open(parts[-1], flags, 0o600, dir_fd=parent_descriptor)
@@ -907,9 +1020,27 @@ def _recover_tail(descriptor: int) -> None:
     raise AuditRecoveryRequired
 
 
-def _audit_index_root(path: Path, descriptor: int) -> Path:
+def _audit_index_root(
+    path: Path,
+    descriptor: int,
+    index_base: Path | None = None,
+) -> Path:
+    del path
     identity = _audit_stream_identity(descriptor)
-    return path.absolute().parent / f".pyquality-audit-index-{identity}"
+    base = _DEFAULT_AUDIT_INDEX_BASE if index_base is None else index_base
+    return base.absolute() / identity
+
+
+def _ensure_secure_audit_index_root(base: Path, index_root: Path) -> None:
+    """Create and validate the shared base and identity leaf without following links."""
+    absolute_base = base.absolute()
+    absolute_index = index_root.absolute()
+    try:
+        absolute_index.relative_to(absolute_base)
+    except ValueError as error:
+        raise OSError("audit index identity escaped its configured root") from error
+    _ensure_audit_index_namespace(absolute_base)
+    _ensure_secure_audit_directory(absolute_index)
 
 
 def _audit_receipt_path(index_root: Path, event_id: str) -> Path:
@@ -925,13 +1056,6 @@ def _read_at(descriptor: int, offset: int, length: int) -> bytes:
             break
         output.extend(chunk)
     return bytes(output)
-
-
-def _replace_descriptor(descriptor: int, payload: bytes) -> None:
-    os.ftruncate(descriptor, 0)
-    os.lseek(descriptor, 0, os.SEEK_SET)
-    _write_all(descriptor, payload)
-    os.fsync(descriptor)
 
 
 def _checkpoint_digest(
@@ -985,17 +1109,26 @@ def _store_audit_checkpoint(
     return generation, indexed_size, receipt_count
 
 
-def _load_audit_receipt(descriptor: int) -> dict[str, object] | None:
-    size = os.lseek(descriptor, 0, os.SEEK_END)
-    if size == 0:
+def _receipt_checksum(
+    generation: int,
+    offset: int,
+    length: int,
+    event_id: bytes,
+    digest: bytes,
+) -> bytes:
+    return hashlib.sha256(
+        struct.pack(">QQI", generation, offset, length) + event_id + digest
+    ).digest()
+
+
+def _valid_legacy_receipt(encoded: bytes) -> dict[str, object] | None:
+    line, separator, tail = encoded.partition(b"\n")
+    if not separator or any(tail):
         return None
-    if size > _MAX_RECEIPT_BYTES:
-        raise OSError("audit receipt exceeds bound")
-    encoded = _read_at(descriptor, 0, size)
     try:
-        receipt = json.loads(encoded)
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise OSError("audit receipt is malformed") from error
+        receipt = json.loads(line)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
     if (
         not isinstance(receipt, dict)
         or receipt.get("version") != 1
@@ -1006,23 +1139,62 @@ def _load_audit_receipt(descriptor: int) -> dict[str, object] | None:
         or not 1 <= receipt["length"] <= _MAX_RECORD_BYTES + 1
         or re.fullmatch(r"[0-9a-f]{64}", receipt.get("digest", "")) is None
     ):
-        raise OSError("audit receipt is invalid")
+        return None
     return receipt
 
 
-def _receipt_payload(event_id: str, offset: int, encoded: bytes) -> bytes:
-    return (
-        _stable_json(
-            {
-                "digest": hashlib.sha256(encoded).hexdigest(),
-                "event_id": event_id,
-                "length": len(encoded),
-                "offset": offset,
-                "version": 1,
-            }
-        ).encode("utf-8")
-        + b"\n"
+def _load_audit_receipt(
+    descriptor: int,
+    *,
+    allow_torn: bool = False,
+) -> dict[str, object] | None:
+    size = os.lseek(descriptor, 0, os.SEEK_END)
+    if size == 0:
+        return None
+    if size > _MAX_RECEIPT_BYTES:
+        raise OSError("audit receipt exceeds bound")
+    candidates: list[dict[str, object]] = []
+    for slot in range(2):
+        encoded = _read_at(
+            descriptor,
+            _RECEIPT_SLOT_OFFSET + slot * _RECEIPT_SLOT.size,
+            _RECEIPT_SLOT.size,
+        )
+        if len(encoded) != _RECEIPT_SLOT.size:
+            continue
+        magic, generation, offset, length, event_id, digest, checksum = (
+            _RECEIPT_SLOT.unpack(encoded)
+        )
+        if (
+            magic == _RECEIPT_MAGIC
+            and generation > 0
+            and 1 <= length <= _MAX_RECORD_BYTES + 1
+            and checksum
+            == _receipt_checksum(generation, offset, length, event_id, digest)
+        ):
+            candidates.append(
+                {
+                    "version": 2,
+                    "generation": generation,
+                    "event_id": event_id.hex(),
+                    "offset": offset,
+                    "length": length,
+                    "digest": digest.hex(),
+                }
+            )
+    if candidates:
+        return max(candidates, key=lambda receipt: int(receipt["generation"]))
+    legacy_region = _read_at(
+        descriptor,
+        0,
+        min(size, _RECEIPT_SLOT_OFFSET),
     )
+    legacy = _valid_legacy_receipt(legacy_region)
+    if legacy is not None:
+        return legacy
+    if allow_torn:
+        return None
+    raise OSError("audit receipt is malformed")
 
 
 def _commit_audit_receipt(
@@ -1032,7 +1204,37 @@ def _commit_audit_receipt(
     encoded: bytes,
 ) -> None:
     """Durably index only a JSONL record that was already fsynced."""
-    _replace_descriptor(descriptor, _receipt_payload(event_id, offset, encoded))
+    previous = _load_audit_receipt(descriptor, allow_torn=True)
+    previous_generation = (
+        previous.get("generation", 0) if previous is not None else 0
+    )
+    assert isinstance(previous_generation, int)
+    generation = previous_generation + 1
+    event_id_bytes = bytes.fromhex(event_id)
+    digest = hashlib.sha256(encoded).digest()
+    payload = _RECEIPT_SLOT.pack(
+        _RECEIPT_MAGIC,
+        generation,
+        offset,
+        len(encoded),
+        event_id_bytes,
+        digest,
+        _receipt_checksum(
+            generation,
+            offset,
+            len(encoded),
+            event_id_bytes,
+            digest,
+        ),
+    )
+    slot = (generation - 1) % 2
+    os.lseek(
+        descriptor,
+        _RECEIPT_SLOT_OFFSET + slot * _RECEIPT_SLOT.size,
+        os.SEEK_SET,
+    )
+    _write_all(descriptor, payload)
+    os.fsync(descriptor)
 
 
 def _verify_audit_receipt(
@@ -1086,13 +1288,20 @@ def _reconcile_audit_index(
     for encoded in suffix.splitlines(keepends=True):
         event_id = _event_id_from_record(encoded)
         if event_id is not None:
-            if receipt_count >= _MAX_AUDIT_RECEIPTS:
-                raise AuditRecoveryRequired
-            receipt_descriptor = _open_audit(
-                _audit_receipt_path(index_root, event_id)
+            receipt_path = _audit_receipt_path(index_root, event_id)
+            receipt_descriptor = _open_existing_audit(
+                receipt_path,
+                append=False,
             )
+            if receipt_descriptor is None:
+                if receipt_count >= _MAX_AUDIT_RECEIPTS:
+                    raise AuditRecoveryRequired
+                receipt_descriptor = _open_audit(receipt_path, append=False)
             try:
-                existing = _load_audit_receipt(receipt_descriptor)
+                existing = _load_audit_receipt(
+                    receipt_descriptor,
+                    allow_torn=True,
+                )
                 if existing is not None:
                     _verify_audit_receipt(audit_descriptor, existing, event_id)
                     if existing["offset"] != offset:
@@ -1426,7 +1635,12 @@ if os.name == "nt":
     _is_valid_sid.argtypes = [wintypes.LPVOID]
     _is_valid_sid.restype = wintypes.BOOL
 
-    def _open_windows_audit(path: Path, *, append: bool = True) -> int:
+    def _open_windows_audit(
+        path: Path,
+        *,
+        append: bool = True,
+        create: bool = True,
+    ) -> int:
         root_handle: int | None = None
         parent_handle: int | None = None
         final_handle: int | None = None
@@ -1442,7 +1656,20 @@ if os.name == "nt":
             root_handle = None
             for part in parts[:-1]:
                 _validate_windows_component(part)
-                next_handle, created = _open_or_create_windows_directory(parent_handle, part)
+                if create:
+                    next_handle, created = _open_or_create_windows_directory(
+                        parent_handle, part
+                    )
+                else:
+                    next_handle = _nt_open_relative(
+                        parent_handle,
+                        part,
+                        desired_access=_FILE_READ_ATTRIBUTES,
+                        disposition=_FILE_OPEN,
+                        attributes=_FILE_ATTRIBUTE_DIRECTORY,
+                        options=_FILE_DIRECTORY_FILE | _FILE_OPEN_REPARSE_POINT,
+                    )
+                    created = False
                 try:
                     _validate_windows_handle(next_handle, directory=True)
                     if created:
@@ -1458,8 +1685,12 @@ if os.name == "nt":
                     parent_handle,
                     parts[-1],
                     security_descriptor,
+                    create=create,
                 )
-                if open_result not in {_FILE_CREATED, _FILE_OPENED}:
+                allowed_results = (
+                    {_FILE_CREATED, _FILE_OPENED} if create else {_FILE_OPENED}
+                )
+                if open_result not in allowed_results:
                     raise OSError("native audit file returned an unexpected open result")
                 _validate_windows_handle(final_handle, directory=False)
                 _verify_windows_owner_only_dacl(final_handle, owner_sid)
@@ -1483,7 +1714,11 @@ if os.name == "nt":
                 _close_windows_handle(root_handle)
 
     def _open_exclusive_windows_audit_file(
-        parent: int, name: str, security_descriptor: wintypes.LPVOID
+        parent: int,
+        name: str,
+        security_descriptor: wintypes.LPVOID,
+        *,
+        create: bool,
     ) -> tuple[int, int]:
         deadline = time.monotonic() + _EXCLUSIVE_OPEN_TIMEOUT_SECONDS
         while True:
@@ -1494,7 +1729,7 @@ if os.name == "nt":
                     desired_access=(
                         _GENERIC_READ | _GENERIC_WRITE | _SYNCHRONIZE | _READ_CONTROL
                     ),
-                    disposition=_FILE_OPEN_IF,
+                    disposition=_FILE_OPEN_IF if create else _FILE_OPEN,
                     attributes=_FILE_ATTRIBUTE_NORMAL,
                     options=(
                         _FILE_NON_DIRECTORY_FILE
@@ -1568,6 +1803,86 @@ if os.name == "nt":
             ),
             False,
         )
+
+    def _ensure_audit_index_namespace(path: Path) -> None:
+        _ensure_secure_audit_directory(path)
+
+    def _ensure_secure_audit_directory(path: Path) -> None:
+        """Create or validate the final directory with the exact owner-only DACL."""
+        root_handle: int | None = None
+        parent_handle: int | None = None
+        final_handle: int | None = None
+        try:
+            root = Path(path.anchor)
+            parts = path.relative_to(root).parts
+            if not parts:
+                raise OSError("audit index root has no secure component")
+            root_handle = _open_windows_root(str(root))
+            _validate_windows_handle(root_handle, directory=True)
+            parent_handle = root_handle
+            root_handle = None
+            for part in parts[:-1]:
+                _validate_windows_component(part)
+                next_handle, _ = _open_or_create_windows_directory(
+                    parent_handle,
+                    part,
+                )
+                try:
+                    _validate_windows_handle(next_handle, directory=True)
+                except Exception:
+                    _close_windows_handle(next_handle)
+                    raise
+                _close_windows_handle(parent_handle)
+                parent_handle = next_handle
+            _validate_windows_component(parts[-1])
+            with _windows_audit_security() as (security_descriptor, owner_sid):
+                try:
+                    final_handle = _nt_open_relative(
+                        parent_handle,
+                        parts[-1],
+                        desired_access=_FILE_READ_ATTRIBUTES | _READ_CONTROL,
+                        disposition=_FILE_OPEN,
+                        attributes=_FILE_ATTRIBUTE_DIRECTORY,
+                        options=_FILE_DIRECTORY_FILE | _FILE_OPEN_REPARSE_POINT,
+                    )
+                except OSError as error:
+                    if error.errno not in {2, 3}:
+                        raise
+                    try:
+                        final_handle, information = _nt_open_relative_result(
+                            parent_handle,
+                            parts[-1],
+                            desired_access=_FILE_READ_ATTRIBUTES | _READ_CONTROL,
+                            disposition=_FILE_CREATE,
+                            attributes=_FILE_ATTRIBUTE_DIRECTORY,
+                            options=_FILE_DIRECTORY_FILE | _FILE_OPEN_REPARSE_POINT,
+                            security_descriptor=security_descriptor,
+                        )
+                    except OSError as create_error:
+                        if create_error.errno not in {80, 183}:
+                            raise
+                        final_handle = _nt_open_relative(
+                            parent_handle,
+                            parts[-1],
+                            desired_access=_FILE_READ_ATTRIBUTES | _READ_CONTROL,
+                            disposition=_FILE_OPEN,
+                            attributes=_FILE_ATTRIBUTE_DIRECTORY,
+                            options=_FILE_DIRECTORY_FILE | _FILE_OPEN_REPARSE_POINT,
+                        )
+                    else:
+                        if information != _FILE_CREATED:
+                            raise OSError(
+                                "audit index directory was not created exclusively"
+                            )
+                _validate_windows_handle(final_handle, directory=True)
+                _verify_windows_owner_only_dacl(final_handle, owner_sid)
+        finally:
+            if final_handle is not None:
+                _close_windows_handle(final_handle)
+            if parent_handle is not None:
+                _close_windows_handle(parent_handle)
+            if root_handle is not None:
+                _close_windows_handle(root_handle)
 
     def _nt_open_relative(
         parent: int,
@@ -1859,9 +2174,47 @@ else:
         information = os.fstat(descriptor)
         return f"{information.st_dev:x}-{information.st_ino:x}"
 
-    def _open_windows_audit(path: Path, *, append: bool = True) -> int:
-        del path, append
+    def _open_windows_audit(
+        path: Path,
+        *,
+        append: bool = True,
+        create: bool = True,
+    ) -> int:
+        del path, append, create
         raise OSError("Windows native audit opens are unavailable")
+
+    def _ensure_secure_audit_directory(path: Path) -> None:
+        no_follow = getattr(os, "O_NOFOLLOW", None)
+        directory = getattr(os, "O_DIRECTORY", None)
+        if no_follow is None or directory is None:
+            raise OSError("descriptor-relative no-follow opens are unavailable")
+        root = Path(path.anchor)
+        parts = path.relative_to(root).parts
+        if not parts:
+            raise OSError("audit index root has no secure component")
+        flags = os.O_RDONLY | directory | no_follow | getattr(os, "O_CLOEXEC", 0)
+        descriptor = os.open(root, flags)
+        try:
+            for part in parts:
+                if part in {"", ".", ".."} or "/" in part or "\\" in part:
+                    raise OSError("audit index path contains an invalid component")
+                next_descriptor, created = _open_or_create_posix_directory(
+                    descriptor,
+                    part,
+                    flags,
+                )
+                os.close(descriptor)
+                descriptor = next_descriptor
+                if created:
+                    os.fchmod(descriptor, 0o700)
+            information = os.fstat(descriptor)
+            if information.st_uid != os.geteuid() or information.st_mode & 0o077:
+                raise OSError("audit index root is not owner-only")
+        finally:
+            os.close(descriptor)
+
+    def _ensure_audit_index_namespace(path: Path) -> None:
+        _ensure_secure_audit_directory(path)
 
     def _lock_descriptor(descriptor: int) -> None:
         fcntl.flock(descriptor, fcntl.LOCK_EX)

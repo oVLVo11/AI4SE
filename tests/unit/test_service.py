@@ -1388,7 +1388,8 @@ def test_export_audit_reads_only_jsonl_and_never_sidecar_receipts(
 ) -> None:
     """Receipt/checkpoint implementation records are not public audit events."""
     audit = tmp_path / "audit.jsonl"
-    logger = AuditLogger(audit)
+    index_base = tmp_path / "audit-index"
+    logger = AuditLogger(audit, index_root=index_base)
     logger.emit(
         AuditEvent(
             event_id="9" * 64,
@@ -1398,7 +1399,8 @@ def test_export_audit_reads_only_jsonl_and_never_sidecar_receipts(
             metadata={"intent_id": "safe"},
         )
     )
-    assert len(tuple(tmp_path.glob(".pyquality-audit-index-*"))) == 1
+    assert index_base.is_dir()
+    assert any(item.is_file() for item in index_base.rglob("*"))
     service = make_service(repository, audit_path=audit)
 
     events = service.export_audit()

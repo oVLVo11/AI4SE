@@ -29,3 +29,15 @@ replay remains exactly once across sink/repository acknowledgement crashes. Fina
 verification: 507 passed, 8 skipped in 42.90 seconds; full Ruff and diff-check clean.
 Required commit subject: `fix: sanitize outbox and bound audit replay`; the frozen
 cumulative package is generated from `b8f2fe2` after that commit.
+
+Formal review round 5: production now shares a live thread-safe known-secret registry
+from lazy keyring retrieval through audit preparation and public export. Startup
+quarantines released R3 raw outbox rows without decoding them, physically purges SQLite
+and WAL bytes, and versions every new sanitized row. Audit receipts use redundant
+checksummed slots, capacity is reserved before create semantics, and the persistent
+owner-only/no-follow index root is keyed solely by opened file identity, so large-stream
+replay converges across hardlink aliases and processes. Final verification: 526 collected,
+517 passed, 9 explicit platform-capability skips in 40.8 seconds; full Ruff and diff-check
+clean. Required commit subject: `fix: harden audit migration and sidecar identity`.
+Five untracked pytest roots retain expired sandbox TokenOwner DACLs after exact-path
+cleanup attempts; they are environment residue and are not staged or packaged.

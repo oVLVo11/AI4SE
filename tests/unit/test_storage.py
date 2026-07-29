@@ -533,6 +533,86 @@ def test_pending_audit_outbox_stores_only_prepared_redacted_payload(
     repository.close()
 
 
+def test_r3_raw_audit_outbox_is_purged_before_pending_reads(
+    tmp_path: Path,
+) -> None:
+    """Legacy pre-sanitizer payloads must not survive startup or reach an unavailable sink."""
+    database = tmp_path / "r3-audit.sqlite"
+    seeded = SQLiteTaskRepository(database)
+    task = seeded.create_task("C:/work/r3-audit", "fix", round_limit=8)
+    seeded.close()
+    secret = "legacy-raw-provider-secret"
+    raw_body = "legacy raw prompt body"
+    connection = sqlite3.connect(database)
+    connection.execute("DROP TABLE audit_outbox")
+    connection.execute(
+        """CREATE TABLE audit_outbox (
+            sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_id TEXT NOT NULL UNIQUE,
+            task_id TEXT NOT NULL REFERENCES tasks(id),
+            event_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            delivered_at TEXT
+        )"""
+    )
+    connection.execute(
+        "DELETE FROM schema_migrations WHERE name = 'audit-outbox-sanitizer-v1'"
+    )
+    connection.execute(
+        """INSERT INTO audit_outbox
+           (event_id, task_id, event_json, created_at, delivered_at)
+           VALUES (?, ?, ?, ?, NULL)""",
+        (
+            "c" * 64,
+            task.id,
+            json.dumps(
+                {
+                    "event_id": "c" * 64,
+                    "event_type": "transition",
+                    "task_id": task.id,
+                    "metadata": {
+                        "status": secret,
+                        "prompt": raw_body,
+                    },
+                }
+            ),
+            "2026-07-29T00:00:00+00:00",
+        ),
+    )
+    connection.commit()
+    connection.close()
+
+    reopened = SQLiteTaskRepository(
+        database,
+        audit_event_preparer=lambda event: (_ for _ in ()).throw(
+            AuditWriteError("sink unavailable")
+        ),
+    )
+    try:
+        assert reopened.pending_audit_events(limit=8) == ()
+        with reopened._connection_lock:
+            columns = {
+                row[1]
+                for row in reopened._connection.execute(
+                    "PRAGMA table_info(audit_outbox)"
+                )
+            }
+            dump = "\n".join(reopened._connection.iterdump())
+        assert "sanitizer_version" in columns
+        assert secret not in dump
+        assert raw_body not in dump
+    finally:
+        reopened.close()
+
+    sqlite_bytes = b"".join(
+        path.read_bytes()
+        for path in tmp_path.glob(f"{database.name}*")
+        if path.is_file()
+    )
+    assert secret.encode() not in sqlite_bytes
+    assert raw_body.encode() not in sqlite_bytes
+
+
 def test_r0_green_candidate_schema_migrates_valid_and_drops_oversized(
     tmp_path: Path,
 ) -> None:

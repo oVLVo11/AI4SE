@@ -266,3 +266,95 @@ reviewer-owned files:
   service/export, loop, application, and component slices were GREEN before the pristine
   full run. One earlier full-suite run had a single scheduling-sensitive cleanup failure;
   that test passed immediately in isolation and the fresh full run above passed cleanly.
+
+## Formal review round 5 remediation
+
+Round 5 started from `90b9c45` (cumulative base remains `b8f2fe2`) and addressed five
+binding audit findings without changing the root course documents or reviewer-owned
+artifacts:
+
+- production credential retrieval did not add the provider key to the audit sanitizer's
+  live known-secret set;
+- released R3 databases could expose already-persisted raw audit outbox payloads after an
+  upgrade;
+- a receipt update truncated its sole durable record before writing the replacement;
+- the receipt cap was checked only after creating a rejected ID's sidecar; and
+- the receipt/checkpoint namespace depended on the audit path's lexical parent, so a
+  hardlink alias could lose the index and exceed the bounded rebuild window.
+
+### Round-5 RED/GREEN evidence
+
+1. The production composition and literal R3 migration tests were both behaviorally RED:
+   the retrieved key survived in `audit_outbox.event_json`, and reopening returned the raw
+   R3 event containing its provider secret and prompt body. GREEN shares one thread-safe
+   `KnownSecretRegistry` across the lazy provider boundary, `CredentialService`,
+   `AuditLogger`, and service export; it registers immediately after a valid keyring read
+   and before the provider call. The same production test proves lazy retrieval, sanitized
+   provider errors, redaction before SQLite serialization, redacted JSONL, and no key in
+   pending events or the public task view. The R3 test proves startup removes the raw row
+   without decoding or logging it, adds `sanitizer_version = 1`, and leaves neither raw
+   string in the database, WAL/SHM artifacts, pending reads, or an SQLite dump during a
+   simulated sink outage. The exact two-test GREEN slice passed 2/2; application,
+   credential, and storage regressions then passed 127/127.
+2. Seven receipt/cap/alias contracts were RED: zero-, one-, and 47-byte torn receipt
+   updates lost the prior receipt; cap rejection and two racing writers created orphan
+   files; default hardlink replay of a stream over 256 KiB required offline recovery; and
+   a configured shared root was unsupported. GREEN passed all 7/7.
+3. Receipts now keep the released JSON receipt region intact and use two fixed-size binary
+   slots beyond it. Each slot carries magic, monotonically increasing generation, record
+   offset/length, the 32-byte event ID, record digest, and a checksum. A commit writes only
+   the inactive slot and `fsync`s it; loading chooses the newest valid slot and can still
+   read an R4 JSON receipt. Reconciliation may replace a wholly torn first slot only when
+   the corresponding complete JSONL record is present in the bounded suffix.
+4. Receipt lookup first performs a descriptor-relative, no-create open. Under the audit
+   stream lock, a missing distinct ID reserves capacity before any receipt file or shard
+   directory is created. Existing IDs remain replayable at the cap; concurrent distinct
+   writers produce exactly one JSONL record and one receipt.
+5. The index base is now stable user state (or an explicitly configured root), never the
+   audit file's lexical parent and never a production temp directory. Both the shared base
+   and the native-file-identity leaf are created and validated with descriptor/handle-
+   relative no-follow operations and owner-only permissions/DACLs. Hardlinks in different
+   directories and a spawned process share the same identity namespace and replay a stream
+   larger than 256 KiB without scanning or duplicating it. Tests inject one session-owned
+   root and remove it only after all worker processes finish, avoiding production cleanup
+   races and test pollution.
+
+### Round-5 migration protocol
+
+- Fresh outbox rows carry an explicit sanitizer protocol version, and pending reads select
+  only that version. Startup enables SQLite `secure_delete` before inspecting the schema.
+- A pre-version table is dropped and recreated without selecting or deserializing its
+  payload columns; incompatible versioned rows are deleted. WAL is checkpointed with
+  `TRUNCATE`, the database is vacuumed, and WAL is truncated again before startup returns.
+- The migration completion marker is written only after physical purge succeeds. If
+  exclusive checkpoint/VACUUM cannot complete, construction fails closed and the absent
+  marker forces the next startup to retry byte purging rather than treating the schema-only
+  migration as complete.
+
+### Round-5 modified files
+
+- Runtime: `src/pyquality/application.py`, `src/pyquality/security.py`,
+  `src/pyquality/service.py`, and `src/pyquality/storage/sqlite.py`.
+- Tests: `tests/conftest.py`, `tests/security/test_redaction.py`,
+  `tests/unit/test_application.py`, `tests/unit/test_service.py`, and
+  `tests/unit/test_storage.py`.
+
+### Round-5 final verification
+
+- `python -m pytest -q -rs -p no:cacheprovider --basetemp "$env:TEMP\\pyquality-task11-r5-persistent-root-full-final"`:
+  526 collected; 517 passed, 9 skipped, zero failures in 40.8 seconds.
+- The nine skips are explicit environment capabilities: one POSIX-directory-descriptor
+  contract on Windows and eight unavailable symlink/link-privilege contracts (patch-tool,
+  process-lease, three audit/policy link groups). No functional failure was converted to a
+  skip.
+- `python -m ruff check src tests examples`: all checks passed.
+- `git diff --check`: exit 0; only the repository's existing LF/CRLF conversion warnings
+  were printed.
+- Five worktree-local pytest basetemp directories created by earlier runs retain DACLs for
+  expired sandbox TokenOwners: `.pytest-task11-r5-affected-a`,
+  `.pytest-task11-r5-affected-b`, `.pytest-task11-r5-security-a`,
+  `.pytest-task11-r5-security-b`, and `.pytest-task11-r5-slices-final`. Exact-path
+  `Remove-Item`, `takeown`, and `icacls` cleanup attempts were denied. They remain untracked
+  environment residue, are excluded from the explicit staging list, and no temp path is
+  part of the commit or cumulative package.
+- Required commit subject: `fix: harden audit migration and sidecar identity`.

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import shutil
 from collections.abc import Callable
+from collections.abc import Set as AbstractSet
 from concurrent.futures import Future, InvalidStateError, ThreadPoolExecutor
 from pathlib import Path
 from threading import BoundedSemaphore, Lock
@@ -96,7 +97,7 @@ class HarnessService:
         provider: str = "mock",
         verifier_finder: Callable[[str], str | None] = shutil.which,
         audit_path: Path | None = None,
-        audit_secrets: set[str] | None = None,
+        audit_secrets: AbstractSet[str] | None = None,
         allowed_root: Path | None = None,
     ) -> None:
         self._repository = repository
@@ -106,7 +107,9 @@ class HarnessService:
         self._provider = provider
         self._verifier_finder = verifier_finder
         self._audit_path = audit_path
-        self._audit_secrets = set(audit_secrets or ())
+        self._audit_secrets = (
+            audit_secrets if audit_secrets is not None else frozenset()
+        )
         self._allowed_root = allowed_root
         self._executor = ThreadPoolExecutor(
             max_workers=settings.global_concurrency,
@@ -730,9 +733,10 @@ class HarnessService:
         )
 
     def _decode_audit(self, line: str) -> AuditEvent:
+        audit_secrets = set(self._audit_secrets)
         payload = redact(
             json.loads(line),
-            self._audit_secrets,
+            audit_secrets,
             set(self._settings.redaction_patterns),
         )
         if not isinstance(payload, dict) or set(payload) != {
@@ -747,7 +751,7 @@ class HarnessService:
         candidates["outcome"] = payload["outcome"]
         candidates["duration"] = payload["duration"]
         safe_metadata, duration, outcome = sanitize_audit_metadata(
-            candidates, self._audit_secrets
+            candidates, audit_secrets
         )
         if outcome is not None:
             safe_metadata["outcome"] = outcome

@@ -194,6 +194,8 @@ _RESERVED_STATUSES = frozenset(
 )
 _PROJECT_RESERVATION_MIGRATION = "project-reservations-v1"
 _GREEN_CANDIDATE_MIGRATION = "green-candidates-v2"
+_AUDIT_OUTBOX_SANITIZER_MIGRATION = "audit-outbox-sanitizer-v1"
+_AUDIT_OUTBOX_SANITIZER_VERSION = 1
 _MAX_AUDIT_OUTBOX_EVENT_BYTES = 16_384
 _ALLOWED_TRANSITIONS = {
     TaskStatus.CREATED: frozenset({TaskStatus.RUNNING}),
@@ -245,6 +247,7 @@ class SQLiteTaskRepository:
             self._connection.row_factory = sqlite3.Row
             self._connection.execute("PRAGMA foreign_keys = ON")
             self._connection.execute("PRAGMA journal_mode = WAL")
+            self._connection.execute("PRAGMA secure_delete = ON")
             self._create_schema()
 
     def create_task(
@@ -789,8 +792,9 @@ class SQLiteTaskRepository:
             rows = tuple(
                 connection.execute(
                     """SELECT sequence, event_json FROM audit_outbox
-                       WHERE delivered_at IS NULL ORDER BY sequence LIMIT ?""",
-                    (limit,),
+                       WHERE delivered_at IS NULL AND sanitizer_version = ?
+                       ORDER BY sequence LIMIT ?""",
+                    (_AUDIT_OUTBOX_SANITIZER_VERSION, limit),
                 )
             )
         return tuple(
@@ -1960,7 +1964,8 @@ class SQLiteTaskRepository:
                 task_id TEXT NOT NULL REFERENCES tasks(id),
                 event_json TEXT NOT NULL,
                 created_at TEXT NOT NULL,
-                delivered_at TEXT
+                delivered_at TEXT,
+                sanitizer_version INTEGER NOT NULL
             );
             CREATE TABLE IF NOT EXISTS project_leases (
                 project_id TEXT PRIMARY KEY REFERENCES projects(id),
@@ -2020,8 +2025,100 @@ class SQLiteTaskRepository:
             "project_reservations", "migrated", "INTEGER NOT NULL DEFAULT 0"
         )
         self._ensure_column("project_reservations", "creation_nonce", "TEXT")
+        purged_legacy_audit = self._migrate_audit_outbox()
         self._migrate_green_candidates()
         self._migrate_project_reservations()
+        if purged_legacy_audit:
+            self._purge_deleted_sqlite_content()
+            self._record_audit_outbox_sanitizer_migration()
+
+    def _migrate_audit_outbox(self) -> bool:
+        """Drop pre-sanitizer rows without ever decoding or copying their payloads."""
+        self._connection.execute("BEGIN IMMEDIATE")
+        migration_recorded = self._connection.execute(
+            "SELECT 1 FROM schema_migrations WHERE name = ?",
+            (_AUDIT_OUTBOX_SANITIZER_MIGRATION,),
+        ).fetchone() is not None
+        purged = not migration_recorded
+        try:
+            columns = {
+                row["name"]
+                for row in self._connection.execute("PRAGMA table_info(audit_outbox)")
+            }
+            if "sanitizer_version" not in columns:
+                purged = purged or self._connection.execute(
+                    "SELECT EXISTS(SELECT 1 FROM audit_outbox)"
+                ).fetchone()[0] == 1
+                self._connection.execute("DROP TABLE audit_outbox")
+                self._connection.execute(
+                    """CREATE TABLE audit_outbox (
+                        sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                        event_id TEXT NOT NULL UNIQUE,
+                        task_id TEXT NOT NULL REFERENCES tasks(id),
+                        event_json TEXT NOT NULL,
+                        created_at TEXT NOT NULL,
+                        delivered_at TEXT,
+                        sanitizer_version INTEGER NOT NULL
+                    )"""
+                )
+            else:
+                incompatible = self._connection.execute(
+                    """SELECT EXISTS(
+                           SELECT 1 FROM audit_outbox
+                           WHERE sanitizer_version != ?
+                       )""",
+                    (_AUDIT_OUTBOX_SANITIZER_VERSION,),
+                ).fetchone()[0]
+                if incompatible:
+                    purged = True
+                    self._connection.execute(
+                        "DELETE FROM audit_outbox WHERE sanitizer_version != ?",
+                        (_AUDIT_OUTBOX_SANITIZER_VERSION,),
+                    )
+            if purged:
+                self._connection.execute(
+                    "DELETE FROM schema_migrations WHERE name = ?",
+                    (_AUDIT_OUTBOX_SANITIZER_MIGRATION,),
+                )
+            else:
+                self._connection.execute(
+                    """INSERT OR IGNORE INTO schema_migrations (name, completed_at)
+                       VALUES (?, ?)""",
+                    (
+                        _AUDIT_OUTBOX_SANITIZER_MIGRATION,
+                        _dump_datetime(_utc_now()),
+                    ),
+                )
+        except Exception:
+            self._connection.rollback()
+            raise
+        else:
+            self._connection.commit()
+        return purged
+
+    def _record_audit_outbox_sanitizer_migration(self) -> None:
+        self._connection.execute(
+            """INSERT OR IGNORE INTO schema_migrations (name, completed_at)
+               VALUES (?, ?)""",
+            (
+                _AUDIT_OUTBOX_SANITIZER_MIGRATION,
+                _dump_datetime(_utc_now()),
+            ),
+        )
+
+    def _purge_deleted_sqlite_content(self) -> None:
+        """Remove bytes from dropped legacy pages and any WAL copies before startup."""
+        checkpoint = self._connection.execute(
+            "PRAGMA wal_checkpoint(TRUNCATE)"
+        ).fetchone()
+        if checkpoint is not None and checkpoint[0] != 0:
+            raise StorageStateError("legacy audit quarantine requires exclusive startup")
+        self._connection.execute("VACUUM")
+        checkpoint = self._connection.execute(
+            "PRAGMA wal_checkpoint(TRUNCATE)"
+        ).fetchone()
+        if checkpoint is not None and checkpoint[0] != 0:
+            raise StorageStateError("legacy audit quarantine requires exclusive startup")
 
     def _migrate_green_candidates(self) -> None:
         """Rebuild the released R0 table with bounded, iteration-bound evidence."""
@@ -2315,13 +2412,15 @@ class SQLiteTaskRepository:
                 raise StorageStateError("audit event exceeds durable outbox bound")
             connection.execute(
                 """INSERT INTO audit_outbox
-                   (event_id, task_id, event_json, created_at, delivered_at)
-                   VALUES (?, ?, ?, ?, NULL)""",
+                   (event_id, task_id, event_json, created_at, delivered_at,
+                    sanitizer_version)
+                   VALUES (?, ?, ?, ?, NULL, ?)""",
                 (
                     prepared.event_id,
                     task_id,
                     event_json,
                     _dump_datetime(prepared.created_at or _utc_now()),
+                    _AUDIT_OUTBOX_SANITIZER_VERSION,
                 ),
             )
 

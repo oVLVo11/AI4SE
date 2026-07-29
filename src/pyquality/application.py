@@ -14,7 +14,7 @@ from .feedback import ProgressTracker
 from .llm import ActionParser, OpenAICompatibleLLM, ScriptedLLM
 from .loop import AgentLoop
 from .policy import PolicyEngine
-from .security import AuditLogger, CredentialService
+from .security import AuditLogger, CredentialService, KnownSecretRegistry
 from .service import HarnessService
 from .storage.sqlite import SQLiteTaskRepository
 from .tools import SubprocessRunner, ToolDispatcher
@@ -38,13 +38,21 @@ def build_service(
     settings = load_settings(root, None)
     runtime_dir = root / ".pyquality"
     runtime_dir.mkdir(mode=0o700, exist_ok=True)
-    audit = AuditLogger(audit_path or runtime_dir / "audit.jsonl")
+    known_secrets = KnownSecretRegistry()
+    audit = AuditLogger(
+        audit_path or runtime_dir / "audit.jsonl",
+        secret_registry=known_secrets,
+    )
     repository = SQLiteTaskRepository(
         state_path or runtime_dir / "state.sqlite",
         audit_event_preparer=audit.prepare,
     )
     backend = keyring.get_keyring()
-    credentials = CredentialService(backend, service_name="pyquality")
+    credentials = CredentialService(
+        backend,
+        service_name="pyquality",
+        secret_registry=known_secrets,
+    )
     selected_provider = provider or os.environ.get("PYQUALITY_PROVIDER", "openai")
     if selected_provider == "mock":
         llm = ScriptedLLM(())
@@ -58,6 +66,7 @@ def build_service(
             value = backend.get_password("pyquality", "provider")
             if not isinstance(value, str) or not value:
                 raise RuntimeError("provider credential is unavailable")
+            known_secrets.register(value)
             return value
 
         llm = OpenAICompatibleLLM.from_settings(
@@ -87,5 +96,6 @@ def build_service(
         credentials=credentials,
         provider=selected_provider,
         audit_path=audit_path or runtime_dir / "audit.jsonl",
+        audit_secrets=known_secrets,
         allowed_root=root,
     )
