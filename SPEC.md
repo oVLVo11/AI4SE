@@ -382,6 +382,14 @@ Approval records retain the normalized action, digest, repository snapshot diges
 
 `TaskRepository` provides compare-and-set state transitions, transition intents, approval lookup/decision/execution marking, lease acquire/release, and recovery snapshots. Leases release on every terminal transition and on a waiting approval after the snapshot is saved. `AgentLoop` receives repository, policy, dispatcher, pipeline, parser, LLM, context builder, progress tracker, clock, and an audit sink through explicit constructor protocols. The injected audit sink redacts metadata from Task 8 onward; Task 9 supplies the JSONL implementation. Transition records contain digests and bounded redacted summaries, never complete prompts or model responses. Storage, verifier/tool availability, configuration, and permission failures are `BLOCKED`; unrecoverable internal consistency failures are `FAILED`.
 
+### 14.3 Application Lifecycle and Public Boundary Contract
+
+Service acceptance is atomic at the durable boundary: a repository has at most one nonterminal service reservation, and an accepted task is durably visible before it is published through an in-process future. Starting work acquires the project lease before executor submission; recovery may adopt a RUNNING task only with the same owner token. Approval resume is an atomic, single-consumer state transition.
+
+User cancellation is a transactional CREATED-only compare-and-set operation. Setup compensation uses separate owner-token-authorized RUNNING rollback and nonce-bound CREATED rollback, so it cannot delete work created or leased by another caller. Cleanup attempts are independent and best-effort, the primary setup error remains authoritative and sanitized, capacity is released exactly once, and local future/repository registries are reconciled before results are published. Nonterminal reservations remain durable for bounded same-service recovery; terminal or absent state is identity-evicted from bounded local registries.
+
+The public application boundary exposes only the bundled mock capability and a server-owned session identity. Public requests cannot select arbitrary repositories, providers, credentials, or execution capabilities, and session state is neither accepted from nor transferred between untrusted clients.
+
 
 ## 15. Design Decisions Summary
 

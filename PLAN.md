@@ -800,7 +800,7 @@ git commit -m "feat: secure credentials and redact audit data"
 - Consumes: `AgentLoop`, storage, settings, credentials.
 - Produces: `ProjectBusyError`, `PreflightError`, `HarnessService.create_task/start_task/get_task/approve/reject/export_audit`, `create_app(service, mode: Literal["local", "public_mock"]) -> FastAPI`, and `main()`.
 
-- [ ] **Step 1: Write failing service concurrency and preflight tests**
+- [x] **Step 1: Write failing service concurrency and preflight tests**
 
 ```python
 def test_service_rejects_second_task_for_same_repository(service, repo) -> None:
@@ -817,11 +817,11 @@ def test_preflight_reports_missing_pytest(service, repo, fake_environment) -> No
 Run: `pytest tests/unit/test_service.py -v`
 Expected: FAIL because service is absent.
 
-- [ ] **Step 2: Implement service, bounded background executor, and audit export**
+- [x] **Step 2: Implement service, bounded background executor, and audit export**
 
 Use a `ThreadPoolExecutor(max_workers=settings.global_concurrency)` in one application process. Acquire the repository lease before queueing, release it on terminal state, expose typed view models, and export only redacted structured events.
 
-- [ ] **Step 3: Write failing WebUI security and workflow tests**
+- [x] **Step 3: Write failing WebUI security and workflow tests**
 
 ```python
 def test_task_create_requires_csrf(client, repo) -> None:
@@ -841,11 +841,11 @@ def test_settings_never_renders_key(client, seeded_credentials) -> None:
 Run: `pytest tests/web/test_web.py -v`
 Expected: FAIL because WebUI is absent.
 
-- [ ] **Step 4: Implement server-rendered pages, CSRF, CLI families, and public restrictions**
+- [x] **Step 4: Implement server-rendered pages, CSRF, CLI families, and public restrictions**
 
 Bind local server to `127.0.0.1` by default. Use an HttpOnly, SameSite=Strict session cookie and per-session CSRF token for mutations. In `public_mock`, reject arbitrary path fields, credential endpoints, provider changes, and non-bundled scenarios. Implement `run`, `serve`, `demo`, and `credential set|status|clear` CLI families; use `getpass.getpass` for key input.
 
-- [ ] **Step 5: Verify and commit**
+- [x] **Step 5: Verify and commit**
 
 Run: `pytest tests/unit/test_service.py tests/web -v && ruff check src tests`
 Expected: PASS.
