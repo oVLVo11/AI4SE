@@ -5,6 +5,7 @@ import json
 import multiprocessing
 import os
 import shutil
+import struct
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from urllib.parse import unquote
@@ -1716,6 +1717,49 @@ def test_invalid_released_r4_index_fails_closed_without_copying(
     assert not security._audit_receipt_path(new_root, events[0].event_id).exists()
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows inherited DACL regression")
+@pytest.mark.parametrize(
+    "sddl",
+    [
+        "D:(A;OICIID;FA;;;WD)",
+        "D:(A;OICIID;0x1301bf;;;BU)",
+        "D:(A;OICIID;0x1301bf;;;AU)",
+    ],
+)
+def test_released_r4_directory_rejects_untrusted_inherited_writers(
+    r4_tmp_path: Path,
+    sddl: str,
+) -> None:
+    """Inherited broad principals must not gain mutation authority over R4 evidence."""
+    from pyquality import security
+
+    path = r4_tmp_path / "unsafe-directory" / "audit.jsonl"
+    index_base = r4_tmp_path / "unsafe-directory-index"
+    events, _, legacy_root, new_root = _build_released_r4_audit_index(
+        path, index_base, event_count=2
+    )
+    parent_sddl = "D:P(A;OICI;FA;;;OW)" + sddl.removeprefix("D:").replace(
+        "OICIID", "OICI"
+    )
+    _windows_set_test_dacl(
+        legacy_root.parent,
+        parent_sddl,
+        protected=True,
+        directory=True,
+    )
+    _windows_set_test_dacl(
+        legacy_root,
+        sddl,
+        protected=False,
+        directory=True,
+    )
+
+    with pytest.raises(security.AuditRecoveryRequired):
+        AuditLogger(path, index_root=index_base).emit(events[0])
+
+    assert not (new_root / "migration").exists()
+
+
 def test_r4_candidate_rejects_a_wrong_encoded_stream_identity(
     r4_tmp_path: Path,
 ) -> None:
@@ -1910,6 +1954,64 @@ def test_completed_r4_marker_allows_live_checkpoint_to_advance(
         first_live.event_id,
         second_live.event_id,
     ]
+
+
+def test_completed_pqamig1_marker_replays_and_upgrades_in_place(
+    r4_tmp_path: Path,
+) -> None:
+    """A committed marker from 63b08cf remains authoritative after the format upgrade."""
+    from pyquality import security
+
+    path = r4_tmp_path / "v1-marker" / "audit.jsonl"
+    index_base = r4_tmp_path / "v1-marker-index"
+    events, _, _, new_root = _build_released_r4_audit_index(
+        path, index_base, event_count=3
+    )
+    AuditLogger(path, index_root=index_base).emit(events[0])
+    marker_path = new_root / "migration"
+    audit_descriptor = security._open_audit(path, create=False)
+    try:
+        identity = security._audit_stream_identity(audit_descriptor)
+        audit_size = os.lseek(audit_descriptor, 0, os.SEEK_END)
+    finally:
+        os.close(audit_descriptor)
+    encoded_identity = identity.encode("ascii").ljust(64, b"\0")
+    generation = 2
+    legacy_slot = struct.Struct(">8sQ64sQQQQB32s111x")
+    legacy_digest = hashlib.sha256(
+        struct.pack(
+            ">Q64sQQQQB",
+            generation,
+            encoded_identity,
+            2,
+            len(events),
+            len(events),
+            audit_size,
+            True,
+        )
+    ).digest()
+    legacy_payload = legacy_slot.pack(
+        b"PQAMIG1\0",
+        generation,
+        encoded_identity,
+        2,
+        len(events),
+        len(events),
+        audit_size,
+        True,
+        legacy_digest,
+    )
+    descriptor = security._open_audit(marker_path, append=False, create=False)
+    try:
+        os.ftruncate(descriptor, 0)
+        security._write_all(descriptor, bytes(legacy_slot.size) + legacy_payload)
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+    AuditLogger(path, index_root=index_base).emit(events[-1])
+
+    assert marker_path.read_bytes().startswith(security._R4_MIGRATION_MAGIC)
 
 
 def test_completed_r4_marker_allows_pending_r5_recovery(
@@ -2341,7 +2443,13 @@ def _windows_descriptor_is_exact_owner_only(
     )
 
 
-def _windows_set_test_dacl(path: Path, sddl: str, *, protected: bool) -> None:
+def _windows_set_test_dacl(
+    path: Path,
+    sddl: str,
+    *,
+    protected: bool,
+    directory: bool = False,
+) -> None:
     import ctypes
     from ctypes import wintypes
 
@@ -2405,8 +2513,9 @@ def _windows_set_test_dacl(path: Path, sddl: str, *, protected: bool) -> None:
             ctypes.byref(defaulted),
         )
         assert present.value and dacl.value
+        flags = 0x02000000 if directory else 0x00000080
         handle = create_file(
-            str(path), 0x00020000 | 0x00040000, 0x00000007, None, 3, 0x00000080, None
+            str(path), 0x00020000 | 0x00040000, 0x00000007, None, 3, flags, None
         )
         invalid_handle = ctypes.c_void_p(-1).value
         value = int(handle) if handle is not None else None
@@ -2415,7 +2524,8 @@ def _windows_set_test_dacl(path: Path, sddl: str, *, protected: bool) -> None:
             assert set_security_info(
                 handle,
                 1,
-                0x00000004 | (0x80000000 if protected else 0x20000000),
+                0x00000004
+                | (0x80000000 if protected else 0x20000000),
                 None,
                 None,
                 dacl,

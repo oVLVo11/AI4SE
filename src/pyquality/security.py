@@ -45,9 +45,11 @@ _CHECKPOINT_V2_MAGIC = b"PQAIDX2\0"
 _CHECKPOINT_V2_REGION_OFFSET = _CHECKPOINT_SLOT.size * 2
 _CHECKPOINT_V2_SLOT = struct.Struct(">8sQQQQ32s32s24x")
 _R4_MIGRATION_MAGIC = b"PQAMIG2\0"
+_R4_MIGRATION_V1_MAGIC = b"PQAMIG1\0"
 _R4_MIGRATION_TARGET_FORMAT = 2
 _R4_SOURCE_LOCATOR_BYTES = 4_096
 _R4_MIGRATION_SLOT = struct.Struct(">8sQ64sQQQQBH4096s32s109x")
+_R4_MIGRATION_V1_SLOT = struct.Struct(">8sQ64sQQQQB32s111x")
 _RECEIPT_MAGIC = b"PQARCP2\0"
 _RECEIPT_SLOT_OFFSET = 256
 _RECEIPT_SLOT = struct.Struct(">8sQQI32s32s32s")
@@ -1860,6 +1862,79 @@ def _load_r4_migration_state(
     return max(candidates, key=lambda state: state.generation)
 
 
+def _load_completed_r4_v1_migration_state(
+    descriptor: int,
+    *,
+    source_identity: str,
+    audit_size: int,
+) -> _R4MigrationState:
+    size = os.lseek(descriptor, 0, os.SEEK_END)
+    if size == 0 or size > _R4_MIGRATION_V1_SLOT.size * 2:
+        raise AuditRecoveryRequired
+    candidates: list[_R4MigrationState] = []
+    for slot in range(2):
+        encoded = _read_at(
+            descriptor, slot * _R4_MIGRATION_V1_SLOT.size, _R4_MIGRATION_V1_SLOT.size
+        )
+        if len(encoded) != _R4_MIGRATION_V1_SLOT.size:
+            continue
+        (
+            magic,
+            generation,
+            encoded_identity,
+            target_format,
+            next_cursor,
+            receipt_count,
+            indexed_size,
+            completed,
+            digest,
+        ) = _R4_MIGRATION_V1_SLOT.unpack(encoded)
+        identity_bytes = encoded_identity.rstrip(b"\0")
+        try:
+            decoded_identity = identity_bytes.decode("ascii")
+        except UnicodeDecodeError:
+            continue
+        expected_digest = hashlib.sha256(
+            struct.pack(
+                ">Q64sQQQQB",
+                generation,
+                encoded_identity,
+                target_format,
+                next_cursor,
+                receipt_count,
+                indexed_size,
+                bool(completed),
+            )
+        ).digest()
+        if (
+            magic == _R4_MIGRATION_V1_MAGIC
+            and generation > 0
+            and encoded_identity == identity_bytes.ljust(64, b"\0")
+            and decoded_identity == source_identity
+            and re.fullmatch(r"[0-9a-f]+-[0-9a-f]+", decoded_identity)
+            and target_format == _R4_MIGRATION_TARGET_FORMAT
+            and next_cursor == receipt_count <= _MAX_AUDIT_RECEIPTS
+            and indexed_size <= audit_size
+            and completed == 1
+            and digest == expected_digest
+        ):
+            candidates.append(
+                _R4MigrationState(
+                    generation,
+                    decoded_identity,
+                    target_format,
+                    next_cursor,
+                    receipt_count,
+                    indexed_size,
+                    True,
+                    "",
+                )
+            )
+    if not candidates:
+        raise AuditRecoveryRequired
+    return max(candidates, key=lambda state: state.generation)
+
+
 def _store_r4_migration_state(
     descriptor: int,
     previous: _R4MigrationState | None,
@@ -2236,6 +2311,54 @@ def _verify_migrated_target_receipts(
             os.close(descriptor)
 
 
+def _verify_completed_v1_target(
+    audit_descriptor: int,
+    index_root: Path,
+    state: _R4MigrationState,
+    audit_size: int,
+) -> None:
+    _verify_target_migration_checkpoint(index_root, state, audit_size)
+    checkpoint, _ = _load_existing_target_checkpoint(index_root, audit_size)
+    if checkpoint is None:
+        raise AuditRecoveryRequired
+    receipts_root = index_root / "receipts"
+    receipt_paths: list[Path] = []
+    for shard, is_directory, is_file in _bounded_r4_directory_entries(
+        receipts_root, limit=257
+    ):
+        if not is_directory or is_file or re.fullmatch(r"[0-9a-f]{2}", shard) is None:
+            raise AuditRecoveryRequired
+        shard_root = receipts_root / shard
+        for name, child_is_directory, child_is_file in _bounded_r4_directory_entries(
+            shard_root, limit=_MAX_AUDIT_RECEIPTS - len(receipt_paths) + 1
+        ):
+            if (
+                child_is_directory
+                or not child_is_file
+                or re.fullmatch(r"[0-9a-f]{64}", name) is None
+                or not name.startswith(shard)
+            ):
+                raise AuditRecoveryRequired
+            receipt_paths.append(shard_root / name)
+            if len(receipt_paths) > _MAX_AUDIT_RECEIPTS:
+                raise AuditRecoveryRequired
+    if len(receipt_paths) != checkpoint.committed_receipt_count:
+        raise AuditRecoveryRequired
+    for path in receipt_paths:
+        descriptor = _open_existing_migration_target(path)
+        if descriptor is None:
+            raise AuditRecoveryRequired
+        try:
+            receipt = _load_audit_receipt(descriptor)
+            if receipt is None or receipt.get("version") != 2:
+                raise AuditRecoveryRequired
+            _verify_audit_receipt(audit_descriptor, receipt, path.name)
+        except OSError:
+            raise AuditRecoveryRequired from None
+        finally:
+            os.close(descriptor)
+
+
 def _target_checkpoint_matches_migration(
     checkpoint: _AuditCheckpoint | None,
     is_v2: bool,
@@ -2455,6 +2578,7 @@ def _migrate_released_r4_audit_index(
     marker_descriptor = _open_existing_migration_target(marker_path)
     state: _R4MigrationState | None = None
     torn_marker = False
+    legacy_completed_marker = False
     try:
         if marker_descriptor is not None:
             try:
@@ -2464,15 +2588,43 @@ def _migrate_released_r4_audit_index(
                     audit_size=audit_size,
                 )
             except AuditRecoveryRequired:
-                torn_marker = True
+                try:
+                    state = _load_completed_r4_v1_migration_state(
+                        marker_descriptor,
+                        source_identity=source_identity,
+                        audit_size=audit_size,
+                    )
+                except AuditRecoveryRequired:
+                    torn_marker = True
+                else:
+                    legacy_completed_marker = True
             except OSError:
                 raise AuditRecoveryRequired from None
             if state is not None and state.completed:
-                _verify_target_migration_checkpoint(
-                    index_root,
-                    state,
-                    audit_size,
-                )
+                if legacy_completed_marker:
+                    _verify_completed_v1_target(
+                        audit_descriptor, index_root, state, audit_size
+                    )
+                    source_root = (
+                        audit_path.absolute().parent
+                        / f".pyquality-audit-index-{source_identity}"
+                    )
+                    _store_r4_migration_state(
+                        marker_descriptor,
+                        None,
+                        source_identity=source_identity,
+                        next_cursor=state.receipt_count,
+                        receipt_count=state.receipt_count,
+                        indexed_size=state.indexed_size,
+                        completed=True,
+                        source_root=source_root,
+                    )
+                else:
+                    _verify_target_migration_checkpoint(
+                        index_root,
+                        state,
+                        audit_size,
+                    )
                 return
 
         source_root = (
@@ -2596,6 +2748,9 @@ if os.name == "nt":
     _LOCKFILE_EXCLUSIVE_LOCK = 0x00000002
     _DUPLICATE_SAME_ACCESS = 0x00000002
     _TOKEN_QUERY = 0x00000008
+    _TOKEN_USER = 1
+    _TOKEN_GROUPS = 2
+    _TOKEN_RESTRICTED_SIDS = 11
     _TOKEN_OWNER = 4
     _ERROR_INSUFFICIENT_BUFFER = 122
     _SE_FILE_OBJECT = 1
@@ -2607,6 +2762,8 @@ if os.name == "nt":
     _TRUSTEE_IS_USER = 1
     _ACL_SIZE_INFORMATION_CLASS = 2
     _ACCESS_ALLOWED_ACE_TYPE = 0
+    _R4_INHERITED_ACE_FLAGS = 0x13
+    _R4_RELEASED_MODIFY_MASK = 0x001301BF
     _SHARING_VIOLATION = 32
     _EXCLUSIVE_OPEN_TIMEOUT_SECONDS = 2.0
     _EXCLUSIVE_OPEN_RETRY_SECONDS = 0.01
@@ -2676,6 +2833,18 @@ if os.name == "nt":
 
     class _TokenOwner(ctypes.Structure):
         _fields_ = [("Owner", wintypes.LPVOID)]
+
+    class _SidAndAttributes(ctypes.Structure):
+        _fields_ = [("Sid", wintypes.LPVOID), ("Attributes", wintypes.DWORD)]
+
+    class _TokenUser(ctypes.Structure):
+        _fields_ = [("User", _SidAndAttributes)]
+
+    class _TokenGroups(ctypes.Structure):
+        _fields_ = [
+            ("GroupCount", wintypes.DWORD),
+            ("Groups", _SidAndAttributes * 1),
+        ]
 
     class _SecurityDescriptor(ctypes.Structure):
         _fields_ = [
@@ -2795,6 +2964,9 @@ if os.name == "nt":
         ctypes.POINTER(wintypes.HANDLE),
     ]
     _open_process_token.restype = wintypes.BOOL
+    _is_well_known_sid = _advapi32.IsWellKnownSid
+    _is_well_known_sid.argtypes = [wintypes.LPVOID, ctypes.c_int]
+    _is_well_known_sid.restype = wintypes.BOOL
     _get_token_information = _advapi32.GetTokenInformation
     _get_token_information.argtypes = [
         wintypes.HANDLE,
@@ -3191,7 +3363,10 @@ if os.name == "nt":
                     next_descriptor = _nt_open_relative(
                         descriptor,
                         part,
-                        desired_access=_FILE_READ_ATTRIBUTES | (_READ_CONTROL if final else 0),
+                        desired_access=(
+                            _FILE_READ_ATTRIBUTES
+                            | (_READ_CONTROL if index >= len(parts) - 2 else 0)
+                        ),
                         disposition=_FILE_OPEN,
                         attributes=_FILE_ATTRIBUTE_DIRECTORY,
                         options=_FILE_DIRECTORY_FILE | _FILE_OPEN_REPARSE_POINT,
@@ -3202,7 +3377,9 @@ if os.name == "nt":
                             try:
                                 _verify_windows_owner_only_dacl(next_descriptor, owner_sid)
                             except OSError:
-                                _verify_windows_released_r4_dacl(next_descriptor, owner_sid)
+                                _verify_windows_released_r4_dacl(
+                                    next_descriptor, owner_sid, descriptor
+                                )
                     except Exception:
                         _close_windows_handle(next_descriptor)
                         raise
@@ -3445,10 +3622,82 @@ if os.name == "nt":
             if security_descriptor.value:
                 _local_free(security_descriptor)
 
-    def _verify_windows_released_r4_dacl(handle: int, owner_sid: wintypes.LPVOID) -> None:
+    @contextmanager
+    def _windows_current_token_sids() -> Iterator[tuple[wintypes.LPVOID, ...]]:
+        token = wintypes.HANDLE()
+        if not _open_process_token(
+            _get_current_process(), _TOKEN_QUERY, ctypes.byref(token)
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+        buffers: list[ctypes.Array[ctypes.c_char]] = []
+        try:
+            def query(information_class: int) -> ctypes.Array[ctypes.c_char]:
+                required = wintypes.DWORD()
+                ctypes.set_last_error(0)
+                if _get_token_information(
+                    token, information_class, None, 0, ctypes.byref(required)
+                ):
+                    raise OSError("token SID query returned an invalid size result")
+                error = ctypes.get_last_error()
+                if error != _ERROR_INSUFFICIENT_BUFFER or not required.value:
+                    raise ctypes.WinError(error)
+                buffer = ctypes.create_string_buffer(required.value)
+                if not _get_token_information(
+                    token,
+                    information_class,
+                    buffer,
+                    required.value,
+                    ctypes.byref(required),
+                ):
+                    raise ctypes.WinError(ctypes.get_last_error())
+                buffers.append(buffer)
+                return buffer
+
+            user_buffer = query(_TOKEN_USER)
+            user = ctypes.cast(user_buffer, ctypes.POINTER(_TokenUser)).contents
+            groups_buffer = query(_TOKEN_GROUPS)
+            groups = ctypes.cast(
+                groups_buffer, ctypes.POINTER(_TokenGroups)
+            ).contents
+            first_group = ctypes.addressof(groups) + _TokenGroups.Groups.offset
+            group_sids = tuple(
+                ctypes.cast(
+                    first_group + index * ctypes.sizeof(_SidAndAttributes),
+                    ctypes.POINTER(_SidAndAttributes),
+                ).contents.Sid
+                for index in range(groups.GroupCount)
+            )
+            restricted_buffer = query(_TOKEN_RESTRICTED_SIDS)
+            restricted = ctypes.cast(
+                restricted_buffer, ctypes.POINTER(_TokenGroups)
+            ).contents
+            first_restricted = (
+                ctypes.addressof(restricted) + _TokenGroups.Groups.offset
+            )
+            restricted_sids = tuple(
+                ctypes.cast(
+                    first_restricted + index * ctypes.sizeof(_SidAndAttributes),
+                    ctypes.POINTER(_SidAndAttributes),
+                ).contents.Sid
+                for index in range(restricted.GroupCount)
+            )
+            yield (wintypes.LPVOID(user.User.Sid),) + tuple(
+                wintypes.LPVOID(sid) for sid in group_sids + restricted_sids
+            )
+        finally:
+            del buffers
+            _close_windows_handle(int(token.value))
+
+    def _verify_windows_released_r4_dacl(
+        handle: int,
+        owner_sid: wintypes.LPVOID,
+        parent_handle: int,
+    ) -> None:
         owner = wintypes.LPVOID()
         dacl = wintypes.LPVOID()
         security_descriptor = wintypes.LPVOID()
+        parent_dacl = wintypes.LPVOID()
+        parent_security_descriptor = wintypes.LPVOID()
         result = _get_security_info(
             wintypes.HANDLE(handle),
             _SE_FILE_OBJECT,
@@ -3461,6 +3710,20 @@ if os.name == "nt":
         )
         if result:
             raise OSError(result, "released R4 ACL verification query failed")
+        result = _get_security_info(
+            wintypes.HANDLE(parent_handle),
+            _SE_FILE_OBJECT,
+            _DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            ctypes.byref(parent_dacl),
+            None,
+            ctypes.byref(parent_security_descriptor),
+        )
+        if result or not parent_dacl.value:
+            if security_descriptor.value:
+                _local_free(security_descriptor)
+            raise OSError(result, "released R4 parent ACL verification failed")
         try:
             if (
                 not owner.value
@@ -3487,18 +3750,81 @@ if os.name == "nt":
                 raise ctypes.WinError(ctypes.get_last_error())
             if not information.AceCount:
                 raise OSError("released R4 ACL is empty")
-            for index in range(information.AceCount):
-                ace_pointer = wintypes.LPVOID()
-                if not _get_ace(dacl, index, ctypes.byref(ace_pointer)) or not ace_pointer.value:
+            with _windows_current_token_sids() as token_sids:
+                parent_information = _AclSizeInformation()
+                if not _get_acl_information(
+                    parent_dacl,
+                    ctypes.byref(parent_information),
+                    ctypes.sizeof(parent_information),
+                    _ACL_SIZE_INFORMATION_CLASS,
+                ):
                     raise ctypes.WinError(ctypes.get_last_error())
-                ace = ctypes.cast(
-                    ace_pointer, ctypes.POINTER(_AccessAllowedAce)
-                ).contents
-                if ace.AceType != _ACCESS_ALLOWED_ACE_TYPE or not ace.AceFlags & 0x10:
-                    raise OSError("released R4 ACL contains an explicit or unsafe entry")
+                for index in range(information.AceCount):
+                    ace_pointer = wintypes.LPVOID()
+                    if not _get_ace(
+                        dacl, index, ctypes.byref(ace_pointer)
+                    ) or not ace_pointer.value:
+                        raise ctypes.WinError(ctypes.get_last_error())
+                    ace = ctypes.cast(
+                        ace_pointer, ctypes.POINTER(_AccessAllowedAce)
+                    ).contents
+                    ace_sid = wintypes.LPVOID(
+                        ace_pointer.value + _AccessAllowedAce.SidStart.offset
+                    )
+                    broad_principal = any(
+                        _is_well_known_sid(ace_sid, sid_type)
+                        for sid_type in (1, 17, 27)
+                    )
+                    system_or_admin = any(
+                        _is_well_known_sid(ace_sid, sid_type)
+                        for sid_type in (22, 26)
+                    )
+                    trusted = (
+                        _equal_sid(ace_sid, owner_sid)
+                        or system_or_admin
+                        or any(_equal_sid(ace_sid, sid) for sid in token_sids)
+                    )
+                    inherited_from_parent = False
+                    for parent_index in range(parent_information.AceCount):
+                        parent_ace_pointer = wintypes.LPVOID()
+                        if not _get_ace(
+                            parent_dacl,
+                            parent_index,
+                            ctypes.byref(parent_ace_pointer),
+                        ) or not parent_ace_pointer.value:
+                            raise ctypes.WinError(ctypes.get_last_error())
+                        parent_ace = ctypes.cast(
+                            parent_ace_pointer, ctypes.POINTER(_AccessAllowedAce)
+                        ).contents
+                        parent_sid = wintypes.LPVOID(
+                            parent_ace_pointer.value + _AccessAllowedAce.SidStart.offset
+                        )
+                        if (
+                            parent_ace.AceType == ace.AceType
+                            and parent_ace.Mask == ace.Mask
+                            and _equal_sid(parent_sid, ace_sid)
+                        ):
+                            inherited_from_parent = True
+                            break
+                    mask_allowed = ace.Mask in {
+                        _R4_RELEASED_MODIFY_MASK,
+                        _FILE_ALL_ACCESS,
+                    }
+                    if (
+                        ace.AceType != _ACCESS_ALLOWED_ACE_TYPE
+                        or ace.AceFlags != _R4_INHERITED_ACE_FLAGS
+                        or broad_principal
+                        or not (trusted or inherited_from_parent)
+                        or not mask_allowed
+                    ):
+                        raise OSError(
+                            "released R4 ACL contains an explicit or unsafe entry"
+                        )
         finally:
             if security_descriptor.value:
                 _local_free(security_descriptor)
+            if parent_security_descriptor.value:
+                _local_free(parent_security_descriptor)
 
     def _fchmod_windows_handle(handle: int, mode: int) -> None:
         duplicate = wintypes.HANDLE()
