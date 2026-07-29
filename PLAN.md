@@ -11,7 +11,8 @@
 | 6 | Complete | `/root/task6_feedback` | `/root/task5_review`: clean after fix round 3 | Primary implementation verification: 164 passed; 5 skipped; focused 24 passed; Ruff and diff-check clean. Final reviewer full runs encountered unrelated pre-existing Task 4 one-second timeout flakes that passed in isolation; no Task 6 regression found | `7a55808`, `c45d2da`, `4831d09`, `b8b54d6` |
 | 7 | Complete | `/root/task7_llm_context` | `/root/task7_review`: clean after fix round 1 | 177 passed; 5 skipped; focused 13 passed; Ruff and diff-check clean; deferred Minor: explicit primitive-root, undeclared-extra-field, and lowered contextual-limit parser tests | `9941c80`, `08b93a6` |
 | 8 | Complete | `/root/task8_agent_loop`, `/root/task8_fix4` | `/root/task8_review`: clean after fix round 4 | Pristine full suite: 264 passed; 6 skipped; focused 98 passed, 1 WinError-1314 alias skip; exact round-4 regression 3 passed; Ruff and diff-check clean; deferred Minor: constructor dependencies are not all protocols | `80d54ec`, `7712349`, `adc6777`, `c3b5c0a`, `3a50249`, `4c9ea1a` |
-| 9–13 | Not started | — | — | — | — |
+| 9 | Complete | Initial implementer identity unavailable; `/root/task9a_remediation` (Task 9A) | Task 9A clean after fix round 1; prior five-round breaker resolved by approved contract amendment | Focused 90 passed, 2 skipped; full 354 passed, 8 skipped; Ruff and diff-check clean | `66631d3`, `d6349b5`, `bc2b1c2`, `4f2fd8c`, `25a80e9`, `b593a49`, `6a2c885`, `4e4899b`, `964e818`, `9ab2f10` |
+| 10–13 | Not started | — | — | — | — |
 
 # PyQuality Harness Implementation Plan
 
@@ -723,7 +724,7 @@ git commit -m "feat: orchestrate bounded agent correction loop"
 - Consumes: `keyring` backend and audit metadata.
 - Produces: `CredentialService.set/status/get/clear`, `CredentialStatus`, `redact(value, secrets, sensitive_keys)`, and `AuditLogger.emit(event) -> None`.
 
-- [ ] **Step 1: Write failing credential lifecycle tests with an in-memory backend**
+- [x] **Step 1: Write failing credential lifecycle tests with an in-memory backend**
 
 ```python
 def test_credential_status_never_contains_secret(memory_keyring) -> None:
@@ -739,11 +740,11 @@ def test_credential_status_never_contains_secret(memory_keyring) -> None:
 Run: `pytest tests/security/test_credentials.py -v`
 Expected: FAIL because security service is absent.
 
-- [ ] **Step 2: Implement credential lifecycle and warned environment fallback**
+- [x] **Step 2: Implement credential lifecycle and warned environment fallback**
 
 Never expose a list or echo operation. `get` returns the key only to the provider callable. Detect unusable keyring backends; allow `PYQUALITY_API_KEY` only when explicitly selected and return a warning object stating process-visibility risk. Do not create `.env`.
 
-- [ ] **Step 3: Write failing recursive redaction and audit tests**
+- [x] **Step 3: Write failing recursive redaction and audit tests**
 
 ```python
 def test_redacts_nested_headers_urls_and_exception_text(tmp_path: Path) -> None:
@@ -763,11 +764,11 @@ def test_audit_log_omits_source_and_prompt_by_default(tmp_path: Path) -> None:
 Run: `pytest tests/security/test_redaction.py -v`
 Expected: FAIL until redaction and logging exist.
 
-- [ ] **Step 4: Implement centralized recursive redaction and JSONL audit logger**
+- [x] **Step 4: Implement centralized recursive redaction and JSONL audit logger**
 
 Redact secret values, authorization-like keys, URL query secrets, exception strings, prompt/model body keys, and bytes. Emit task ID, iteration, component, event type, duration, outcome, and approved metadata using one JSON object per line.
 
-- [ ] **Step 5: Verify and commit**
+- [x] **Step 5: Verify and commit**
 
 Run: `pytest tests/security -v && ruff check src tests`
 Expected: PASS.
@@ -776,6 +777,8 @@ Expected: PASS.
 git add src/pyquality/security.py tests/security
 git commit -m "feat: secure credentials and redact audit data"
 ```
+
+**Approved Task 9A security amendment:** Provider callback text over 4,096 UTF-8 bytes is rejected before return. Numeric-looking credentials outside the closed canonical domain whose accepted spellings fit within 4,096 bytes are rejected at `set`; accepted numeric equivalents share one identity while nonnumeric text remains exact. On Windows, new audit files are created atomically with a protected DACL owned by the process token's `TokenOwner`; existing files are opened exclusively and must already have that exact owner-only DACL, otherwise emission raises a typed sanitized failure without mutating the file or DACL. The prior Task 9 five-round breaker was resolved by `964e818` and the `TokenOwner` correction `9ab2f10`; final review was clean after Task 9A fix round 1. Verification: focused 90 passed, 2 skipped; full 354 passed, 8 skipped; Ruff and `git diff --check` clean. Frozen package: `.superpowers/sdd/2026-07-29-task-9a-security-contract/review-4e4899b..9ab2f10.diff`.
 
 ### Task 10: Application Service, CLI, and Local WebUI
 

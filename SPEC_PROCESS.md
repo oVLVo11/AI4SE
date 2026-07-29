@@ -74,3 +74,7 @@ Expected mismatches: no aggregate core-protocol constructor boundary; missing re
 ### Corrections Made
 
 Specification section 14 and the matching root `SPEC.md` now define the requested model/configuration contract, state-transition and round accounting, typed tool-result data, deterministic digest, approval/lease/drift/recovery rules, repository and dependency-injection interfaces, and pre-Task-9 redacted audit sink. The canonical plan and root `PLAN.md` add matching Task 1–8 consumption and production amendments. These corrections directly address the findings above; no product code was written.
+
+## 2026-07-29 Task 9A security contract amendment
+
+Task 9 reached the five-fix-round breaker with two unresolved boundary findings: numeric credential equivalence could cross the 4,096-byte provider-result limit, and Windows audit-file permissions were installed after creation rather than atomically. Human approval selected the fail-closed contract recorded in `docs/superpowers/plans/2026-07-29-task-9a-security-contract.md`: reject oversized callback text and out-of-domain numeric-looking credentials; create new Windows audit files atomically with the process-token `TokenOwner` as the sole protected-DACL principal; and exclusively open, verify, and never mutate existing audit files. Implementation commits `964e818` and `9ab2f10` resolved the breaker, including the review-found `TokenUser`/`TokenOwner` distinction. Final evidence was 90 passed/2 skipped focused, 354 passed/8 skipped full, with Ruff and diff checks clean.

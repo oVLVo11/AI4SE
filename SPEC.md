@@ -269,6 +269,10 @@ An environment variable is an explicit compatibility fallback with documented pr
 
 The public mock deployment never accepts or stores provider credentials.
 
+Task 9A makes the credential boundary closed under its 4,096-byte UTF-8 limit: provider callback text above that boundary is rejected before return, and numeric-looking credentials whose canonical equivalence class cannot remain within the accepted domain are rejected at `set`. Accepted integer, fixed-decimal, and exponent spellings share one bounded identity; nonnumeric credential text remains exact.
+
+On Windows, a new audit file is created with a protected owner-only DACL in the final `NtCreateFile` call, using the process token's `TokenOwner`. An existing audit file is opened exclusively and accepted only when its retained handle reports that exact owner-only protected DACL; otherwise logging fails with a typed sanitized error and does not mutate the file or its DACL.
+
 ## 9. Technology, Distribution, and Deployment
 
 - Python 3.12 for the harness and packaging.

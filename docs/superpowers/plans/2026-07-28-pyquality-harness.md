@@ -706,7 +706,7 @@ git commit -m "feat: orchestrate bounded agent correction loop"
 - Consumes: `keyring` backend and audit metadata.
 - Produces: `CredentialService.set/status/get/clear`, `CredentialStatus`, `redact(value, secrets, sensitive_keys)`, and `AuditLogger.emit(event) -> None`.
 
-- [ ] **Step 1: Write failing credential lifecycle tests with an in-memory backend**
+- [x] **Step 1: Write failing credential lifecycle tests with an in-memory backend**
 
 ```python
 def test_credential_status_never_contains_secret(memory_keyring) -> None:
@@ -722,11 +722,11 @@ def test_credential_status_never_contains_secret(memory_keyring) -> None:
 Run: `pytest tests/security/test_credentials.py -v`
 Expected: FAIL because security service is absent.
 
-- [ ] **Step 2: Implement credential lifecycle and warned environment fallback**
+- [x] **Step 2: Implement credential lifecycle and warned environment fallback**
 
 Never expose a list or echo operation. `get` returns the key only to the provider callable. Detect unusable keyring backends; allow `PYQUALITY_API_KEY` only when explicitly selected and return a warning object stating process-visibility risk. Do not create `.env`.
 
-- [ ] **Step 3: Write failing recursive redaction and audit tests**
+- [x] **Step 3: Write failing recursive redaction and audit tests**
 
 ```python
 def test_redacts_nested_headers_urls_and_exception_text(tmp_path: Path) -> None:
@@ -746,11 +746,11 @@ def test_audit_log_omits_source_and_prompt_by_default(tmp_path: Path) -> None:
 Run: `pytest tests/security/test_redaction.py -v`
 Expected: FAIL until redaction and logging exist.
 
-- [ ] **Step 4: Implement centralized recursive redaction and JSONL audit logger**
+- [x] **Step 4: Implement centralized recursive redaction and JSONL audit logger**
 
 Redact secret values, authorization-like keys, URL query secrets, exception strings, prompt/model body keys, and bytes. Emit task ID, iteration, component, event type, duration, outcome, and approved metadata using one JSON object per line.
 
-- [ ] **Step 5: Verify and commit**
+- [x] **Step 5: Verify and commit**
 
 Run: `pytest tests/security -v && ruff check src tests`
 Expected: PASS.
@@ -759,6 +759,8 @@ Expected: PASS.
 git add src/pyquality/security.py tests/security
 git commit -m "feat: secure credentials and redact audit data"
 ```
+
+**Approved Task 9A security amendment:** Provider callback text over 4,096 UTF-8 bytes is rejected before return. Numeric-looking credentials outside the closed canonical domain whose accepted spellings fit within 4,096 bytes are rejected at `set`; accepted numeric equivalents share one identity while nonnumeric text remains exact. On Windows, new audit files are created atomically with a protected DACL owned by the process token's `TokenOwner`; existing files are opened exclusively and must already have that exact owner-only DACL, otherwise emission raises a typed sanitized failure without mutating the file or DACL. The prior Task 9 five-round breaker was resolved by `964e818` and the `TokenOwner` correction `9ab2f10`; final review was clean after Task 9A fix round 1. Verification: focused 90 passed, 2 skipped; full 354 passed, 8 skipped; Ruff and `git diff --check` clean. Frozen package: `.superpowers/sdd/2026-07-29-task-9a-security-contract/review-4e4899b..9ab2f10.diff`.
 
 ### Task 10: Application Service, CLI, and Local WebUI
 
