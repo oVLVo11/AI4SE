@@ -12,7 +12,8 @@
 | 7 | Complete | `/root/task7_llm_context` | `/root/task7_review`: clean after fix round 1 | 177 passed; 5 skipped; focused 13 passed; Ruff and diff-check clean; deferred Minor: explicit primitive-root, undeclared-extra-field, and lowered contextual-limit parser tests | `9941c80`, `08b93a6` |
 | 8 | Complete | `/root/task8_agent_loop`, `/root/task8_fix4` | `/root/task8_review`: clean after fix round 4 | Pristine full suite: 264 passed; 6 skipped; focused 98 passed, 1 WinError-1314 alias skip; exact round-4 regression 3 passed; Ruff and diff-check clean; deferred Minor: constructor dependencies are not all protocols | `80d54ec`, `7712349`, `adc6777`, `c3b5c0a`, `3a50249`, `4c9ea1a` |
 | 9 | Complete | Initial implementer identity unavailable; `/root/task9a_remediation` (Task 9A) | Task 9A clean after fix round 1; prior five-round breaker resolved by approved contract amendment | Focused 90 passed, 2 skipped; full 354 passed, 8 skipped; Ruff and diff-check clean | `66631d3`, `d6349b5`, `bc2b1c2`, `4f2fd8c`, `25a80e9`, `b593a49`, `6a2c885`, `4e4899b`, `964e818`, `9ab2f10` |
-| 10–13 | Not started | — | — | — | — |
+| 10 | Complete | Initial implementer and remediation identities unavailable after context compaction | Independent Task 10A review clean after fix round 2; prior five-round breaker resolved by approved lifecycle amendment | Affected 157 passed; pristine full 460 passed, 8 skipped; Ruff and cumulative diff-check clean | `49072fe`, `65f26c2`, `88993f7`, `9fb90d0`, `67f4e39`, `3b3859f`, `f0c5fa4`, `71efb7c`, `0a4a15c`, `eb7afd3`, `6e4b44e` |
+| 11–13 | Not started | — | — | — | — |
 
 # PyQuality Harness Implementation Plan
 
