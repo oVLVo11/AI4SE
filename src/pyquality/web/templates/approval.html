@@ -1,0 +1,9 @@
+<section>
+<h2>Waiting for approval</h2>
+<form method="post" action="/approvals/{{ task.pending_approval_id }}/approve">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button>Approve</button>
+</form>
+<form method="post" action="/approvals/{{ task.pending_approval_id }}/reject">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button>Reject</button>
+</form>
+</section>

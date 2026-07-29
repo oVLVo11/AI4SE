@@ -1,0 +1,8 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>PyQuality Harness</title></head>
+<body>
+<nav><a href="/tasks/new">New task</a>{% if mode == "local" %} <a href="/settings">Settings</a>{% endif %}</nav>
+<main>{% block content %}{% endblock %}</main>
+</body>
+</html>

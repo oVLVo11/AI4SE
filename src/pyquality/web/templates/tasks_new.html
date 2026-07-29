@@ -1,0 +1,16 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>New task</h1>
+{% if error %}<p role="alert">{{ error }}</p>{% endif %}
+<form method="post" action="/tasks">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  {% if mode == "public_mock" %}
+  <input type="hidden" name="scenario" value="{{ bundled_scenario }}">
+  <button type="submit">Run bundled scenario</button>
+  {% else %}
+  <label>Repository <input name="repo_path" required></label>
+  <label>Request <textarea name="request" required></textarea></label>
+  <button type="submit">Create</button>
+  {% endif %}
+</form>
+{% endblock %}
