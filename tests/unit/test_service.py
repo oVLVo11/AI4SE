@@ -1354,6 +1354,7 @@ def test_export_audit_returns_only_redacted_structured_events(
     audit.write_text(
         json.dumps(
             {
+                "event_id": "a" * 64,
                 "task_id": "task-1",
                 "iteration": None,
                 "component": "loop",
@@ -1372,6 +1373,7 @@ def test_export_audit_returns_only_redacted_structured_events(
 
     assert events == (
         AuditEvent(
+            event_id="a" * 64,
             task_id="task-1",
             component="loop",
             event_type="transition",
@@ -1388,6 +1390,7 @@ def test_export_audit_recursively_redacts_nested_auth_urls_and_known_secrets(
     audit.write_text(
         json.dumps(
             {
+                "event_id": "b" * 64,
                 "task_id": "task-1",
                 "iteration": None,
                 "component": "loop",

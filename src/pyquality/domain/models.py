@@ -302,6 +302,7 @@ class ApprovalDecision(StrEnum):
 
 
 class AuditEvent(PublicModel):
+    event_id: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
     event_type: str = Field(min_length=1)
     metadata: dict[str, JsonValue] = Field(default_factory=dict)
     task_id: str | None = None

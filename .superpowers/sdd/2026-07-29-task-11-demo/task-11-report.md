@@ -96,3 +96,101 @@ terminal cleanup, and approved candidate bound to the tool/approval digest rathe
 than the actual `QualityReport` digest). On the corrected branch the exact three
 tests passed. Fresh final verification reported 487 passed, 8 environment skips;
 Ruff and `git diff --check` passed.
+
+## Formal review round 2 remediation (round-3 takeover)
+
+The original round-3 agent exhausted its context after starting the fix. The takeover
+preserved every inherited working-tree edit, reconstructed the frozen cumulative review
+range `b8f2fe2..5ad427a`, and completed the remaining findings under the required commit
+subject `fix: recover finish evidence and audit outbox`. Root course documents and
+reviewer-owned files were not modified.
+
+The binding findings were:
+
+- a passing approved action whose approval already says `completed` must repair a missing
+  candidate from the persisted verifier transition, consume that intent exactly once, and
+  still require a distinct final verifier after a later `finish`;
+- `quality_candidate_ready`, `finish_verification`, and `task_terminal` evidence must be
+  committed atomically with the lifecycle state it describes, survive sink failure and
+  restart, and be drained before a terminal fast-return;
+- sink success followed by acknowledgement failure must replay the same stable ID without
+  creating a second observable JSONL record;
+- IDs, durable payloads, delivery batches, scan memory, metadata, and recovery work must
+  remain typed, bounded, ordered, and redacted.
+
+### Round-3 RED/GREEN evidence
+
+1. The inherited model RED required every production `AuditEvent` to carry a 64-character
+   lowercase hexadecimal `event_id`. On takeover the model slice was GREEN while the
+   approval recovery slice still failed because loop producers had not propagated the new
+   required field.
+2. The first storage RED cluster failed collection because `AuditOutboxRecord` and outbox
+   APIs did not exist. GREEN added ordered reopen-durable rows and atomic enqueue to
+   candidate, iteration, approval-completion, and terminal transactions. Injecting an
+   enqueue failure proves the candidate, iteration, terminal result, approval completion,
+   and events roll back together. A separate RED showed a 20,000-byte event was accepted;
+   GREEN rejects any durable event over 16,384 bytes before commit.
+3. `test_audit_logger_replay_of_same_event_id_is_observable_once` was RED with two JSONL
+   lines. GREEN performs recovery, exact-ID detection, append, and `fsync` under the same
+   descriptor lock, so a replay is a no-op.
+4. The two loop crash tests were RED with missing-ID validation errors. GREEN proves
+   commit -> sink failure -> restart drains candidate, finish, and terminal evidence in
+   order before returning the saved terminal result, with zero new model/verifier calls.
+   It also proves sink success -> repository-mark failure reuses all three persisted IDs
+   and leaves each event observable once.
+5. The completed-approval recovery regression now leaves the approval truly `completed`,
+   removes only its candidate, closes and reopens SQLite, repairs the candidate while
+   consuming the saved verifier intent, and then runs a distinct final verifier. The
+   dispatcher remains exact-once and the verifier call count is two.
+6. Final self-review found that delivered rows were only timestamped and would accumulate.
+   `python -m pytest tests/unit/test_storage.py::test_delivered_audit_outbox_rows_are_pruned_and_reack_is_harmless -q -p no:cacheprovider --basetemp "$env:TEMP\\pyquality-task11-r3-prune-red"`
+   failed with `retained_rows == 1`. GREEN physically deletes the oldest row after sink
+   acknowledgement, treats acknowledgement replay as harmless, and retains only pending
+   recovery work. The three focused ordering/pruning tests then passed.
+7. Final scan review found that the bounded byte-substring search could mistake a nested
+   `event_id` in an oversized legacy line for a top-level ID. The focused RED command
+   `python -m pytest tests/security/test_redaction.py::test_audit_id_scan_ignores_nested_id_in_oversized_legacy_record tests/security/test_redaction.py::test_audit_id_scan_detects_top_level_id_across_read_boundary -q -p no:cacheprovider --basetemp "$env:TEMP\\pyquality-task11-r3-audit-scan-red2"`
+   failed the nested-ID case. GREEN parses complete JSONL records with a 16,384-byte record
+   buffer, skips malformed/oversized records, reads only 64 KiB at a time, and still finds
+   a valid top-level ID spanning two reads; the replay plus both boundary tests passed 3/3.
+
+### Round-3 protocol and bounds
+
+- The loop creates each critical event once before commit. SQLite serializes it in the
+  same transaction as the candidate/finish/terminal state, keyed by a unique persisted
+  64-character lowercase hexadecimal ID and ordered by an autoincrement sequence.
+- Delivery reads a validated batch of 1-128 records and drains one oldest record at a
+  time. Sink failure or mark failure leaves that row pending. Successful acknowledgement
+  deletes it, preventing delivered tombstone growth; a permanent sink outage necessarily
+  retains only the still-undelivered recovery evidence.
+- Every task entry drains the global oldest pending event before reading terminal state.
+  The JSONL sink uses its existing hardened owner-only/no-follow descriptor and
+  cross-process lock; recovery, bounded exact top-level-ID scan, append, and `fsync` share
+  that lock. Thus a crash after append but before SQLite acknowledgement safely replays the
+  stable ID without a duplicate line.
+- Production construction was exhaustively checked: the loop is the only producer and
+  supplies a fresh stable ID, while service export is the only decoder and restores the
+  persisted ID. The durable event envelope is capped at 16,384 bytes and passes through the
+  centralized audit metadata allowlist; no prompt, source body, secret, or absolute path is
+  added to the outbox.
+
+### Round-3 modified files
+
+- Runtime: `src/pyquality/domain/models.py`, `src/pyquality/storage/sqlite.py`,
+  `src/pyquality/loop.py`, `src/pyquality/security.py`, `src/pyquality/service.py`, and
+  `src/pyquality/demo.py`.
+- Tests: `tests/unit/test_models.py`, `tests/unit/test_storage.py`,
+  `tests/unit/test_service.py`, `tests/loop/conftest.py`,
+  `tests/loop/test_agent_loop.py`, `tests/loop/test_approval_resume.py`,
+  `tests/security/test_redaction.py`, and `tests/component/test_audit_process.py`.
+
+### Round-3 final verification
+
+- `python -m pytest -p no:cacheprovider --basetemp "$env:TEMP\\pyquality-task11-r3-final-full"`:
+  499 passed, 8 skipped in 37.07 seconds.
+- `python -m ruff check src tests examples`: all checks passed.
+- `git diff --check`: exit 0; only the repository's existing LF/CRLF conversion warnings
+  were printed.
+- Focused storage ordering/pruning, JSONL replay/scan boundaries, loop restart repair,
+  completed-approval cold recovery, service export, security, component, and e2e slices
+  were also GREEN before the pristine full run.

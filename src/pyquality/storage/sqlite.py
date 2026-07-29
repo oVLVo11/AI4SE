@@ -21,6 +21,7 @@ from pyquality.domain.models import (
     MAX_ACTION_ARGUMENTS_BYTES,
     MAX_CONFIG_PATTERN_BYTES,
     ApprovalDecision,
+    AuditEvent,
     Finding,
     PolicyDecision,
     PolicyOutcome,
@@ -94,6 +95,13 @@ class GreenCandidate(_StorageRecord):
         if sum(len(path.encode("utf-8")) for path in self.changed_paths) > 16_384:
             raise ValueError("changed paths exceed aggregate UTF-8 bound")
         return self
+
+
+class AuditOutboxRecord(_StorageRecord):
+    """One durable audit event in repository commit order."""
+
+    sequence: int = Field(ge=1)
+    event: AuditEvent
 
 
 class IterationRecord(_StorageRecord):
@@ -185,6 +193,7 @@ _RESERVED_STATUSES = frozenset(
 )
 _PROJECT_RESERVATION_MIGRATION = "project-reservations-v1"
 _GREEN_CANDIDATE_MIGRATION = "green-candidates-v2"
+_MAX_AUDIT_OUTBOX_EVENT_BYTES = 16_384
 _ALLOWED_TRANSITIONS = {
     TaskStatus.CREATED: frozenset({TaskStatus.RUNNING}),
     TaskStatus.RUNNING: frozenset({TaskStatus.WAITING_APPROVAL, *_TERMINAL_STATUSES}),
@@ -407,6 +416,7 @@ class SQLiteTaskRepository:
         green_candidate: GreenCandidate | None = None,
         clear_green_candidate: bool = False,
         terminal_result: TaskResult | None = None,
+        audit_events: tuple[AuditEvent, ...] = (),
     ) -> IterationRecord:
         iteration_id = _new_id()
         created_at = _utc_now()
@@ -417,6 +427,7 @@ class SQLiteTaskRepository:
                 green_candidate is not None
                 or clear_green_candidate
                 or terminal_result is not None
+                or bool(audit_events)
             )
             if source_intent_ids or lifecycle_write:
                 self._require_running_lease(connection, task_id, owner_token)
@@ -493,6 +504,7 @@ class SQLiteTaskRepository:
                     (task_id, owner_token),
                 )
                 self._release_or_transfer_project_reservation(connection, task_id)
+            self._enqueue_audit_events(connection, task_id, audit_events)
         if terminal_result is not None:
             self._release_local_lease(owner_token)
         return IterationRecord(
@@ -517,6 +529,7 @@ class SQLiteTaskRepository:
         result: TaskResult | None = None,
         *,
         owner_token: str | None = None,
+        audit_events: tuple[AuditEvent, ...] = (),
     ) -> bool:
         release_local = False
         with self._transaction() as connection:
@@ -525,6 +538,8 @@ class SQLiteTaskRepository:
                 return False
             if expected is TaskStatus.RUNNING:
                 self._require_running_lease(connection, task_id, owner_token)
+            elif audit_events:
+                raise StorageStateError("audit events require a running lifecycle transition")
             if new not in _ALLOWED_TRANSITIONS.get(expected, frozenset()):
                 raise StorageStateError(f"illegal task transition: {expected.value} -> {new.value}")
             if result is not None and result.status is not new:
@@ -553,12 +568,18 @@ class SQLiteTaskRepository:
                 self._release_or_transfer_project_reservation(
                     connection, task_id
                 )
+            self._enqueue_audit_events(connection, task_id, audit_events)
         if release_local:
             self._release_local_lease(owner_token)
         return True
 
     def save_green_candidate(
-        self, candidate: GreenCandidate, *, owner_token: str
+        self,
+        candidate: GreenCandidate,
+        *,
+        owner_token: str,
+        source_intent_ids: tuple[str, ...] = (),
+        audit_events: tuple[AuditEvent, ...] = (),
     ) -> None:
         """Atomically replace the bounded green evidence for one task."""
         with self._transaction() as connection:
@@ -574,6 +595,12 @@ class SQLiteTaskRepository:
             if iteration is None or iteration["quality_outcome"] != "passed":
                 raise StorageStateError("green candidate requires a passing task iteration")
             self._upsert_green_candidate(connection, candidate)
+            self._consume_transition_intents(
+                connection, candidate.task_id, source_intent_ids
+            )
+            self._enqueue_audit_events(
+                connection, candidate.task_id, audit_events
+            )
 
     @staticmethod
     def _upsert_green_candidate(
@@ -641,6 +668,7 @@ class SQLiteTaskRepository:
         owner_token: str | None = None,
         green_candidate: GreenCandidate | None = None,
         approval_id: str | None = None,
+        audit_events: tuple[AuditEvent, ...] = (),
     ) -> IterationRecord:
         _require_digest(tool_result_digest, "tool_result_digest")
         if fingerprint is not None:
@@ -695,6 +723,7 @@ class SQLiteTaskRepository:
                            WHERE id = ?""",
                         (tool_result_digest, _dump_datetime(_utc_now()), approval_id),
                     )
+                self._enqueue_audit_events(connection, task_id, audit_events)
                 return _iteration_from_row(row)
             connection.execute(
                 """UPDATE iterations
@@ -740,7 +769,54 @@ class SQLiteTaskRepository:
                        result_digest = ?, executed_at = ? WHERE id = ?""",
                     (tool_result_digest, _dump_datetime(_utc_now()), approval_id),
                 )
+            self._enqueue_audit_events(connection, task_id, audit_events)
         return self._iteration_by_id(iteration_id)
+
+    def pending_audit_events(self, *, limit: int = 1) -> tuple[AuditOutboxRecord, ...]:
+        """Return the oldest bounded batch of undelivered audit events."""
+        if type(limit) is not int or not 1 <= limit <= 128:
+            raise StorageStateError("audit outbox limit must be between 1 and 128")
+        with self._read_transaction() as connection:
+            rows = tuple(
+                connection.execute(
+                    """SELECT sequence, event_json FROM audit_outbox
+                       WHERE delivered_at IS NULL ORDER BY sequence LIMIT ?""",
+                    (limit,),
+                )
+            )
+        return tuple(
+            AuditOutboxRecord(
+                sequence=row["sequence"],
+                event=AuditEvent.model_validate(json.loads(row["event_json"])),
+            )
+            for row in rows
+        )
+
+    def mark_audit_event_delivered(self, event_id: str) -> None:
+        """Remove only the oldest pending event; exact acknowledgement replays are harmless."""
+        if re.fullmatch(r"[0-9a-f]{64}", event_id) is None:
+            raise StorageStateError("audit event id must be lowercase SHA-256 hex")
+        with self._transaction() as connection:
+            target = connection.execute(
+                "SELECT sequence, delivered_at FROM audit_outbox WHERE event_id = ?",
+                (event_id,),
+            ).fetchone()
+            if target is None:
+                return
+            if target["delivered_at"] is not None:
+                connection.execute(
+                    "DELETE FROM audit_outbox WHERE sequence = ?", (target["sequence"],)
+                )
+                return
+            oldest = connection.execute(
+                """SELECT sequence, event_id FROM audit_outbox
+                   WHERE delivered_at IS NULL ORDER BY sequence LIMIT 1"""
+            ).fetchone()
+            if oldest is None or oldest["event_id"] != event_id:
+                raise StorageStateError("audit event is not the oldest pending event")
+            connection.execute(
+                "DELETE FROM audit_outbox WHERE sequence = ?", (target["sequence"],)
+            )
 
     def consume_intents_for_completed_iteration(
         self,
@@ -1869,6 +1945,14 @@ class SQLiteTaskRepository:
                 event_json TEXT NOT NULL,
                 created_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS audit_outbox (
+                sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_id TEXT NOT NULL UNIQUE,
+                task_id TEXT NOT NULL REFERENCES tasks(id),
+                event_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                delivered_at TEXT
+            );
             CREATE TABLE IF NOT EXISTS project_leases (
                 project_id TEXT PRIMARY KEY REFERENCES projects(id),
                 task_id TEXT NOT NULL UNIQUE REFERENCES tasks(id),
@@ -2198,6 +2282,30 @@ class SQLiteTaskRepository:
             connection.execute(
                 "UPDATE transition_intents SET consumed_at = ? WHERE id = ?",
                 (consumed_at, intent_id),
+            )
+
+    @staticmethod
+    def _enqueue_audit_events(
+        connection: sqlite3.Connection,
+        task_id: str,
+        events: tuple[AuditEvent, ...],
+    ) -> None:
+        for event in events:
+            if event.task_id != task_id:
+                raise StorageStateError("audit event belongs to another task")
+            event_json = _canonical_json(event.model_dump(mode="json"))
+            if len(event_json.encode("utf-8")) > _MAX_AUDIT_OUTBOX_EVENT_BYTES:
+                raise StorageStateError("audit event exceeds durable outbox bound")
+            connection.execute(
+                """INSERT INTO audit_outbox
+                   (event_id, task_id, event_json, created_at, delivered_at)
+                   VALUES (?, ?, ?, ?, NULL)""",
+                (
+                    event.event_id,
+                    task_id,
+                    event_json,
+                    _dump_datetime(event.created_at or _utc_now()),
+                ),
             )
 
 

@@ -635,7 +635,7 @@ class AuditLogger:
         failed = False
         try:
             encoded = self._encode(event)
-            self._append(encoded)
+            self._append(encoded, event.event_id)
         except Exception:  # noqa: BLE001
             failed = True
         if failed:
@@ -654,6 +654,7 @@ class AuditLogger:
     def _record(self, event: AuditEvent) -> dict[str, object]:
         metadata, duration, outcome = _approved_metadata(event.metadata, self._secrets)
         return {
+            "event_id": event.event_id,
             "task_id": _audit_scalar(event.task_id, self._secrets, 1_024),
             "iteration": _audit_scalar(event.iteration_id, self._secrets, 1_024),
             "component": _audit_scalar(event.component, self._secrets, 1_024),
@@ -663,11 +664,13 @@ class AuditLogger:
             "metadata": metadata,
         }
 
-    def _append(self, encoded: bytes) -> None:
+    def _append(self, encoded: bytes, event_id: str) -> None:
         descriptor = _open_audit(self._path)
         try:
             with _audit_file_lock(descriptor):
                 _recover_tail(descriptor)
+                if _audit_contains_event_id(descriptor, event_id):
+                    return
                 _write_all(descriptor, encoded)
                 os.fsync(descriptor)
         finally:
@@ -806,6 +809,44 @@ def _recover_tail(descriptor: int) -> None:
                 os.ftruncate(descriptor, position + index + 1)
             return
     os.ftruncate(descriptor, 0)
+
+
+def _audit_contains_event_id(descriptor: int, event_id: str) -> bool:
+    """Scan locked JSONL records with bounded memory for an exact top-level ID."""
+    record = bytearray()
+    oversized = False
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    while True:
+        chunk = os.read(descriptor, 64 * 1_024)
+        if not chunk:
+            return False
+        offset = 0
+        while offset < len(chunk):
+            newline = chunk.find(b"\n", offset)
+            terminated = newline >= 0
+            end = newline if terminated else len(chunk)
+            fragment = chunk[offset:end]
+            if not oversized:
+                if len(record) + len(fragment) <= _MAX_RECORD_BYTES:
+                    record.extend(fragment)
+                else:
+                    record.clear()
+                    oversized = True
+            if not terminated:
+                break
+            if not oversized and _audit_record_has_event_id(record, event_id):
+                return True
+            record.clear()
+            oversized = False
+            offset = newline + 1
+
+
+def _audit_record_has_event_id(record: bytearray, event_id: str) -> bool:
+    try:
+        payload = json.loads(record)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    return isinstance(payload, dict) and payload.get("event_id") == event_id
 
 
 if os.name == "nt":

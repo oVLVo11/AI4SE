@@ -6,11 +6,19 @@ import os
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from urllib.parse import unquote
+from uuid import uuid4
 
 import pytest
+from pydantic import Field
 
-from pyquality.domain.models import AuditEvent
+from pyquality.domain.models import AuditEvent as _AuditEvent
 from pyquality.security import AuditLogger, AuditWriteError, redact
+
+
+class AuditEvent(_AuditEvent):
+    """Test fixture that supplies a fresh valid ID unless a replay ID is explicit."""
+
+    event_id: str = Field(default_factory=lambda: uuid4().hex + uuid4().hex)
 
 
 def _set_process_environment(root: str) -> None:
@@ -401,6 +409,77 @@ def test_audit_log_omits_source_and_prompt_by_default(tmp_path: Path) -> None:
 
     text = (tmp_path / "audit.jsonl").read_text(encoding="utf-8")
     assert "source body" not in text and "sk-secret" not in text
+
+
+def test_audit_logger_replay_of_same_event_id_is_observable_once(
+    tmp_path: Path,
+) -> None:
+    """A repository mark failure must not duplicate an already-appended JSONL event."""
+    path = tmp_path / "audit.jsonl"
+    event = AuditEvent(
+        event_id="a" * 64,
+        event_type="task_terminal",
+        task_id="task-1",
+        component="agent_loop",
+        metadata={"status": "succeeded", "prompt": "source body"},
+    )
+
+    AuditLogger(path, secrets={"source body"}).emit(event)
+    AuditLogger(path, secrets={"source body"}).emit(event)
+
+    records = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    assert len(records) == 1
+    assert records[0]["event_id"] == event.event_id
+    assert "source body" not in json.dumps(records[0])
+
+
+def test_audit_id_scan_ignores_nested_id_in_oversized_legacy_record(
+    tmp_path: Path,
+) -> None:
+    """A bounded scan must not mistake an over-limit nested key for a top-level ID."""
+    path = tmp_path / "audit.jsonl"
+    event_id = "b" * 64
+    _prepare_existing_audit(
+        path,
+        b'{"metadata":{"padding":"'
+        + (b"x" * 20_000)
+        + b'","event_id":"'
+        + event_id.encode("ascii")
+        + b'"}}\n',
+    )
+    event = AuditEvent(
+        event_id=event_id,
+        event_type="task_terminal",
+        task_id="task-1",
+        component="agent_loop",
+        metadata={"status": "succeeded"},
+    )
+
+    AuditLogger(path).emit(event)
+
+    records = path.read_bytes().splitlines()
+    assert len(records) == 2
+    assert json.loads(records[-1])["event_id"] == event_id
+
+
+def test_audit_id_scan_detects_top_level_id_across_read_boundary(tmp_path: Path) -> None:
+    """Chunking must retain exact-once behavior when the bounded ID spans two reads."""
+    path = tmp_path / "audit.jsonl"
+    event = AuditEvent(
+        event_id="c" * 64,
+        event_type="task_terminal",
+        task_id="task-1",
+        component="agent_loop",
+        metadata={"status": "succeeded"},
+    )
+    logger = AuditLogger(path)
+    encoded = logger._encode(event)
+    initial = (b"x" * 65_529) + b"\n" + encoded
+    _prepare_existing_audit(path, initial)
+
+    logger.emit(event)
+
+    assert path.read_bytes() == initial
 
 
 def test_audit_log_accepts_only_allowlisted_metadata_and_normalizes_aliases(tmp_path: Path) -> None:

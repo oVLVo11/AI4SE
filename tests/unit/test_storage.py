@@ -9,6 +9,7 @@ import pytest
 
 from pyquality.domain.models import (
     ApprovalDecision,
+    AuditEvent,
     Finding,
     PolicyDecision,
     PolicyOutcome,
@@ -16,6 +17,7 @@ from pyquality.domain.models import (
     TaskStatus,
 )
 from pyquality.storage.sqlite import (
+    AuditOutboxRecord,
     GreenCandidate,
     LeaseRecoveryBlocked,
     ProjectReservationError,
@@ -23,6 +25,21 @@ from pyquality.storage.sqlite import (
     StorageStateError,
     TaskCreationConflictError,
 )
+
+
+def _audit_event(
+    task_id: str,
+    event_id: str,
+    event_type: str,
+    metadata: dict[str, str] | None = None,
+) -> AuditEvent:
+    return AuditEvent(
+        event_id=event_id,
+        event_type=event_type,
+        task_id=task_id,
+        component="agent_loop",
+        metadata=metadata or {},
+    )
 
 
 def _candidate(task_id: str, *, iteration: int = 1, suffix: str = "a") -> GreenCandidate:
@@ -198,6 +215,248 @@ def test_finish_iteration_and_terminal_result_rollback_together(
     assert snapshot.task.status is TaskStatus.RUNNING
     assert len(snapshot.iterations) == 1
     assert repo.green_candidate(task.id) == _candidate(task.id)
+
+
+def test_approved_candidate_and_audit_outbox_commit_atomically_in_order(
+    repo: SQLiteTaskRepository,
+) -> None:
+    """Losing the candidate event between commits would make approval recovery unauditable."""
+    task = repo.create_task("C:/work/approved-audit", "fix", round_limit=8)
+    _start(repo, task.id)
+    assert repo.acquire_project_lease(task.id, owner_token=OWNER_A)
+    iteration = repo.append_iteration(
+        task.id,
+        sequence=1,
+        context_digest="a" * 64,
+    )
+    approval = repo.record_approval(
+        task.id,
+        iteration.id,
+        '{"arguments":{"patch":"safe"},"kind":"apply_patch","rationale":"fix"}',
+        "b" * 64,
+        "c" * 64,
+    )
+    repo.decide_approval(approval.id, ApprovalDecision.APPROVE)
+    repo.mark_execution_intent(
+        approval.id,
+        expected_after_digests={"calculator.py": "d" * 64},
+        owner_token=OWNER_A,
+    )
+    candidate_event = _audit_event(
+        task.id,
+        "1" * 64,
+        "quality_candidate_ready",
+        {"digest": "e" * 64},
+    )
+
+    repo.complete_iteration_outcome(
+        task.id,
+        iteration.id,
+        tool_result_digest="f" * 64,
+        fingerprint=None,
+        relevant_digest="0" * 64,
+        quality_outcome="passed",
+        owner_token=OWNER_A,
+        green_candidate=_candidate(task.id),
+        approval_id=approval.id,
+        audit_events=(candidate_event,),
+    )
+
+    assert repo.green_candidate(task.id) == _candidate(task.id)
+    assert repo.pending_audit_events(limit=8) == (
+        AuditOutboxRecord(sequence=1, event=candidate_event),
+    )
+    assert repo.resume_snapshot(task.id).decided_approval.execution_state == "completed"
+
+
+def test_finish_terminal_events_are_durable_ordered_and_marked_by_event_id(
+    repo: SQLiteTaskRepository,
+) -> None:
+    """Out-of-order or volatile finish events cannot prove what terminal commit occurred."""
+    task = repo.create_task("C:/work/finish-audit", "fix", round_limit=8)
+    _start(repo, task.id)
+    assert repo.acquire_project_lease(task.id, owner_token=OWNER_A)
+    candidate_event = _audit_event(task.id, "1" * 64, "quality_candidate_ready")
+    repo.append_iteration(
+        task.id,
+        sequence=1,
+        context_digest="a" * 64,
+        quality_outcome="passed",
+        green_candidate=_candidate(task.id),
+        audit_events=(candidate_event,),
+        owner_token=OWNER_A,
+    )
+    finish_event = _audit_event(
+        task.id, "2" * 64, "finish_verification", {"outcome": "passed"}
+    )
+    terminal_event = _audit_event(
+        task.id, "3" * 64, "task_terminal", {"status": "succeeded"}
+    )
+    result = TaskResult(
+        task_id=task.id,
+        status=TaskStatus.SUCCEEDED,
+        iterations=2,
+        verification_summary="passed",
+    )
+
+    repo.append_iteration(
+        task.id,
+        sequence=2,
+        context_digest="b" * 64,
+        quality_outcome="passed",
+        terminal_result=result,
+        clear_green_candidate=True,
+        audit_events=(finish_event, terminal_event),
+        owner_token=OWNER_A,
+    )
+
+    assert tuple(record.event for record in repo.pending_audit_events(limit=8)) == (
+        candidate_event,
+        finish_event,
+        terminal_event,
+    )
+    repo.mark_audit_event_delivered(candidate_event.event_id)
+    assert tuple(record.event for record in repo.pending_audit_events(limit=8)) == (
+        finish_event,
+        terminal_event,
+    )
+
+
+def test_delivered_audit_outbox_rows_are_pruned_and_reack_is_harmless(
+    repo: SQLiteTaskRepository,
+) -> None:
+    """Delivered evidence belongs in the sink, not an ever-growing SQLite tombstone set."""
+    task = repo.create_task("C:/work/audit-prune", "fix", round_limit=8)
+    _start(repo, task.id)
+    assert repo.acquire_project_lease(task.id, owner_token=OWNER_A)
+    event = _audit_event(task.id, "5" * 64, "quality_candidate_ready")
+    repo.append_iteration(
+        task.id,
+        sequence=1,
+        context_digest="a" * 64,
+        audit_events=(event,),
+        owner_token=OWNER_A,
+    )
+
+    repo.mark_audit_event_delivered(event.event_id)
+    repo.mark_audit_event_delivered(event.event_id)
+
+    assert repo.pending_audit_events(limit=8) == ()
+    with repo._connection_lock:
+        retained_rows = repo._connection.execute(
+            "SELECT COUNT(*) FROM audit_outbox"
+        ).fetchone()[0]
+    assert retained_rows == 0
+
+
+def test_audit_outbox_survives_reopen_and_rejects_out_of_order_delivery(
+    tmp_path: Path,
+) -> None:
+    """A restart must observe the same oldest pending event before later lifecycle events."""
+    database = tmp_path / "audit-outbox.sqlite"
+    first = SQLiteTaskRepository(database)
+    task = first.create_task("C:/work/audit-reopen", "fix", round_limit=8)
+    _start(first, task.id)
+    assert first.acquire_project_lease(task.id, owner_token=OWNER_A)
+    first_event = _audit_event(task.id, "1" * 64, "quality_candidate_ready")
+    second_event = _audit_event(task.id, "2" * 64, "finish_verification")
+    first.append_iteration(
+        task.id,
+        sequence=1,
+        context_digest="a" * 64,
+        audit_events=(first_event, second_event),
+        owner_token=OWNER_A,
+    )
+    first.close()
+
+    reopened = SQLiteTaskRepository(database)
+    try:
+        assert tuple(record.event for record in reopened.pending_audit_events(limit=8)) == (
+            first_event,
+            second_event,
+        )
+        with pytest.raises(StorageStateError, match="oldest"):
+            reopened.mark_audit_event_delivered(second_event.event_id)
+        assert reopened.pending_audit_events(limit=1)[0].event == first_event
+    finally:
+        reopened.close()
+
+
+def test_audit_enqueue_failure_rolls_back_finish_candidate_and_iteration(
+    repo: SQLiteTaskRepository, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An outbox failure cannot publish terminal state without its ordered audit evidence."""
+    task = repo.create_task("C:/work/audit-rollback", "fix", round_limit=8)
+    _start(repo, task.id)
+    assert repo.acquire_project_lease(task.id, owner_token=OWNER_A)
+    repo.append_iteration(
+        task.id,
+        sequence=1,
+        context_digest="a" * 64,
+        quality_outcome="passed",
+        green_candidate=_candidate(task.id),
+        owner_token=OWNER_A,
+    )
+    result = TaskResult(
+        task_id=task.id,
+        status=TaskStatus.SUCCEEDED,
+        iterations=2,
+        verification_summary="passed",
+    )
+    original_enqueue = repo._enqueue_audit_events
+
+    def fail_after_enqueue(*args, **kwargs):
+        original_enqueue(*args, **kwargs)
+        raise RuntimeError("audit enqueue failed")
+
+    monkeypatch.setattr(repo, "_enqueue_audit_events", fail_after_enqueue)
+    with pytest.raises(RuntimeError, match="audit enqueue failed"):
+        repo.append_iteration(
+            task.id,
+            sequence=2,
+            context_digest="b" * 64,
+            quality_outcome="passed",
+            terminal_result=result,
+            clear_green_candidate=True,
+            audit_events=(
+                _audit_event(task.id, "2" * 64, "finish_verification"),
+                _audit_event(task.id, "3" * 64, "task_terminal"),
+            ),
+            owner_token=OWNER_A,
+        )
+
+    snapshot = repo.resume_snapshot(task.id)
+    assert snapshot.task.status is TaskStatus.RUNNING
+    assert len(snapshot.iterations) == 1
+    assert repo.green_candidate(task.id) == _candidate(task.id)
+    assert repo.pending_audit_events(limit=8) == ()
+
+
+def test_oversized_audit_event_is_rejected_before_durable_outbox_commit(
+    repo: SQLiteTaskRepository,
+) -> None:
+    """The retry outbox must not become a durable store for unbounded raw metadata."""
+    task = repo.create_task("C:/work/audit-bound", "fix", round_limit=8)
+    _start(repo, task.id)
+    assert repo.acquire_project_lease(task.id, owner_token=OWNER_A)
+    oversized = _audit_event(
+        task.id,
+        "4" * 64,
+        "quality_candidate_ready",
+        {"digest": "x" * 20_000},
+    )
+
+    with pytest.raises(StorageStateError, match="audit event exceeds"):
+        repo.append_iteration(
+            task.id,
+            sequence=1,
+            context_digest="a" * 64,
+            audit_events=(oversized,),
+            owner_token=OWNER_A,
+        )
+
+    assert repo.resume_snapshot(task.id).iterations == ()
+    assert repo.pending_audit_events(limit=8) == ()
 
 
 def test_r0_green_candidate_schema_migrates_valid_and_drops_oversized(

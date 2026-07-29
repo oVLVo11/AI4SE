@@ -68,6 +68,8 @@ class Clock(Protocol):
 
 
 class AuditSink(Protocol):
+    """A sink whose repeated delivery of one event ID is a no-op."""
+
     def emit(self, event: AuditEvent) -> None: ...
 
 
@@ -174,6 +176,7 @@ class AgentLoop:
         cycle_token = self._cycle_intents.set(())
         acquired = lease_acquired
         try:
+            self._drain_audit_outbox()
             snapshot = self._repository.resume_snapshot(task_id)
             if snapshot.task.status in _TERMINAL:
                 return self._saved_result(snapshot)
@@ -439,6 +442,12 @@ class AgentLoop:
                 terminal = self._make_result(
                     task_id, TaskStatus.BUDGET_EXHAUSTED, "Deadline exhausted."
                 ).model_copy(update={"iterations": sequence})
+                finish_event = self._make_audit_event(
+                    "finish_verification", task_id, {"outcome": "late"}
+                )
+                terminal_event = self._make_audit_event(
+                    "task_terminal", task_id, {"status": terminal.status.value}
+                )
                 self._append_cycle(
                     task_id,
                     sequence,
@@ -448,11 +457,9 @@ class AgentLoop:
                     report=quality,
                     clear_green_candidate=True,
                     terminal_result=terminal,
+                    audit_events=(finish_event, terminal_event),
                 )
-                self._audit_after_commit(
-                    "finish_verification", task_id, {"outcome": "late"}
-                )
-                self._audit_after_commit("task_terminal", task_id, {"status": terminal.status.value})
+                self._drain_audit_outbox()
                 return terminal
             if post_verifier.repository_snapshot_digest != candidate.repository_digest:
                 return self._reject_finish(
@@ -854,9 +861,6 @@ class AgentLoop:
             candidate = self._repository.green_candidate(task_id)
             assert candidate is not None
             self._feedback[task_id] = self._candidate_feedback(task_id, candidate)
-            self._audit_after_commit(
-                "quality_candidate_ready", task_id, {"digest": candidate.report_digest}
-            )
             return None
         self._repository.clear_green_candidate(task_id, owner_token=self._owner())
         snapshot = self._repository.resume_snapshot(task_id)
@@ -898,11 +902,17 @@ class AgentLoop:
             summary="Full pytest and Ruff passed; finish is permitted.",
             changed_paths=tool_result.changed_paths,
         )
-        self._repository.save_green_candidate(candidate, owner_token=self._owner())
-        self._feedback[task_id] = self._candidate_feedback(task_id, candidate)
-        self._audit_after_commit(
+        candidate_event = self._make_audit_event(
             "quality_candidate_ready", task_id, {"digest": candidate.report_digest}
         )
+        self._repository.save_green_candidate(
+            candidate,
+            owner_token=self._owner(),
+            source_intent_ids=self._cycle_intents.get(),
+            audit_events=(candidate_event,),
+        )
+        self._drain_audit_outbox()
+        self._feedback[task_id] = self._candidate_feedback(task_id, candidate)
         return None
 
     def _persist_approved_outcome(
@@ -939,6 +949,17 @@ class AgentLoop:
                 summary="Full pytest and Ruff passed; finish is permitted.",
                 changed_paths=tool_result.changed_paths,
             )
+        audit_events = (
+            (
+                self._make_audit_event(
+                    "quality_candidate_ready",
+                    task_id,
+                    {"digest": candidate.report_digest},
+                ),
+            )
+            if candidate is not None
+            else ()
+        )
         self._repository.complete_iteration_outcome(
             task_id,
             approval.iteration_id,
@@ -951,7 +972,9 @@ class AgentLoop:
             owner_token=self._owner(),
             green_candidate=candidate,
             approval_id=approval.id,
+            audit_events=audit_events,
         )
+        self._drain_audit_outbox()
 
     def _persist_approved_tool_only(
         self,
@@ -1060,6 +1083,30 @@ class AgentLoop:
                 verification_summary="Full verification passed.",
                 changed_paths=tuple(sorted(self._changed(task_id))),
             )
+        audit_events: tuple[AuditEvent, ...] = ()
+        if finish:
+            finish_event = self._make_audit_event(
+                "finish_verification",
+                task_id,
+                {"outcome": "passed" if report.succeeded else "failed"},
+            )
+            audit_events = (finish_event,)
+            if terminal_result is not None:
+                audit_events += (
+                    self._make_audit_event(
+                        "task_terminal",
+                        task_id,
+                        {"status": terminal_result.status.value},
+                    ),
+                )
+        elif candidate is not None:
+            audit_events = (
+                self._make_audit_event(
+                    "quality_candidate_ready",
+                    task_id,
+                    {"digest": candidate.report_digest},
+                ),
+            )
         self._append_cycle(
             task_id,
             sequence,
@@ -1073,19 +1120,12 @@ class AgentLoop:
             green_candidate=candidate,
             clear_green_candidate=not report.succeeded or finish,
             terminal_result=terminal_result,
+            audit_events=audit_events,
         )
-        if finish:
-            self._audit_after_commit(
-                "finish_verification",
-                task_id,
-                {"outcome": "passed" if report.succeeded else "failed"},
-            )
-            if report.succeeded:
-                result = self._saved_result(self._repository.resume_snapshot(task_id))
-                self._audit_after_commit(
-                    "task_terminal", task_id, {"status": result.status.value}
-                )
-                return result
+        self._drain_audit_outbox()
+        if finish and report.succeeded:
+            result = self._saved_result(self._repository.resume_snapshot(task_id))
+            return result
 
         blocked = any(
             finding.category in {"missing_tool_dependency", "infrastructure"}
@@ -1105,11 +1145,6 @@ class AgentLoop:
         if report.succeeded:
             assert candidate is not None
             self._feedback[task_id] = self._candidate_feedback(task_id, candidate)
-            self._audit_after_commit(
-                "quality_candidate_ready",
-                task_id,
-                {"digest": candidate.report_digest},
-            )
             return None
         if report.findings:
             self._feedback[task_id] = self._compose(report.findings)
@@ -1251,6 +1286,7 @@ class AgentLoop:
         green_candidate: GreenCandidate | None = None,
         clear_green_candidate: bool = False,
         terminal_result: TaskResult | None = None,
+        audit_events: tuple[AuditEvent, ...] = (),
     ):
         persisted_findings = report.findings if report is not None else findings
         if fingerprint is None and persisted_findings:
@@ -1271,6 +1307,7 @@ class AgentLoop:
             green_candidate=green_candidate,
             clear_green_candidate=clear_green_candidate,
             terminal_result=terminal_result,
+            audit_events=audit_events,
         )
 
     def _stop_after_cycle(self, task_id: str) -> TaskResult | None:
@@ -1445,15 +1482,33 @@ class AgentLoop:
         self._audit(event_type, intent.task_id, {"intent_id": intent.id, "digest": result_digest})
 
     def _audit(self, event_type: str, task_id: str, metadata: dict[str, str]) -> None:
-        self._audit_sink.emit(
-            AuditEvent(
-                event_type=event_type,
-                task_id=task_id,
-                component="agent_loop",
-                created_at=self._clock.now(),
-                metadata=metadata,
-            )
+        self._audit_sink.emit(self._make_audit_event(event_type, task_id, metadata))
+
+    def _make_audit_event(
+        self, event_type: str, task_id: str, metadata: dict[str, str]
+    ) -> AuditEvent:
+        return AuditEvent(
+            event_id=uuid4().hex + uuid4().hex,
+            event_type=event_type,
+            task_id=task_id,
+            component="agent_loop",
+            created_at=self._clock.now(),
+            metadata=metadata,
         )
+
+    def _drain_audit_outbox(self) -> None:
+        """Deliver committed events oldest-first; any failure leaves the row pending."""
+        while True:
+            try:
+                pending = self._repository.pending_audit_events(limit=1)
+                if not pending:
+                    return
+                event = pending[0].event
+                self._audit_sink.emit(event)
+                self._repository.mark_audit_event_delivered(event.event_id)
+            except Exception as audit_error:  # noqa: BLE001 - audit remains repairable.
+                _ = audit_error
+                return
 
     def _audit_after_commit(
         self, event_type: str, task_id: str, metadata: dict[str, str]
@@ -1465,21 +1520,22 @@ class AgentLoop:
 
     def _terminal(self, task_id: str, status: TaskStatus, summary: str) -> TaskResult:
         result = self._make_result(task_id, status, summary)
+        terminal_event = self._make_audit_event(
+            "task_terminal", task_id, {"status": status.value}
+        )
         if not self._repository.set_status(
             task_id,
             TaskStatus.RUNNING,
             status,
             result,
             owner_token=self._owner(),
+            audit_events=(terminal_event,),
         ):
             snapshot = self._repository.resume_snapshot(task_id)
             if snapshot.task.status in _TERMINAL:
                 return self._saved_result(snapshot)
             raise StorageStateError("terminal compare-and-set failed")
-        try:
-            self._audit("task_terminal", task_id, {"status": status.value})
-        except Exception as audit_error:  # noqa: BLE001
-            _ = audit_error
+        self._drain_audit_outbox()
         return result
 
     def _make_result(self, task_id: str, status: TaskStatus, summary: str) -> TaskResult:

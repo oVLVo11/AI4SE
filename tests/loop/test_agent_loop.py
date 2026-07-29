@@ -222,6 +222,92 @@ def test_green_and_finish_audit_events_are_bounded_and_path_free(loop_fixture) -
     ] == lifecycle_before_resume
 
 
+def test_committed_audit_sink_failure_restarts_and_repairs_in_outbox_order(
+    loop_fixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A sink outage after commit must leave ordered evidence for terminal resume repair."""
+    harness = loop_fixture(
+        responses=[quality_json(), finish_json()],
+        reports=[successful_report(), successful_report()],
+    )
+    lifecycle = {"quality_candidate_ready", "finish_verification", "task_terminal"}
+    original_emit = harness.audit.emit
+
+    def fail_lifecycle(event):
+        if event.event_type in lifecycle:
+            raise RuntimeError("audit sink unavailable")
+        original_emit(event)
+
+    monkeypatch.setattr(harness.audit, "emit", fail_lifecycle)
+
+    assert harness.loop.run(harness.task_id).status is TaskStatus.SUCCEEDED
+    pending = harness.repository.pending_audit_events(limit=8)
+    assert tuple(record.event.event_type for record in pending) == (
+        "quality_candidate_ready",
+        "finish_verification",
+        "task_terminal",
+    )
+    assert [event for event in harness.audit.events if event.event_type in lifecycle] == []
+
+    monkeypatch.setattr(harness.audit, "emit", original_emit)
+    resumed_llm = ScriptedLLM([])
+    resumed_pipeline = type(harness.pipeline)([])
+    harness.restart(resumed_llm, resumed_pipeline)
+
+    result = harness.loop.resume(harness.task_id)
+
+    assert result.status is TaskStatus.SUCCEEDED
+    assert resumed_llm.calls == []
+    assert resumed_pipeline.calls == []
+    assert [
+        event.event_type for event in harness.audit.events if event.event_type in lifecycle
+    ] == ["quality_candidate_ready", "finish_verification", "task_terminal"]
+    assert harness.repository.pending_audit_events(limit=8) == ()
+
+
+def test_sink_success_then_mark_failure_retries_same_ids_without_duplicates(
+    loop_fixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A lost delivery acknowledgement must replay stable IDs and remain observable once."""
+    harness = loop_fixture(
+        responses=[quality_json(), finish_json()],
+        reports=[successful_report(), successful_report()],
+    )
+    lifecycle = {"quality_candidate_ready", "finish_verification", "task_terminal"}
+
+    def fail_mark(event_id: str) -> None:
+        raise RuntimeError(f"delivery mark unavailable for {event_id}")
+
+    monkeypatch.setattr(harness.repository, "mark_audit_event_delivered", fail_mark)
+
+    assert harness.loop.run(harness.task_id).status is TaskStatus.SUCCEEDED
+    pending = harness.repository.pending_audit_events(limit=8)
+    pending_ids = tuple(record.event.event_id for record in pending)
+    assert len(pending_ids) == 3
+    assert len(set(pending_ids)) == 3
+    assert [
+        event.event_id for event in harness.audit.events if event.event_type in lifecycle
+    ] == [pending_ids[0]]
+
+    resumed_llm = ScriptedLLM([])
+    resumed_pipeline = type(harness.pipeline)([])
+    harness.restart(resumed_llm, resumed_pipeline)
+
+    result = harness.loop.resume(harness.task_id)
+
+    assert result.status is TaskStatus.SUCCEEDED
+    assert resumed_llm.calls == []
+    assert resumed_pipeline.calls == []
+    observed = [event for event in harness.audit.events if event.event_type in lifecycle]
+    assert tuple(event.event_id for event in observed) == pending_ids
+    assert [event.event_type for event in observed] == [
+        "quality_candidate_ready",
+        "finish_verification",
+        "task_terminal",
+    ]
+    assert harness.repository.pending_audit_events(limit=8) == ()
+
+
 def test_later_failed_quality_clears_green_candidate_before_finish(loop_fixture) -> None:
     """A failed report after green must make the earlier candidate unconsumable."""
     harness = loop_fixture(

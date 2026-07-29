@@ -721,17 +721,15 @@ def test_passing_approved_verification_crash_recovers_candidate_then_finishes(
     harness.repository._connection.execute(
         "DELETE FROM green_candidates WHERE task_id = ?", (harness.task_id,)
     )
-    harness.repository._connection.execute(
-        "UPDATE approvals SET execution_state = 'intent_recorded' WHERE id = ?",
-        (approval.id,),
-    )
     harness.repository._connection.commit()
     class CrashBeforeFinish(ScriptedLLM):
         def complete(self, messages):
             raise CrashAfterApprovedPass
 
-    harness.llm = CrashBeforeFinish([])
-    harness.loop._llm = harness.llm
+    recovery_pipeline = type(harness.pipeline)(
+        [successful_report(), successful_report()]
+    )
+    harness.restart(CrashBeforeFinish([]), recovery_pipeline)
     with pytest.raises(CrashAfterApprovedPass):
         harness.loop.resume(harness.task_id)
     candidate = harness.repository.green_candidate(harness.task_id)

@@ -4,11 +4,19 @@ import json
 import multiprocessing
 import os
 from pathlib import Path
+from uuid import uuid4
 
 import pytest
+from pydantic import Field
 
-from pyquality.domain.models import AuditEvent
+from pyquality.domain.models import AuditEvent as _AuditEvent
 from pyquality.security import AuditLogger, AuditWriteError
+
+
+class AuditEvent(_AuditEvent):
+    """Supply distinct valid IDs for audit-process fixtures."""
+
+    event_id: str = Field(default_factory=lambda: uuid4().hex + uuid4().hex)
 
 
 def _hold_shared_windows_handle(path: str, ready: object, release: object) -> None:

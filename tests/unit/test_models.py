@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pytest
+from pydantic import ValidationError
 
 from pyquality.domain.models import (
     Action,
@@ -14,6 +15,15 @@ from pyquality.domain.models import (
     TaskStatus,
     ToolResult,
 )
+
+
+def test_audit_event_requires_bounded_stable_event_id() -> None:
+    event = AuditEvent(event_id="a" * 64, event_type="task_terminal")
+    assert event.event_id == "a" * 64
+    with pytest.raises(ValidationError):
+        AuditEvent(event_type="task_terminal")
+    with pytest.raises(ValidationError):
+        AuditEvent(event_id="x" * 65, event_type="task_terminal")
 
 
 def test_action_rejects_unknown_kind() -> None:

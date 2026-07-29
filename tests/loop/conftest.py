@@ -109,8 +109,12 @@ class FixedClock:
 class RecordingAuditSink:
     def __init__(self) -> None:
         self.events: list[AuditEvent] = []
+        self._event_ids: set[str] = set()
 
     def emit(self, event: AuditEvent) -> None:
+        if event.event_id in self._event_ids:
+            return
+        self._event_ids.add(event.event_id)
         self.events.append(event)
 
 

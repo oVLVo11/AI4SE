@@ -736,7 +736,8 @@ class HarnessService:
             set(self._settings.redaction_patterns),
         )
         if not isinstance(payload, dict) or set(payload) != {
-            "task_id", "iteration", "component", "event_type", "duration", "outcome", "metadata"
+            "event_id", "task_id", "iteration", "component", "event_type", "duration",
+            "outcome", "metadata"
         }:
             raise ValueError("invalid audit record")
         metadata = payload["metadata"]
@@ -753,6 +754,7 @@ class HarnessService:
         if duration is not None:
             safe_metadata["duration"] = duration
         return AuditEvent(
+            event_id=payload["event_id"],
             task_id=payload["task_id"],
             iteration_id=payload["iteration"],
             component=payload["component"],
