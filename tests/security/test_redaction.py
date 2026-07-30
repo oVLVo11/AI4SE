@@ -904,6 +904,92 @@ def test_receipt_directory_durability_normal_append_retry_resyncs_before_clearin
     assert checkpoint.committed_receipt_count == 1
 
 
+def test_receipt_directory_durability_pending_retry_refsyncs_before_clearing_pending(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A valid cached receipt after fsync failure must be fsynced again before count advance."""
+    from pyquality import security
+
+    logger, path, index_root = _prepare_receipt_directory_durability_logger(tmp_path)
+    event = AuditEvent(event_id="3" * 64, event_type="transition")
+    receipt_path = security._audit_receipt_path(index_root, event.event_id)
+    receipt_descriptors: set[int] = set()
+    calls: list[str] = []
+    fsync_faulted = False
+    real_open = security._open_audit
+    real_close = security.os.close
+    real_fsync = security.os.fsync
+    real_store = security._store_audit_checkpoint
+
+    def record_open(
+        target: Path,
+        *,
+        append: bool = True,
+        create: bool = True,
+    ) -> int:
+        descriptor = real_open(target, append=append, create=create)
+        if Path(target) == receipt_path:
+            receipt_descriptors.add(descriptor)
+        return descriptor
+
+    def record_close(descriptor: int) -> None:
+        receipt_descriptors.discard(descriptor)
+        real_close(descriptor)
+
+    def fail_then_record_receipt_fsync(descriptor: int) -> None:
+        nonlocal fsync_faulted
+        if descriptor in receipt_descriptors:
+            if not fsync_faulted:
+                fsync_faulted = True
+                raise OSError("simulated receipt file fsync failure")
+            calls.append("retry-receipt-file-fsync")
+        real_fsync(descriptor)
+
+    def record_sync(root: Path, leaf: Path) -> None:
+        assert (root, leaf) == (index_root, receipt_path.parent)
+        calls.append("retry-receipt-directory-fsync")
+
+    def record_store(*args: object, **kwargs: object):
+        previous = args[1] if len(args) > 1 else kwargs.get("previous")
+        if (
+            previous is not None
+            and previous.pending_event_id == event.event_id
+            and kwargs.get("pending_event_id") is None
+        ):
+            calls.append("clear-pending-checkpoint")
+        return real_store(*args, **kwargs)
+
+    monkeypatch.setattr(security, "_open_audit", record_open)
+    monkeypatch.setattr(security.os, "close", record_close)
+    monkeypatch.setattr(security.os, "fsync", fail_then_record_receipt_fsync)
+    monkeypatch.setattr(security, "_sync_audit_directory_chain", record_sync)
+    monkeypatch.setattr(security, "_store_audit_checkpoint", record_store)
+
+    with pytest.raises(AuditWriteError):
+        logger.emit(event)
+    assert fsync_faulted
+    logger.emit(event)
+
+    assert calls.index("retry-receipt-file-fsync") < calls.index(
+        "retry-receipt-directory-fsync"
+    )
+    assert calls.index("retry-receipt-directory-fsync") < calls.index(
+        "clear-pending-checkpoint"
+    )
+    checkpoint_descriptor = security._open_audit(index_root / "checkpoint", append=False)
+    try:
+        checkpoint = security._load_audit_checkpoint(
+            checkpoint_descriptor,
+            audit_size=path.stat().st_size,
+        )
+    finally:
+        os.close(checkpoint_descriptor)
+    assert checkpoint is not None
+    assert checkpoint.pending_event_id is None
+    assert checkpoint.committed_receipt_count == 1
+
+
 def test_receipt_directory_durability_reconciliation_orders_new_receipt_before_checkpoint_clear(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2470,6 +2556,82 @@ def test_receipt_directory_durability_r4_retry_resyncs_before_cursor_advance(
     state = load_marker_state()
     assert state.next_cursor == 1
     assert state.completed is True
+
+
+def test_receipt_directory_durability_r4_retry_refsyncs_before_cursor_advance(
+    r4_tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cached R4 target after fsync failure must be fsynced before cursor advance."""
+    from pyquality import security
+
+    path = r4_tmp_path / "migration-refsync" / "audit.jsonl"
+    index_base = r4_tmp_path / "migration-refsync-index"
+    events, _, _, index_root = _build_released_r4_audit_index(
+        path,
+        index_base,
+        event_count=1,
+    )
+    event = events[0]
+    receipt_path = security._audit_receipt_path(index_root, event.event_id)
+    receipt_descriptors: set[int] = set()
+    calls: list[str] = []
+    fsync_faulted = False
+    real_open = security._open_audit
+    real_close = security.os.close
+    real_fsync = security.os.fsync
+    real_store_state = security._store_r4_migration_state
+
+    def record_open(
+        target: Path,
+        *,
+        append: bool = True,
+        create: bool = True,
+    ) -> int:
+        descriptor = real_open(target, append=append, create=create)
+        if Path(target) == receipt_path:
+            receipt_descriptors.add(descriptor)
+        return descriptor
+
+    def record_close(descriptor: int) -> None:
+        receipt_descriptors.discard(descriptor)
+        real_close(descriptor)
+
+    def fail_then_record_receipt_fsync(descriptor: int) -> None:
+        nonlocal fsync_faulted
+        if descriptor in receipt_descriptors:
+            if not fsync_faulted:
+                fsync_faulted = True
+                raise OSError("simulated migration receipt file fsync failure")
+            calls.append("retry-receipt-file-fsync")
+        real_fsync(descriptor)
+
+    def record_sync(root: Path, leaf: Path) -> None:
+        if (root, leaf) == (index_root, receipt_path.parent):
+            calls.append("retry-receipt-directory-fsync")
+
+    def record_state(*args: object, **kwargs: object):
+        if kwargs.get("next_cursor") == 1:
+            calls.append("advance-r4-cursor")
+        return real_store_state(*args, **kwargs)
+
+    monkeypatch.setattr(security, "_open_audit", record_open)
+    monkeypatch.setattr(security.os, "close", record_close)
+    monkeypatch.setattr(security.os, "fsync", fail_then_record_receipt_fsync)
+    monkeypatch.setattr(security, "_sync_audit_directory_chain", record_sync)
+    monkeypatch.setattr(security, "_store_r4_migration_state", record_state)
+
+    with pytest.raises(AuditWriteError):
+        AuditLogger(path, index_root=index_base).emit(event)
+    assert fsync_faulted
+    AuditLogger(path, index_root=index_base).emit(event)
+
+    assert calls.index("retry-receipt-file-fsync") < calls.index(
+        "retry-receipt-directory-fsync"
+    )
+    assert calls.index("retry-receipt-directory-fsync") < calls.index(
+        "advance-r4-cursor"
+    )
 
 
 def test_completed_r4_marker_allows_live_checkpoint_to_advance(
