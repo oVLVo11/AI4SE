@@ -14,6 +14,11 @@ from pathlib import Path
 import pytest
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+EXPECTED_TASK_12_QUALITY_REVIEW = (
+    "Task 1 review CLEAN; Task 2 review pending; focused 12 passed; "
+    "full isolated 593 passed, 10 skipped; wheel/sdist and wheel CLI/demo verified; "
+    "Docker CLI unavailable"
+)
 
 
 def _read(relative_path: str) -> str:
@@ -62,11 +67,7 @@ def _validate_root_evidence(plan: str, agent_log: str) -> None:
     assert "Task 2 under review" in ledger["12"][0]
     assert "CLEAN" in ledger["12"][2]
     assert "Task 2 review pending" in ledger["12"][2]
-    assert "task 1 review clean" in ledger["12"][3].lower()
-    assert "task 2 review pending" in ledger["12"][3].lower()
-    assert "docker cli unavailable" in ledger["12"][3].lower()
-    assert "complete" not in ledger["12"][3].lower()
-    assert "docker image build succeeded" not in ledger["12"][3].lower()
+    assert ledger["12"][3].strip() == EXPECTED_TASK_12_QUALITY_REVIEW
 
     required_commits = {
         "11": (
@@ -167,6 +168,33 @@ def test_root_evidence_contract_rejects_completed_task_12_and_docker_success(
     documents["PLAN.md"] = documents["PLAN.md"].replace(
         "Task 1 review CLEAN; Task 2 review pending; focused 12 passed; full isolated 593 passed, 10 skipped; wheel/sdist and wheel CLI/demo verified; Docker CLI unavailable",
         "Task 12 COMPLETE; Docker image build succeeded",
+    )
+
+    monkeypatch.setitem(globals(), "_read", documents.__getitem__)
+    with pytest.raises(AssertionError):
+        test_root_evidence_records_preserve_task_11_breakers_and_task_12_review_state()
+
+
+@pytest.mark.parametrize(
+    "contradiction",
+    (
+        "Docker build succeeded",
+        "Task 12 finished and final review passed",
+    ),
+)
+def test_root_evidence_contract_rejects_appended_task_12_quality_contradictions(
+    monkeypatch: pytest.MonkeyPatch,
+    contradiction: str,
+) -> None:
+    documents = {name: _read(name) for name in ("PLAN.md", "AGENT_LOG.md")}
+    current_quality_review = (
+        "Task 1 review CLEAN; Task 2 review pending; focused 12 passed; "
+        "full isolated 593 passed, 10 skipped; wheel/sdist and wheel CLI/demo verified; "
+        "Docker CLI unavailable"
+    )
+    documents["PLAN.md"] = documents["PLAN.md"].replace(
+        current_quality_review,
+        f"{current_quality_review}; {contradiction}",
     )
 
     monkeypatch.setitem(globals(), "_read", documents.__getitem__)
