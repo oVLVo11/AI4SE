@@ -11,6 +11,8 @@ import tomllib
 import zipfile
 from pathlib import Path
 
+import pytest
+
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -31,8 +33,8 @@ def _task_ledger_rows(plan: str) -> dict[str, tuple[str, str, str, str, str]]:
     return rows
 
 
-def test_root_evidence_records_preserve_task_11_breakers_and_task_12_review_state() -> None:
-    ledger = _task_ledger_rows(_read("PLAN.md"))
+def _validate_root_evidence(plan: str, agent_log: str) -> None:
+    ledger = _task_ledger_rows(plan)
     for task in ("11", "11A", "11B", "12"):
         assert task in ledger
         status, agent, spec_review, quality_review, commits = ledger[task]
@@ -40,7 +42,29 @@ def test_root_evidence_records_preserve_task_11_breakers_and_task_12_review_stat
         assert agent == "unavailable" or re.fullmatch(r"`/root/[^`]+`(?:, `/root/[^`]+`)*", agent)
         assert re.search(r"\b[0-9a-f]{7,40}\b", commits)
 
-    agent_log = _read("AGENT_LOG.md")
+    assert ledger["11"][0] == "Implemented; breaker reached"
+    assert ledger["11A"][0] == "Blocked; breaker reached"
+    assert ledger["11B"][0] == "Complete"
+    assert "CLEAN" in ledger["11B"][2]
+    assert ledger["12"][0] == "In progress; Task 1 clean, Task 2 under review"
+    assert "Task 2 review pending" in ledger["12"][2]
+
+    required_commits = {
+        "11": (
+            "593384e", "e80a17d", "6dcc2ec", "16b4edc", "ba8d95b", "d60a8bc", "10339c0",
+            "7c21ce6", "39a21c4", "5ad427a", "f363ccc", "90b9c45", "9f44513",
+        ),
+        "11A": ("87e5ad7", "63b08cf", "07cffcd", "5eb42fb", "ea569a9", "47bed5d", "6de2411"),
+        "11B": ("d396c24", "e7448ff", "cad8e17"),
+        "12": ("6d06a3e", "783a814", "869dd20", "8e1792d"),
+    }
+    for task, expected in required_commits.items():
+        actual = tuple(re.findall(r"\b[0-9a-f]{7,40}\b", ledger[task][4]))
+        if task == "12":
+            assert set(expected) <= set(actual)
+        else:
+            assert actual == expected
+
     headings = (
         "## 2026-07-29 Task 11 implementation and breaker",
         "## 2026-07-30 Task 11A remediation and breaker",
@@ -57,8 +81,36 @@ def test_root_evidence_records_preserve_task_11_breakers_and_task_12_review_stat
     assert "breaker" in task_11a
     assert "remaining" in task_11b.lower() and "defect" in task_11b.lower()
     assert "CLEAN" in task_11b
-    for commit in ("6de2411", "cad8e17", "6d06a3e", "869dd20", "8e1792d"):
+    for commit in ("6de2411", "cad8e17", "6d06a3e", "783a814", "869dd20", "8e1792d"):
         assert commit in agent_log
+
+
+def test_root_evidence_records_preserve_task_11_breakers_and_task_12_review_state() -> None:
+    _validate_root_evidence(_read("PLAN.md"), _read("AGENT_LOG.md"))
+
+
+@pytest.mark.parametrize(
+    ("path", "old", "new"),
+    (
+        ("PLAN.md", "Implemented; breaker reached", "Complete; CLEAN"),
+        ("PLAN.md", "Blocked; breaker reached", "Complete; CLEAN"),
+        ("PLAN.md", "In progress; Task 1 clean, Task 2 under review", "Complete; CLEAN"),
+        ("PLAN.md", "`6d06a3e`, `783a814`, `869dd20`, `8e1792d`", "`deadbee`"),
+        ("AGENT_LOG.md", "`783a814`", "`amendment unavailable`"),
+    ),
+)
+def test_root_evidence_contract_rejects_reviewed_history_mutations(
+    monkeypatch: pytest.MonkeyPatch,
+    path: str,
+    old: str,
+    new: str,
+) -> None:
+    documents = {name: _read(name) for name in ("PLAN.md", "AGENT_LOG.md")}
+    documents[path] = documents[path].replace(old, new)
+
+    monkeypatch.setitem(globals(), "_read", documents.__getitem__)
+    with pytest.raises(AssertionError):
+        test_root_evidence_records_preserve_task_11_breakers_and_task_12_review_state()
 
 
 def test_required_artifacts_and_readme_headings_exist() -> None:
