@@ -1012,6 +1012,16 @@ git commit -m "docs: complete packaging and course delivery contract"
 
 **Recorded hosted evidence:** Render service https://ai4se.onrender.com deployed `690e23e2544936c0bde3e507730c63d34da6af0f` as `dep-d9lntmcs728c739h5ffg`. Public acceptance reached terminal `SUCCEEDED` with zero rounds remaining and displayed deterministic guardrail, feedback, and progress evidence. No credentials, provider configuration, database, or persistent disk are attached to this free-tier public mock service. Task 3 review and final audit pending. No local Docker CLI success is claimed.
 
+The Render deploy SHA and deploy ID are user-supplied dashboard evidence. GitHub CI evidence was independently verified through the GitHub API. Hosted acceptance was independently verified by the controller through the real HTTP CSRF form. A fresh direct rerun posted the bundled scenario to https://ai4se.onrender.com/tasks and returned HTTP 200 at https://ai4se.onrender.com/tasks/public-demo with terminal `SUCCEEDED` and zero remaining rounds.
+
+Guardrail: `outside action denied`.
+
+Feedback: `assertion`.
+
+Progress: `read_file -> apply_patch -> apply_patch -> finish`.
+
+Task results are process-local and may return HTTP 404 after a restart or free-tier sleep until the bundled scenario is rerun.
+
 **Files:**
 - Modify: `SPEC.md`
 - Modify: `PLAN.md`

@@ -106,9 +106,19 @@ Task 13 is In progress; repository and CI evidence complete; Render deployment p
 
 ## 2026-07-31 Task 13 hosted public mock evidence
 
-Task 13 is In progress; hosted evidence recorded; Task 3 review and final audit pending. Public repository, final CI, and hosted mock evidence recorded; Task 3 review and final audit pending. The reviewed implementation sequence is `a1672c4`, `ad4229c`, `c49283f`, `aceb2d7`, `710600d`, `3d90e63`, `9127380`, `f776f1e`, and `690e23e`, ending at deployed Git SHA `690e23e2544936c0bde3e507730c63d34da6af0f` on remote `master`.
+Task 13 is In progress; hosted evidence recorded; Task 3 review and final audit pending. Public repository, final CI, and hosted mock evidence recorded; Task 3 review and final audit pending. Public repository: https://github.com/oVLVo11/AI4SE.git. Initial CI run https://github.com/oVLVo11/AI4SE/actions/runs/30544072702 succeeded for `89544fc9d295fdbe0d6d20fd1ffc202d5238144f`. The reviewed implementation sequence is `a1672c4`, `ad4229c`, `c49283f`, `aceb2d7`, `710600d`, `3d90e63`, `9127380`, `f776f1e`, and `690e23e`, ending at deployed Git SHA `690e23e2544936c0bde3e507730c63d34da6af0f` on remote `master`.
 
-User-supplied Render dashboard evidence identified deploy `dep-d9lntmcs728c739h5ffg` for public service https://ai4se.onrender.com. Public root and task pages returned HTTP 200. Submitting the bundled form redirected with HTTP 200 to https://ai4se.onrender.com/tasks/public-demo, which showed terminal `SUCCEEDED`, zero remaining rounds, guardrail evidence `outside action denied`, feedback `assertion`, and progress `read_file -> apply_patch -> apply_patch -> finish`. The public response contained no forbidden local or temporary paths, `LEAK` sentinels, prompt/source/patch bodies, provider key, credential prompt, traceback, or server error.
+The Render deploy SHA and deploy ID are user-supplied dashboard evidence. That dashboard evidence identified deploy `dep-d9lntmcs728c739h5ffg` and deployed SHA `690e23e2544936c0bde3e507730c63d34da6af0f` for public service https://ai4se.onrender.com; it is not an agent- or browser-authenticated dashboard observation. GitHub CI evidence was independently verified through the GitHub API. Hosted acceptance was independently verified by the controller through the real HTTP CSRF form.
+
+The controller's fresh direct rerun posted the bundled scenario to https://ai4se.onrender.com/tasks and returned HTTP 200 at https://ai4se.onrender.com/tasks/public-demo with terminal `SUCCEEDED` and zero remaining rounds.
+
+Guardrail: `outside action denied`.
+
+Feedback: `assertion`.
+
+Progress: `read_file -> apply_patch -> apply_patch -> finish`.
+
+The public response contained no forbidden local or temporary paths, `LEAK` sentinels, prompt/source/patch bodies, provider key, credential prompt, traceback, or server error. Task results are process-local and may return HTTP 404 after a restart or free-tier sleep until the bundled scenario is rerun. The earlier HTTP 404 was expected process-local state loss after restart or free-tier sleep, not a failed deployment.
 
 No credentials, provider configuration, database, or persistent disk are attached to this free-tier public mock service. It is mock-only, ephemeral, and has no production availability guarantee. No local Docker CLI success is claimed.
 

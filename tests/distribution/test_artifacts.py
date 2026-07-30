@@ -85,6 +85,25 @@ EXPECTED_HOSTED_LIMITATION = (
     "No credentials, provider configuration, database, or persistent disk are "
     "attached to this free-tier public mock service."
 )
+EXPECTED_DASHBOARD_PROVENANCE = (
+    "The Render deploy SHA and deploy ID are user-supplied dashboard evidence."
+)
+EXPECTED_ACCEPTANCE_PROVENANCE = (
+    "Hosted acceptance was independently verified by the controller through the "
+    "real HTTP CSRF form."
+)
+EXPECTED_CI_PROVENANCE = (
+    "GitHub CI evidence was independently verified through the GitHub API."
+)
+EXPECTED_PROCESS_LOCAL_LIMITATION = (
+    "Task results are process-local and may return HTTP 404 after a restart or "
+    "free-tier sleep until the bundled scenario is rerun."
+)
+EXPECTED_GUARDRAIL_EVIDENCE = "Guardrail: `outside action denied`."
+EXPECTED_FEEDBACK_EVIDENCE = "Feedback: `assertion`."
+EXPECTED_PROGRESS_EVIDENCE = (
+    "Progress: `read_file -> apply_patch -> apply_patch -> finish`."
+)
 
 
 def _read(relative_path: str) -> str:
@@ -102,6 +121,86 @@ def _task_ledger_rows(plan: str) -> dict[str, tuple[str, str, str, str, str]]:
         if len(cells) == 6:
             rows[cells[0]] = tuple(cells[1:])  # type: ignore[assignment]
     return rows
+
+
+def _bounded_section(document: str, start: str, end: str | None = None) -> str:
+    assert document.count(start) == 1
+    section = document[document.index(start) :]
+    if end is not None:
+        assert end in section
+        section = section[: section.index(end)]
+    return section
+
+
+def _validate_current_task13_sections(readme: str, plan: str, agent_log: str) -> None:
+    sections = (
+        _bounded_section(readme, "### Render-compatible deployment"),
+        _bounded_section(plan, "### Task 13: Final Release and Hosted Demonstration Evidence", "**Files:**"),
+        _bounded_section(agent_log, "## 2026-07-31 Task 13 hosted public mock evidence"),
+    )
+    required = (
+        EXPECTED_PUBLIC_REPOSITORY_URL,
+        EXPECTED_INITIAL_CI_URL,
+        EXPECTED_INITIAL_CI_SHA,
+        EXPECTED_HOSTED_URL,
+        EXPECTED_HOSTED_SHA,
+        EXPECTED_RENDER_DEPLOY_ID,
+        EXPECTED_HOSTED_TERMINAL_RESULT,
+        EXPECTED_FINAL_CI_RECORD,
+        EXPECTED_HOSTED_LIMITATION,
+        EXPECTED_DASHBOARD_PROVENANCE,
+        EXPECTED_ACCEPTANCE_PROVENANCE,
+        EXPECTED_CI_PROVENANCE,
+        EXPECTED_PROCESS_LOCAL_LIMITATION,
+        EXPECTED_GUARDRAIL_EVIDENCE,
+        EXPECTED_FEEDBACK_EVIDENCE,
+        EXPECTED_PROGRESS_EVIDENCE,
+        "Task 3 review and final audit pending",
+    )
+    forbidden = (
+        "has production availability",
+        "live provider mode",
+        "paid service",
+        "durable task storage",
+        "Task 3 review CLEAN",
+        "Task 3 review complete",
+        "Task 13 final broad review complete",
+        "CI and Render deployed commit `06a5bf8`",
+        "authenticated browser",
+        "Hosted acceptance was user-supplied",
+        "https://github.com/example/",
+        "https://example.onrender.com",
+        "dep-example",
+        "`FAILED`",
+    )
+    allowed_urls = {
+        EXPECTED_PUBLIC_REPOSITORY_URL,
+        EXPECTED_INITIAL_CI_URL,
+        EXPECTED_FINAL_CI_URL,
+        f"{EXPECTED_FINAL_CI_URL}/job/90939296464",
+        "https://github.com/oVLVo11/AI4SE/actions/runs/30561047811",
+        EXPECTED_HOSTED_URL,
+        f"{EXPECTED_HOSTED_URL}/tasks",
+        f"{EXPECTED_HOSTED_URL}/tasks/public-demo",
+    }
+    allowed_full_shas = {EXPECTED_INITIAL_CI_SHA, EXPECTED_HOSTED_SHA}
+
+    for section in sections:
+        for text in required:
+            assert text in section
+        for text in forbidden:
+            assert text not in section
+        for label in ("Guardrail:", "Feedback:", "Progress:"):
+            assert len(re.findall(rf"(?m)^{label} .+$", section)) == 1
+        urls = {
+            match.rstrip(".,;")
+            for match in re.findall(r"https://[^\s`)]+", section)
+        }
+        assert urls <= allowed_urls
+        assert set(re.findall(r"\b[0-9a-f]{40}\b", section)) <= allowed_full_shas
+        assert set(re.findall(r"\bdep-[a-z0-9]+\b", section)) <= {
+            EXPECTED_RENDER_DEPLOY_ID
+        }
 
 
 def _validate_root_evidence(plan: str, agent_log: str) -> None:
@@ -222,6 +321,9 @@ def test_task13_records_observed_hosted_release_evidence() -> None:
         ", ".join(f"`{commit}`" for commit in EXPECTED_TASK_13_COMMITS),
     )
     _validate_root_evidence(_read("PLAN.md"), _read("AGENT_LOG.md"))
+    _validate_current_task13_sections(
+        _read("README.md"), _read("PLAN.md"), _read("AGENT_LOG.md")
+    )
     for document in ("README.md", "PLAN.md", "AGENT_LOG.md"):
         content = _read(document)
         for expected in (
@@ -368,6 +470,25 @@ def test_root_evidence_contract_rejects_appended_task_12_quality_contradictions(
         ("README.md", EXPECTED_HOSTED_TERMINAL_RESULT, "FAILED"),
         ("PLAN.md", EXPECTED_FINAL_CI_URL, "https://github.com/example/actions/runs/1"),
         ("AGENT_LOG.md", EXPECTED_HOSTED_LIMITATION, "Production service."),
+        (
+            "README.md",
+            EXPECTED_DASHBOARD_PROVENANCE,
+            "The agent verified the Render dashboard through an authenticated browser.",
+        ),
+        (
+            "PLAN.md",
+            EXPECTED_ACCEPTANCE_PROVENANCE,
+            "Hosted acceptance was user-supplied.",
+        ),
+        (
+            "AGENT_LOG.md",
+            EXPECTED_CI_PROVENANCE,
+            "GitHub CI evidence was not independently verified.",
+        ),
+        ("README.md", EXPECTED_PROCESS_LOCAL_LIMITATION, "Task storage is durable."),
+        ("README.md", EXPECTED_GUARDRAIL_EVIDENCE, ""),
+        ("PLAN.md", EXPECTED_FEEDBACK_EVIDENCE, ""),
+        ("AGENT_LOG.md", EXPECTED_PROGRESS_EVIDENCE, ""),
     ),
 )
 def test_task13_release_evidence_rejects_tampered_observed_values(
@@ -378,6 +499,92 @@ def test_task13_release_evidence_rejects_tampered_observed_values(
 ) -> None:
     documents = {name: _read(name) for name in ("README.md", "PLAN.md", "AGENT_LOG.md")}
     documents[path] = documents[path].replace(expected, replacement)
+
+    monkeypatch.setitem(globals(), "_read", documents.__getitem__)
+    with pytest.raises(AssertionError):
+        test_task13_records_observed_hosted_release_evidence()
+
+
+@pytest.mark.parametrize(
+    ("path", "marker", "contradiction"),
+    (
+        (
+            "README.md",
+            "## Credential Security",
+            "This service has production availability and live provider mode.",
+        ),
+        (
+            "README.md",
+            "## Credential Security",
+            "This paid service guarantees durable task storage.",
+        ),
+        (
+            "PLAN.md",
+            "**Files:**",
+            "Task 3 review CLEAN; Task 13 final broad review complete.",
+        ),
+        (
+            "PLAN.md",
+            "**Files:**",
+            "CI and Render deployed commit `06a5bf8`.",
+        ),
+        (
+            "AGENT_LOG.md",
+            None,
+            "Agent verified the Render dashboard through an authenticated browser.",
+        ),
+        (
+            "AGENT_LOG.md",
+            None,
+            "Hosted acceptance was user-supplied.",
+        ),
+        (
+            "README.md",
+            "## Credential Security",
+            "Conflicting repository: https://github.com/example/AI4SE.git.",
+        ),
+        (
+            "PLAN.md",
+            "**Files:**",
+            "Conflicting CI SHA: `1111111111111111111111111111111111111111`.",
+        ),
+        (
+            "AGENT_LOG.md",
+            None,
+            "Conflicting Render SHA: `2222222222222222222222222222222222222222`.",
+        ),
+        ("README.md", "## Credential Security", "Conflicting deploy ID: `dep-example`."),
+        (
+            "PLAN.md",
+            "**Files:**",
+            "Conflicting Render URL: https://example.onrender.com.",
+        ),
+        ("AGENT_LOG.md", None, "Conflicting terminal status: `FAILED`."),
+        ("README.md", "## Credential Security", "Guardrail: `unexpected action allowed`."),
+        ("PLAN.md", "**Files:**", "Feedback: `provider request`."),
+        ("AGENT_LOG.md", None, "Progress: `read_file -> finish`."),
+    ),
+)
+def test_task13_current_sections_reject_appended_contradictions(
+    monkeypatch: pytest.MonkeyPatch,
+    path: str,
+    marker: str | None,
+    contradiction: str,
+) -> None:
+    documents = {name: _read(name) for name in ("README.md", "PLAN.md", "AGENT_LOG.md")}
+    if marker is None:
+        documents[path] = f"{documents[path]}\n{contradiction}\n"
+    else:
+        start_anchor = {
+            "README.md": "### Render-compatible deployment",
+            "PLAN.md": "### Task 13: Final Release and Hosted Demonstration Evidence",
+        }[path]
+        marker_index = documents[path].index(marker, documents[path].index(start_anchor))
+        documents[path] = (
+            documents[path][:marker_index]
+            + f"{contradiction}\n\n"
+            + documents[path][marker_index:]
+        )
 
     monkeypatch.setitem(globals(), "_read", documents.__getitem__)
     with pytest.raises(AssertionError):

@@ -75,7 +75,17 @@ Final GitHub Actions run https://github.com/oVLVo11/AI4SE/actions/runs/305626437
 
 Render service: https://ai4se.onrender.com; deployed commit: `690e23e2544936c0bde3e507730c63d34da6af0f`; deploy ID: `dep-d9lntmcs728c739h5ffg`.
 
-Hosted acceptance submitted the bundled scenario and reached terminal `SUCCEEDED` at `/tasks/public-demo` with zero rounds remaining. The public result showed the expected denied outside action, assertion feedback, and `read_file -> apply_patch -> apply_patch -> finish` progress. It exposed no credentials, provider setup, local or temporary paths, prompt/source/patch bodies, tracebacks, or server errors.
+The Render deploy SHA and deploy ID are user-supplied dashboard evidence. GitHub CI evidence was independently verified through the GitHub API. Hosted acceptance was independently verified by the controller through the real HTTP CSRF form.
+
+The controller submitted the bundled scenario and reached terminal `SUCCEEDED` at https://ai4se.onrender.com/tasks/public-demo with zero rounds remaining.
+
+Guardrail: `outside action denied`.
+
+Feedback: `assertion`.
+
+Progress: `read_file -> apply_patch -> apply_patch -> finish`.
+
+The public result exposed no credentials, provider setup, local or temporary paths, prompt/source/patch bodies, tracebacks, or server errors. Task results are process-local and may return HTTP 404 after a restart or free-tier sleep until the bundled scenario is rerun.
 
 Task 3 review and final audit pending.
 
@@ -95,4 +105,4 @@ The included public mock mode is intended for demonstrations and repeatable chec
 
 ## Known Limitations
 
-The hosted demonstration is mock-only, free-tier, ephemeral, and not a production service. This repository does not provide managed credentials or a production service guarantee. Local container execution requires a locally available Docker-compatible runtime; no local Docker CLI success is claimed by the recorded release evidence.
+The hosted demonstration is mock-only, free-tier, ephemeral, and not a production service. No credentials, provider configuration, database, or persistent disk are attached to this free-tier public mock service. This repository does not provide managed credentials or a production service guarantee. Local container execution requires a locally available Docker-compatible runtime; no local Docker CLI success is claimed by the recorded release evidence.
