@@ -833,6 +833,7 @@ class AuditLogger:
                         receipt_path,
                         append=False,
                     )
+                    receipt_created = receipt_descriptor is None
                     try:
                         if receipt_descriptor is not None:
                             receipt = _load_audit_receipt(receipt_descriptor)
@@ -857,7 +858,7 @@ class AuditLogger:
                             pending_event_id=event_id,
                             pending_start_offset=offset,
                         )
-                        if receipt_descriptor is None:
+                        if receipt_created:
                             receipt_descriptor = _open_audit(
                                 receipt_path,
                                 append=False,
@@ -874,6 +875,9 @@ class AuditLogger:
                             event_id,
                             offset,
                             encoded,
+                            created=receipt_created,
+                            index_root=index_root,
+                            receipt_parent=receipt_path.parent,
                         )
                         _store_audit_checkpoint(
                             checkpoint_descriptor,
@@ -1454,6 +1458,10 @@ def _commit_audit_receipt(
     event_id: str,
     offset: int,
     encoded: bytes,
+    *,
+    created: bool,
+    index_root: Path,
+    receipt_parent: Path,
 ) -> None:
     """Durably index only a JSONL record that was already fsynced."""
     previous = _load_audit_receipt(descriptor, allow_torn=True)
@@ -1487,6 +1495,8 @@ def _commit_audit_receipt(
     )
     _write_all(descriptor, payload)
     os.fsync(descriptor)
+    if created:
+        _sync_audit_directory_chain(index_root, receipt_parent)
 
 
 def _verify_audit_receipt(
@@ -1579,7 +1589,8 @@ def _recover_pending_audit_reservation(
         raise AuditRecoveryRequired
     receipt_path = _audit_receipt_path(index_root, event_id)
     receipt_descriptor = _open_existing_audit(receipt_path, append=False)
-    if receipt_descriptor is None:
+    receipt_created = receipt_descriptor is None
+    if receipt_created:
         receipt_descriptor = _open_audit(receipt_path, append=False)
     try:
         receipt = _load_audit_receipt(receipt_descriptor, allow_torn=True)
@@ -1589,6 +1600,9 @@ def _recover_pending_audit_reservation(
                 event_id,
                 start_offset,
                 encoded,
+                created=receipt_created,
+                index_root=index_root,
+                receipt_parent=receipt_path.parent,
             )
         else:
             _verify_audit_receipt(audit_descriptor, receipt, event_id)
@@ -1655,7 +1669,8 @@ def _reconcile_audit_index(
                 receipt_path,
                 append=False,
             )
-            if receipt_descriptor is None:
+            receipt_created = receipt_descriptor is None
+            if receipt_created:
                 receipt_descriptor = _open_audit(receipt_path, append=False)
             try:
                 existing = _load_audit_receipt(
@@ -1672,6 +1687,9 @@ def _reconcile_audit_index(
                         event_id,
                         offset,
                         encoded,
+                        created=receipt_created,
+                        index_root=index_root,
+                        receipt_parent=receipt_path.parent,
                     )
             finally:
                 os.close(receipt_descriptor)
@@ -2414,7 +2432,8 @@ def _copy_r4_receipt(
     )
     target_path = _audit_receipt_path(index_root, receipt.event_id)
     target_descriptor = _open_existing_migration_target(target_path)
-    if target_descriptor is None:
+    target_created = target_descriptor is None
+    if target_created:
         target_descriptor = _open_audit(target_path, append=False)
     try:
         try:
@@ -2430,6 +2449,9 @@ def _copy_r4_receipt(
                 receipt.event_id,
                 receipt.offset,
                 encoded,
+                created=target_created,
+                index_root=index_root,
+                receipt_parent=target_path.parent,
             )
         elif (
             existing.get("version") != 2
@@ -2449,7 +2471,6 @@ def _copy_r4_receipt(
                 raise AuditRecoveryRequired from None
     finally:
         os.close(target_descriptor)
-    _sync_audit_directory_chain(index_root, target_path.parent)
 
 
 def _publish_r4_migration_checkpoint(

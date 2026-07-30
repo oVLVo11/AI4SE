@@ -661,6 +661,322 @@ def test_append_before_receipt_crash_replays_without_duplicate(
     assert [record["event_id"] for record in records] == [event.event_id]
 
 
+def _prepare_receipt_directory_durability_logger(
+    tmp_path: Path,
+) -> tuple[AuditLogger, Path, Path]:
+    """Create the audit index before recording receipt-publication calls."""
+    from pyquality import security
+
+    path = tmp_path / "audit.jsonl"
+    index_base = tmp_path / "index"
+    logger = AuditLogger(path, index_root=index_base)
+    descriptor = security._open_audit(path)
+    try:
+        index_root = security._audit_index_root(path, descriptor, index_base)
+        security._ensure_secure_audit_index_root(index_base, index_root)
+    finally:
+        os.close(descriptor)
+    return logger, path, index_root
+
+
+def test_receipt_directory_durability_normal_append_orders_receipt_before_checkpoint_clear(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A missing receipt-directory fsync would clear the reservation too early."""
+    from pyquality import security
+
+    logger, _, index_root = _prepare_receipt_directory_durability_logger(tmp_path)
+    event = AuditEvent(event_id="d" * 64, event_type="transition")
+    receipt_path = security._audit_receipt_path(index_root, event.event_id)
+    calls: list[str] = []
+    sync_calls: list[tuple[Path, Path]] = []
+    receipt_descriptor: int | None = None
+    real_open = security._open_audit
+    real_fsync = security.os.fsync
+    real_store = security._store_audit_checkpoint
+
+    def record_open(
+        target: Path,
+        *,
+        append: bool = True,
+        create: bool = True,
+    ) -> int:
+        nonlocal receipt_descriptor
+        descriptor = real_open(target, append=append, create=create)
+        if Path(target) == receipt_path:
+            receipt_descriptor = descriptor
+        return descriptor
+
+    def record_fsync(descriptor: int) -> None:
+        real_fsync(descriptor)
+        if descriptor == receipt_descriptor:
+            calls.append("receipt-file-fsync")
+
+    def record_sync(root: Path, leaf: Path) -> None:
+        sync_calls.append((root, leaf))
+        calls.append("receipt-directory-fsync")
+
+    def record_store(*args: object, **kwargs: object):
+        previous = args[1] if len(args) > 1 else kwargs.get("previous")
+        if (
+            previous is not None
+            and previous.pending_event_id == event.event_id
+            and kwargs.get("pending_event_id") is None
+        ):
+            calls.append("clear-pending-checkpoint")
+        return real_store(*args, **kwargs)
+
+    monkeypatch.setattr(security, "_open_audit", record_open)
+    monkeypatch.setattr(security.os, "fsync", record_fsync)
+    monkeypatch.setattr(security, "_sync_audit_directory_chain", record_sync)
+    monkeypatch.setattr(security, "_store_audit_checkpoint", record_store)
+
+    logger.emit(event)
+
+    assert calls.index("receipt-file-fsync") < calls.index("receipt-directory-fsync")
+    assert calls.index("receipt-directory-fsync") < calls.index("clear-pending-checkpoint")
+    assert sync_calls == [(index_root, receipt_path.parent)]
+
+
+def test_receipt_directory_durability_normal_append_sync_failure_retains_pending_checkpoint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A parent-directory failure must retain the exact durable reservation."""
+    from pyquality import security
+
+    logger, path, index_root = _prepare_receipt_directory_durability_logger(tmp_path)
+    event = AuditEvent(event_id="e" * 64, event_type="transition")
+
+    def fail_directory_sync(root: Path, leaf: Path) -> None:
+        del root, leaf
+        raise OSError("simulated directory sync failure")
+
+    monkeypatch.setattr(security, "_sync_audit_directory_chain", fail_directory_sync)
+
+    with pytest.raises(AuditWriteError):
+        logger.emit(event)
+
+    checkpoint_descriptor = security._open_audit(
+        index_root / "checkpoint",
+        append=False,
+    )
+    try:
+        checkpoint = security._load_audit_checkpoint(
+            checkpoint_descriptor,
+            audit_size=path.stat().st_size,
+        )
+    finally:
+        os.close(checkpoint_descriptor)
+    assert checkpoint is not None
+    assert checkpoint.pending_event_id == event.event_id
+    assert checkpoint.committed_receipt_count == 0
+
+
+def test_receipt_directory_durability_normal_append_recovers_after_post_sync_checkpoint_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failure after publication but before clearance must reconcile exactly once."""
+    from pyquality import security
+
+    logger, path, index_root = _prepare_receipt_directory_durability_logger(tmp_path)
+    event = AuditEvent(event_id="f" * 64, event_type="transition")
+    directory_synced = False
+    faulted = False
+    real_store = security._store_audit_checkpoint
+
+    def record_sync(root: Path, leaf: Path) -> None:
+        nonlocal directory_synced
+        assert (root, leaf) == (
+            index_root,
+            security._audit_receipt_path(index_root, event.event_id).parent,
+        )
+        directory_synced = True
+
+    def fail_once_after_directory_sync(*args: object, **kwargs: object):
+        nonlocal faulted
+        previous = args[1] if len(args) > 1 else kwargs.get("previous")
+        if (
+            not faulted
+            and directory_synced
+            and previous is not None
+            and previous.pending_event_id == event.event_id
+            and kwargs.get("pending_event_id") is None
+        ):
+            faulted = True
+            raise OSError("simulated checkpoint-clear failure")
+        return real_store(*args, **kwargs)
+
+    monkeypatch.setattr(security, "_sync_audit_directory_chain", record_sync)
+    monkeypatch.setattr(
+        security,
+        "_store_audit_checkpoint",
+        fail_once_after_directory_sync,
+    )
+
+    with pytest.raises(AuditWriteError):
+        logger.emit(event)
+    assert directory_synced and faulted
+
+    logger.emit(event)
+
+    checkpoint_descriptor = security._open_audit(
+        index_root / "checkpoint",
+        append=False,
+    )
+    try:
+        checkpoint = security._load_audit_checkpoint(
+            checkpoint_descriptor,
+            audit_size=path.stat().st_size,
+        )
+    finally:
+        os.close(checkpoint_descriptor)
+    assert checkpoint is not None
+    assert checkpoint.pending_event_id is None
+    assert checkpoint.committed_receipt_count == 1
+    assert len(path.read_bytes().splitlines()) == 1
+    assert security._audit_receipt_path(index_root, event.event_id).exists()
+
+
+def test_receipt_directory_durability_reconciliation_orders_new_receipt_before_checkpoint_clear(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Suffix reconciliation must publish its new receipt before clearing pending work."""
+    from pyquality import security
+
+    path = tmp_path / "audit.jsonl"
+    index_base = tmp_path / "index"
+    logger = AuditLogger(path, index_root=index_base)
+    event = AuditEvent(event_id="a" * 64, event_type="transition")
+    _prepare_existing_audit(path, logger._encode(event))
+    descriptor = security._open_audit(path)
+    try:
+        os.fsync(descriptor)
+        index_root = security._audit_index_root(path, descriptor, index_base)
+        security._ensure_secure_audit_index_root(index_base, index_root)
+    finally:
+        os.close(descriptor)
+    receipt_path = security._audit_receipt_path(index_root, event.event_id)
+    calls: list[str] = []
+    sync_calls: list[tuple[Path, Path]] = []
+    receipt_descriptor: int | None = None
+    real_open = security._open_audit
+    real_fsync = security.os.fsync
+    real_store = security._store_audit_checkpoint
+
+    def record_open(
+        target: Path,
+        *,
+        append: bool = True,
+        create: bool = True,
+    ) -> int:
+        nonlocal receipt_descriptor
+        opened = real_open(target, append=append, create=create)
+        if Path(target) == receipt_path:
+            receipt_descriptor = opened
+        return opened
+
+    def record_fsync(opened: int) -> None:
+        real_fsync(opened)
+        if opened == receipt_descriptor:
+            calls.append("receipt-file-fsync")
+
+    def record_sync(root: Path, leaf: Path) -> None:
+        sync_calls.append((root, leaf))
+        calls.append("receipt-directory-fsync")
+
+    def record_store(*args: object, **kwargs: object):
+        previous = args[1] if len(args) > 1 else kwargs.get("previous")
+        if (
+            previous is not None
+            and previous.pending_event_id == event.event_id
+            and kwargs.get("pending_event_id") is None
+        ):
+            calls.append("clear-pending-checkpoint")
+        return real_store(*args, **kwargs)
+
+    monkeypatch.setattr(security, "_open_audit", record_open)
+    monkeypatch.setattr(security.os, "fsync", record_fsync)
+    monkeypatch.setattr(security, "_sync_audit_directory_chain", record_sync)
+    monkeypatch.setattr(security, "_store_audit_checkpoint", record_store)
+
+    logger.emit(event)
+
+    assert calls.index("receipt-file-fsync") < calls.index("receipt-directory-fsync")
+    assert calls.index("receipt-directory-fsync") < calls.index("clear-pending-checkpoint")
+    assert sync_calls == [(index_root, receipt_path.parent)]
+
+
+def test_receipt_directory_durability_reconciliation_sync_failure_retains_pending_checkpoint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A reconciliation directory failure must not count its pending suffix event."""
+    from pyquality import security
+
+    path = tmp_path / "audit.jsonl"
+    index_base = tmp_path / "index"
+    logger = AuditLogger(path, index_root=index_base)
+    event = AuditEvent(event_id="b" * 64, event_type="transition")
+    _prepare_existing_audit(path, logger._encode(event))
+    descriptor = security._open_audit(path)
+    try:
+        os.fsync(descriptor)
+        index_root = security._audit_index_root(path, descriptor, index_base)
+        security._ensure_secure_audit_index_root(index_base, index_root)
+    finally:
+        os.close(descriptor)
+
+    def fail_directory_sync(root: Path, leaf: Path) -> None:
+        del root, leaf
+        raise OSError("simulated directory sync failure")
+
+    monkeypatch.setattr(security, "_sync_audit_directory_chain", fail_directory_sync)
+
+    with pytest.raises(AuditWriteError):
+        logger.emit(event)
+
+    checkpoint_descriptor = security._open_audit(
+        index_root / "checkpoint",
+        append=False,
+    )
+    try:
+        checkpoint = security._load_audit_checkpoint(
+            checkpoint_descriptor,
+            audit_size=path.stat().st_size,
+        )
+    finally:
+        os.close(checkpoint_descriptor)
+    assert checkpoint is not None
+    assert checkpoint.pending_event_id == event.event_id
+    assert checkpoint.committed_receipt_count == 0
+
+
+def test_receipt_directory_durability_existing_receipt_skips_publication_sync(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Replaying an already verified receipt must not publish a directory entry again."""
+    from pyquality import security
+
+    logger, _, _ = _prepare_receipt_directory_durability_logger(tmp_path)
+    event = AuditEvent(event_id="c" * 64, event_type="transition")
+    logger.emit(event)
+    sync_calls: list[tuple[Path, Path]] = []
+
+    def record_sync(root: Path, leaf: Path) -> None:
+        sync_calls.append((root, leaf))
+
+    monkeypatch.setattr(security, "_sync_audit_directory_chain", record_sync)
+
+    logger.emit(event)
+
+    assert sync_calls == []
+
+
 @pytest.mark.parametrize("written_bytes", [0, 1, 47])
 def test_torn_receipt_update_retains_prior_valid_slot(
     tmp_path: Path,
@@ -699,6 +1015,12 @@ def test_torn_receipt_update_retains_prior_valid_slot(
                 event.event_id,
                 0,
                 encoded,
+                created=False,
+                index_root=index_root,
+                receipt_parent=security._audit_receipt_path(
+                    index_root,
+                    event.event_id,
+                ).parent,
             )
     finally:
         os.close(receipt_descriptor)
@@ -1132,8 +1454,20 @@ def test_pending_reservation_recovers_each_crash_boundary(
         event_id: str,
         offset: int,
         encoded: bytes,
+        *,
+        created: bool,
+        index_root: Path,
+        receipt_parent: Path,
     ) -> None:
-        real_commit(descriptor, event_id, offset, encoded)
+        real_commit(
+            descriptor,
+            event_id,
+            offset,
+            encoded,
+            created=created,
+            index_root=index_root,
+            receipt_parent=receipt_parent,
+        )
         if stage == "receipt_committed" and event_id == first.event_id:
             fail_once()
 
@@ -1276,8 +1610,20 @@ def test_suffix_reconciliation_resumes_each_reserved_record_stage(
         event_id: str,
         offset: int,
         encoded: bytes,
+        *,
+        created: bool,
+        index_root: Path,
+        receipt_parent: Path,
     ) -> None:
-        real_commit(descriptor, event_id, offset, encoded)
+        real_commit(
+            descriptor,
+            event_id,
+            offset,
+            encoded,
+            created=created,
+            index_root=index_root,
+            receipt_parent=receipt_parent,
+        )
         if stage == "receipt_commit" and event_id == first.event_id:
             fail_once()
 
@@ -1829,6 +2175,12 @@ def test_released_r4_conflicts_with_existing_committed_r5_data(
             events[0].event_id,
             0,
             records[0],
+            created=True,
+            index_root=new_root,
+            receipt_parent=security._audit_receipt_path(
+                new_root,
+                events[0].event_id,
+            ).parent,
         )
     finally:
         os.close(receipt_descriptor)
@@ -2129,10 +2481,22 @@ def test_completed_r4_marker_allows_pending_r5_recovery(
         event_id: str,
         offset: int,
         encoded: bytes,
+        *,
+        created: bool,
+        index_root: Path,
+        receipt_parent: Path,
     ) -> None:
         if event_id == live.event_id:
             raise OSError("simulated post-migration receipt crash")
-        real_commit(descriptor, event_id, offset, encoded)
+        real_commit(
+            descriptor,
+            event_id,
+            offset,
+            encoded,
+            created=created,
+            index_root=index_root,
+            receipt_parent=receipt_parent,
+        )
 
     with monkeypatch.context() as fault:
         fault.setattr(security, "_commit_audit_receipt", fail_before_receipt_commit)
