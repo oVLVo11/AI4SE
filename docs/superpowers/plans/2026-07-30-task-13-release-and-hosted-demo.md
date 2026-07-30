@@ -117,10 +117,10 @@ Create a public repository named `pyquality-harness` with no generated README, l
 git remote -v
 $githubCloneUrl = 'the exact HTTPS clone URL visibly returned by GitHub in Step 3'
 git remote add origin $githubCloneUrl
-git push -u origin master
+git push -u origin HEAD:master
 ```
 
-If browser/credential-manager authentication is required, pause for the user. Verify `git ls-remote origin refs/heads/master` equals the intended local commit. Never push other branches or tags in this step.
+If browser/credential-manager authentication is required, pause for the user. Verify `git ls-remote origin refs/heads/master` equals the reviewed feature-branch HEAD. This publishes the isolated Task 13 branch as remote `master` without prematurely merging local `master`. Never push other branches or tags in this step.
 
 - [ ] **Step 5: Observe the initial Actions run**
 
