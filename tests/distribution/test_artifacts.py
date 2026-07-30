@@ -36,11 +36,15 @@ EXPECTED_TASK_12_COMMITS = (
     "f916136",
     EXPECTED_TASK_12_FINAL_COMMIT,
 )
-EXPECTED_TASK_13_STATUS = "In progress"
-EXPECTED_TASK_13_AGENT = "`/root/task13_local_gate`"
-EXPECTED_TASK_13_SPEC_REVIEW = "Public GitHub source publication explicitly authorized; repository, CI, Render, and hosted evidence pending"
-EXPECTED_TASK_13_QUALITY_REVIEW = "Pre-publication local gate pending; no repository URL, remote CI, Render URL, or hosted SUCCEEDED evidence yet"
-EXPECTED_TASK_13_COMMIT = "7f8dd42"
+EXPECTED_TASK_13_STATUS = "In progress; repository and CI evidence complete; Render deployment pending"
+EXPECTED_TASK_13_AGENT = "`/root/task13_github`"
+EXPECTED_TASK_13_SPEC_REVIEW = "Public repository and initial CI evidence recorded; Render and hosted evidence pending"
+EXPECTED_TASK_13_QUALITY_REVIEW = "GitHub Actions run 30544072702 completed with conclusion success; pytest, Ruff, package, and Docker build succeeded; Render deployment pending"
+EXPECTED_TASK_13_COMMITS = ("7f8dd42", "9fdd7c4", "89544fc")
+EXPECTED_PUBLIC_REPOSITORY_URL = "https://github.com/oVLVo11/AI4SE"
+EXPECTED_INITIAL_CI_URL = "https://github.com/oVLVo11/AI4SE/actions/runs/30544072702"
+EXPECTED_INITIAL_CI_SHA = "89544fc9d295fdbe0d6d20fd1ffc202d5238144f"
+EXPECTED_INITIAL_CI_CONCLUSION = "success"
 
 
 def _read(relative_path: str) -> str:
@@ -99,7 +103,7 @@ def _validate_root_evidence(plan: str, agent_log: str) -> None:
         "11A": ("87e5ad7", "63b08cf", "07cffcd", "5eb42fb", "ea569a9", "47bed5d", "6de2411"),
         "11B": ("d396c24", "e7448ff", "cad8e17"),
         "12": EXPECTED_TASK_12_COMMITS,
-        "13": (EXPECTED_TASK_13_COMMIT,),
+        "13": EXPECTED_TASK_13_COMMITS,
     }
     for task, expected in required_commits.items():
         actual = tuple(re.findall(r"\b[0-9a-f]{7,40}\b", ledger[task][4]))
@@ -142,20 +146,13 @@ def _validate_root_evidence(plan: str, agent_log: str) -> None:
     ):
         assert text in task_12_final
     for text in (
-        "public GitHub source publication",
-        "explicitly authorized",
-        "repository, CI, Render, and hosted evidence pending",
-        "no repository URL, remote CI, Render URL, or hosted SUCCEEDED evidence yet",
+        EXPECTED_PUBLIC_REPOSITORY_URL,
+        EXPECTED_INITIAL_CI_URL,
+        EXPECTED_INITIAL_CI_SHA,
+        EXPECTED_INITIAL_CI_CONCLUSION,
+        "Render deployment pending",
     ):
         assert text in task_13
-    for fabricated_claim in (
-        "https://github.com/",
-        "Remote CI: SUCCEEDED",
-        "Render URL:",
-        "Hosted acceptance: SUCCEEDED",
-        "Docker image build succeeded",
-    ):
-        assert fabricated_claim not in task_13
     for commit in ("6de2411", "cad8e17", *EXPECTED_TASK_12_COMMITS):
         assert commit in agent_log
 
@@ -164,7 +161,7 @@ def test_task12_completion_records_final_clean_local_evidence() -> None:
     _validate_root_evidence(_read("PLAN.md"), _read("AGENT_LOG.md"))
 
 
-def test_task13_prepublication_records_authorization_and_pending_remote_evidence() -> None:
+def test_task13_records_observed_public_repository_and_initial_ci_evidence() -> None:
     ledger = _task_ledger_rows(_read("PLAN.md"))
     assert ledger["12"][0].strip() == EXPECTED_TASK_12_STATUS
     assert ledger["12"][2].strip() == EXPECTED_TASK_12_SPEC_REVIEW
@@ -175,9 +172,19 @@ def test_task13_prepublication_records_authorization_and_pending_remote_evidence
         EXPECTED_TASK_13_AGENT,
         EXPECTED_TASK_13_SPEC_REVIEW,
         EXPECTED_TASK_13_QUALITY_REVIEW,
-        f"`{EXPECTED_TASK_13_COMMIT}`",
+        ", ".join(f"`{commit}`" for commit in EXPECTED_TASK_13_COMMITS),
     )
     _validate_root_evidence(_read("PLAN.md"), _read("AGENT_LOG.md"))
+    for document in ("README.md", "PLAN.md", "AGENT_LOG.md"):
+        content = _read(document)
+        for expected in (
+            EXPECTED_PUBLIC_REPOSITORY_URL,
+            EXPECTED_INITIAL_CI_URL,
+            EXPECTED_INITIAL_CI_SHA,
+            EXPECTED_INITIAL_CI_CONCLUSION,
+            "Render deployment pending",
+        ):
+            assert expected in content
 
 
 @pytest.mark.parametrize(
@@ -294,25 +301,26 @@ def test_root_evidence_contract_rejects_appended_task_12_quality_contradictions(
 
 
 @pytest.mark.parametrize(
-    "fabricated_claim",
+    ("path", "expected", "replacement"),
     (
-        "Repository URL: https://github.com/example/pyquality-harness",
-        "Remote CI: SUCCEEDED",
-        "Render URL: https://pyquality-harness.onrender.com",
-        "Hosted acceptance: SUCCEEDED",
-        "Docker image build succeeded",
+        ("README.md", EXPECTED_PUBLIC_REPOSITORY_URL, "https://github.com/example/AI4SE"),
+        ("PLAN.md", EXPECTED_INITIAL_CI_URL, "https://github.com/example/AI4SE/actions/runs/1"),
+        ("AGENT_LOG.md", EXPECTED_INITIAL_CI_SHA, "deadbeef"),
+        ("AGENT_LOG.md", EXPECTED_INITIAL_CI_CONCLUSION, "failure"),
     ),
 )
-def test_task13_prepublication_rejects_fabricated_remote_or_docker_evidence(
+def test_task13_release_evidence_rejects_tampered_observed_values(
     monkeypatch: pytest.MonkeyPatch,
-    fabricated_claim: str,
+    path: str,
+    expected: str,
+    replacement: str,
 ) -> None:
-    documents = {name: _read(name) for name in ("PLAN.md", "AGENT_LOG.md")}
-    documents["AGENT_LOG.md"] = f"{documents['AGENT_LOG.md']}\n{fabricated_claim}\n"
+    documents = {name: _read(name) for name in ("README.md", "PLAN.md", "AGENT_LOG.md")}
+    documents[path] = documents[path].replace(expected, replacement)
 
     monkeypatch.setitem(globals(), "_read", documents.__getitem__)
     with pytest.raises(AssertionError):
-        test_task13_prepublication_records_authorization_and_pending_remote_evidence()
+        test_task13_records_observed_public_repository_and_initial_ci_evidence()
 
 
 def test_root_evidence_contract_does_not_require_git_history(

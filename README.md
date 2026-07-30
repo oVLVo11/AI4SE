@@ -61,6 +61,16 @@ docker run --rm -p 8000:8000 pyquality-harness
 
 Create a Docker-based web service from this repository, configure its service port as `8000`, and deploy the supplied Dockerfile unchanged. The image starts only public mock mode, so it needs no provider credential configuration. This is a deployment procedure for a compatible platform, not a hosted service offered by this project.
 
+### Release evidence
+
+Public repository: https://github.com/oVLVo11/AI4SE
+
+Initial verified CI run: https://github.com/oVLVo11/AI4SE/actions/runs/30544072702
+
+Commit: `89544fc9d295fdbe0d6d20fd1ffc202d5238144f`; conclusion: `success`.
+
+Render deployment pending.
+
 ## Credential Security
 
 Public mock mode does not require credentials. For local mode, prefer keyring-first storage. `PYQUALITY_API_KEY` is a warned plaintext fallback; do not place it, provider credentials, API keys, tokens, or passwords in source files, container build arguments, environment files committed to Git, or command history.

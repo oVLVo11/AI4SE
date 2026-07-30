@@ -17,7 +17,7 @@
 | 11A | Blocked; breaker reached | unavailable | Fifth review left the POSIX parent-directory durability defect | Remediation reached its five-round breaker | `87e5ad7`, `63b08cf`, `07cffcd`, `5eb42fb`, `ea569a9`, `47bed5d`, `6de2411` |
 | 11B | Complete | `/root/task11b_impl` | `/root/task11b_review`: CLEAN after task and final review | Task and final review CLEAN; focused durability 11 passed; affected 128 passed, 4 skipped; full 581 passed, 10 skipped; Ruff and diff clean | `d396c24`, `e7448ff`, `cad8e17` |
 | 12 | Complete | `/root/task12_artifacts`, `/root/task12_evidence` | `/root/task12_task1_review`: final scoped review CLEAN; broad final review CLEAN | Final controller/merged verification at e7892cd: full pytest to 100%; Ruff and diff exit 0; Docker CLI unavailable; no local image build claimed | `6d06a3e`, `783a814`, `869dd20`, `8e1792d`, `2313c29`, `5ebe41b`, `469d268`, `1d37067`, `f916136`, `e7892cd` |
-| 13 | In progress | `/root/task13_local_gate` | Public GitHub source publication explicitly authorized; repository, CI, Render, and hosted evidence pending | Pre-publication local gate pending; no repository URL, remote CI, Render URL, or hosted SUCCEEDED evidence yet | `7f8dd42` |
+| 13 | In progress; repository and CI evidence complete; Render deployment pending | `/root/task13_github` | Public repository and initial CI evidence recorded; Render and hosted evidence pending | GitHub Actions run 30544072702 completed with conclusion success; pytest, Ruff, package, and Docker build succeeded; Render deployment pending | `7f8dd42`, `9fdd7c4`, `89544fc` |
 
 # PyQuality Harness Implementation Plan
 
@@ -1007,6 +1007,8 @@ git commit -m "docs: complete packaging and course delivery contract"
 ```
 
 ### Task 13: Final Release and Hosted Demonstration Evidence
+
+**Recorded repository and CI evidence:** Public repository https://github.com/oVLVo11/AI4SE; GitHub Actions run https://github.com/oVLVo11/AI4SE/actions/runs/30544072702 completed with conclusion success for `89544fc9d295fdbe0d6d20fd1ffc202d5238144f`. Pytest, Ruff, package, and Docker build succeeded. Render deployment pending.
 
 **Files:**
 - Modify: `SPEC.md`
