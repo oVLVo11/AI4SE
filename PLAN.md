@@ -17,7 +17,7 @@
 | 11A | Blocked; breaker reached | unavailable | Fifth review left the POSIX parent-directory durability defect | Remediation reached its five-round breaker | `87e5ad7`, `63b08cf`, `07cffcd`, `5eb42fb`, `ea569a9`, `47bed5d`, `6de2411` |
 | 11B | Complete | `/root/task11b_impl` | `/root/task11b_review`: CLEAN after task and final review | Task and final review CLEAN; focused durability 11 passed; affected 128 passed, 4 skipped; full 581 passed, 10 skipped; Ruff and diff clean | `d396c24`, `e7448ff`, `cad8e17` |
 | 12 | Complete | `/root/task12_artifacts`, `/root/task12_evidence` | `/root/task12_task1_review`: final scoped review CLEAN; broad final review CLEAN | Final controller/merged verification at e7892cd: full pytest to 100%; Ruff and diff exit 0; Docker CLI unavailable; no local image build claimed | `6d06a3e`, `783a814`, `869dd20`, `8e1792d`, `2313c29`, `5ebe41b`, `469d268`, `1d37067`, `f916136`, `e7892cd` |
-| 13 | In progress; hosted evidence recorded; Task 3 review and final audit pending | `/root/task13_github`, `/root/task13_render` | Public repository, final CI, and hosted mock evidence recorded; Task 3 review and final audit pending | GitHub Actions run 30562643715 completed with conclusion success; pytest, Ruff, package, and Docker succeeded; hosted public mock reached SUCCEEDED; review pending | `7f8dd42`, `9fdd7c4`, `89544fc`, `a1672c4`, `ad4229c`, `c49283f`, `aceb2d7`, `710600d`, `3d90e63`, `9127380`, `f776f1e`, `690e23e` |
+| 13 | In progress; implementation tasks reviewed; final broad review pending | `/root/task13_github`, `/root/task13_render` | Task 1, Task 2, public-mock subplan, and Task 3 scoped reviews CLEAN; final broad review pending | Verified pre-audit head 82958a8: GitHub Actions 30567593776 success with pytest, Ruff, package, and Docker; hosted public mock reached SUCCEEDED; final broad review pending | `7f8dd42`, `1d4c237`, `9fdd7c4`, `89544fc`, `cc7ea93`, `a1672c4`, `ad4229c`, `c49283f`, `aceb2d7`, `710600d`, `3d90e63`, `9127380`, `f776f1e`, `690e23e`, `06a5bf8`, `82958a8` |
 
 # PyQuality Harness Implementation Plan
 
@@ -1008,11 +1008,13 @@ git commit -m "docs: complete packaging and course delivery contract"
 
 ### Task 13: Final Release and Hosted Demonstration Evidence
 
-**Recorded repository and CI evidence:** Public repository https://github.com/oVLVo11/AI4SE.git; initial GitHub Actions run https://github.com/oVLVo11/AI4SE/actions/runs/30544072702 completed with conclusion success for `89544fc9d295fdbe0d6d20fd1ffc202d5238144f`. Final GitHub Actions run https://github.com/oVLVo11/AI4SE/actions/runs/30562643715 completed with conclusion `success` for `690e23e2544936c0bde3e507730c63d34da6af0f`; pytest, Ruff, package, and Docker succeeded. Superseded run https://github.com/oVLVo11/AI4SE/actions/runs/30561047811 failed and is not the final release result.
+**Recorded repository and CI evidence:** Public repository https://github.com/oVLVo11/AI4SE.git; initial GitHub Actions run https://github.com/oVLVo11/AI4SE/actions/runs/30544072702 completed with conclusion success for `89544fc9d295fdbe0d6d20fd1ffc202d5238144f`. Final GitHub Actions run https://github.com/oVLVo11/AI4SE/actions/runs/30567593776 completed with conclusion `success` for `82958a82dfc12b171691042c012c5279ae639dea`; job https://github.com/oVLVo11/AI4SE/actions/runs/30567593776/job/90955887900 reported pytest, Ruff, package, and Docker successful. Superseded run https://github.com/oVLVo11/AI4SE/actions/runs/30561047811 failed and is not the final release result.
 
-**Recorded hosted evidence:** Render service https://ai4se.onrender.com deployed `690e23e2544936c0bde3e507730c63d34da6af0f` as `dep-d9lntmcs728c739h5ffg`. Public acceptance reached terminal `SUCCEEDED` with zero rounds remaining and displayed deterministic guardrail, feedback, and progress evidence. No credentials, provider configuration, database, or persistent disk are attached to this free-tier public mock service. Task 3 review and final audit pending. No local Docker CLI success is claimed.
+**Recorded hosted evidence:** Render service https://ai4se.onrender.com deployed `82958a82dfc12b171691042c012c5279ae639dea` as `dep-d9loso4s728c739i80rg`. No credentials, provider configuration, database, or persistent disk are attached to this free-tier public mock service.
 
-The Render deploy SHA and deploy ID are user-supplied dashboard evidence. GitHub CI evidence was independently verified through the GitHub API. Hosted acceptance was independently verified by the controller through the real HTTP CSRF form. A fresh direct rerun posted the bundled scenario to https://ai4se.onrender.com/tasks and returned HTTP 200 at https://ai4se.onrender.com/tasks/public-demo with terminal `SUCCEEDED` and zero remaining rounds.
+The Render deploy SHA and deploy ID are user-supplied dashboard evidence. The controller independently verified GitHub CI through the GitHub API. Hosted acceptance was independently verified by the controller through the real HTTP CSRF form.
+
+At `2026-07-30 17:50:41 GMT`, the controller independently repeated the real hosted CSRF flow and received HTTP 200 at https://ai4se.onrender.com/tasks/public-demo with terminal `SUCCEEDED` and zero remaining rounds.
 
 Guardrail: `outside action denied`.
 
@@ -1020,7 +1022,15 @@ Feedback: `assertion`.
 
 Progress: `read_file -> apply_patch -> apply_patch -> finish`.
 
+The public response contained no forbidden local or temporary paths, `LEAK` sentinels, prompt/source/patch bodies, provider key, credential prompt, traceback, or server error.
+
 Task results are process-local and may return HTTP 404 after a restart or free-tier sleep until the bundled scenario is rerun.
+
+Local Docker CLI remains unavailable; no local Docker success is claimed.
+
+Task 13 implementation tasks are reviewed; final broad review pending.
+
+These tracked records cover verified pre-audit commit `82958a82dfc12b171691042c012c5279ae639dea` and do not claim CI or deployment success for the later final-audit commit; post-commit remote verification belongs only in ignored evidence.
 
 **Files:**
 - Modify: `SPEC.md`

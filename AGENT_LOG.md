@@ -106,11 +106,11 @@ Task 13 is In progress; repository and CI evidence complete; Render deployment p
 
 ## 2026-07-31 Task 13 hosted public mock evidence
 
-Task 13 is In progress; hosted evidence recorded; Task 3 review and final audit pending. Public repository, final CI, and hosted mock evidence recorded; Task 3 review and final audit pending. Public repository: https://github.com/oVLVo11/AI4SE.git. Initial CI run https://github.com/oVLVo11/AI4SE/actions/runs/30544072702 succeeded for `89544fc9d295fdbe0d6d20fd1ffc202d5238144f`. The reviewed implementation sequence is `a1672c4`, `ad4229c`, `c49283f`, `aceb2d7`, `710600d`, `3d90e63`, `9127380`, `f776f1e`, and `690e23e`, ending at deployed Git SHA `690e23e2544936c0bde3e507730c63d34da6af0f` on remote `master`.
+Task 13 is In progress; implementation tasks reviewed; final broad review pending. Task 1, Task 2, public-mock subplan, and Task 3 scoped reviews CLEAN; final broad review pending. Public repository: https://github.com/oVLVo11/AI4SE.git. Initial CI run https://github.com/oVLVo11/AI4SE/actions/runs/30544072702 succeeded for `89544fc9d295fdbe0d6d20fd1ffc202d5238144f`. The complete reviewed implementation and evidence sequence is `7f8dd42`, `1d4c237`, `9fdd7c4`, `89544fc`, `cc7ea93`, `a1672c4`, `ad4229c`, `c49283f`, `aceb2d7`, `710600d`, `3d90e63`, `9127380`, `f776f1e`, `690e23e`, `06a5bf8`, and `82958a8`.
 
-The Render deploy SHA and deploy ID are user-supplied dashboard evidence. That dashboard evidence identified deploy `dep-d9lntmcs728c739h5ffg` and deployed SHA `690e23e2544936c0bde3e507730c63d34da6af0f` for public service https://ai4se.onrender.com; it is not an agent- or browser-authenticated dashboard observation. GitHub CI evidence was independently verified through the GitHub API. Hosted acceptance was independently verified by the controller through the real HTTP CSRF form.
+The Render deploy SHA and deploy ID are user-supplied dashboard evidence. That dashboard evidence identified deploy `dep-d9loso4s728c739i80rg` and deployed SHA `82958a82dfc12b171691042c012c5279ae639dea` for public service https://ai4se.onrender.com; it is not an agent- or browser-authenticated dashboard observation. The controller independently verified GitHub CI through the GitHub API. Hosted acceptance was independently verified by the controller through the real HTTP CSRF form.
 
-The controller's fresh direct rerun posted the bundled scenario to https://ai4se.onrender.com/tasks and returned HTTP 200 at https://ai4se.onrender.com/tasks/public-demo with terminal `SUCCEEDED` and zero remaining rounds.
+At `2026-07-30 17:50:41 GMT`, the controller independently repeated the real hosted CSRF flow and received HTTP 200 at https://ai4se.onrender.com/tasks/public-demo with terminal `SUCCEEDED` and zero remaining rounds.
 
 Guardrail: `outside action denied`.
 
@@ -120,6 +120,12 @@ Progress: `read_file -> apply_patch -> apply_patch -> finish`.
 
 The public response contained no forbidden local or temporary paths, `LEAK` sentinels, prompt/source/patch bodies, provider key, credential prompt, traceback, or server error. Task results are process-local and may return HTTP 404 after a restart or free-tier sleep until the bundled scenario is rerun. The earlier HTTP 404 was expected process-local state loss after restart or free-tier sleep, not a failed deployment.
 
-No credentials, provider configuration, database, or persistent disk are attached to this free-tier public mock service. It is mock-only, ephemeral, and has no production availability guarantee. No local Docker CLI success is claimed.
+No credentials, provider configuration, database, or persistent disk are attached to this free-tier public mock service. It is mock-only, ephemeral, and has no production availability guarantee.
 
-Final GitHub Actions run https://github.com/oVLVo11/AI4SE/actions/runs/30562643715 completed with conclusion `success` for `690e23e2544936c0bde3e507730c63d34da6af0f`; job https://github.com/oVLVo11/AI4SE/actions/runs/30562643715/job/90939296464 ran from `2026-07-30T16:42:07Z` through `2026-07-30T16:43:20Z`, and pytest, Ruff, package, and Docker succeeded. The run was created at `2026-07-30T16:42:03Z`. Earlier run https://github.com/oVLVo11/AI4SE/actions/runs/30561047811 failed and was superseded; it is not represented as final passing evidence. The complete Task 13 commit record is `7f8dd42`, `9fdd7c4`, `89544fc`, `a1672c4`, `ad4229c`, `c49283f`, `aceb2d7`, `710600d`, `3d90e63`, `9127380`, `f776f1e`, and `690e23e`.
+Local Docker CLI remains unavailable; no local Docker success is claimed.
+
+Final GitHub Actions run https://github.com/oVLVo11/AI4SE/actions/runs/30567593776 completed with conclusion `success` for `82958a82dfc12b171691042c012c5279ae639dea`; job https://github.com/oVLVo11/AI4SE/actions/runs/30567593776/job/90955887900 reported pytest, Ruff, package, and Docker successful.
+
+Task 13 implementation tasks are reviewed; final broad review pending.
+
+These tracked records cover verified pre-audit commit `82958a82dfc12b171691042c012c5279ae639dea` and do not claim CI or deployment success for the later final-audit commit; post-commit remote verification belongs only in ignored evidence.

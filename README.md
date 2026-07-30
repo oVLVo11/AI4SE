@@ -71,13 +71,13 @@ Initial verified CI run: https://github.com/oVLVo11/AI4SE/actions/runs/305440727
 
 Commit: `89544fc9d295fdbe0d6d20fd1ffc202d5238144f`; conclusion: `success`.
 
-Final GitHub Actions run https://github.com/oVLVo11/AI4SE/actions/runs/30562643715 completed with conclusion `success`. Pytest, Ruff, package, and Docker jobs succeeded.
+Final GitHub Actions run https://github.com/oVLVo11/AI4SE/actions/runs/30567593776 completed with conclusion `success` for `82958a82dfc12b171691042c012c5279ae639dea`; job https://github.com/oVLVo11/AI4SE/actions/runs/30567593776/job/90955887900 reported pytest, Ruff, package, and Docker successful.
 
-Render service: https://ai4se.onrender.com; deployed commit: `690e23e2544936c0bde3e507730c63d34da6af0f`; deploy ID: `dep-d9lntmcs728c739h5ffg`.
+Render service: https://ai4se.onrender.com; deployed commit: `82958a82dfc12b171691042c012c5279ae639dea`; deploy ID: `dep-d9loso4s728c739i80rg`.
 
-The Render deploy SHA and deploy ID are user-supplied dashboard evidence. GitHub CI evidence was independently verified through the GitHub API. Hosted acceptance was independently verified by the controller through the real HTTP CSRF form.
+The Render deploy SHA and deploy ID are user-supplied dashboard evidence. The controller independently verified GitHub CI through the GitHub API. Hosted acceptance was independently verified by the controller through the real HTTP CSRF form.
 
-The controller submitted the bundled scenario and reached terminal `SUCCEEDED` at https://ai4se.onrender.com/tasks/public-demo with zero rounds remaining.
+At `2026-07-30 17:50:41 GMT`, the controller independently repeated the real hosted CSRF flow and received HTTP 200 at https://ai4se.onrender.com/tasks/public-demo with terminal `SUCCEEDED` and zero remaining rounds.
 
 Guardrail: `outside action denied`.
 
@@ -85,9 +85,15 @@ Feedback: `assertion`.
 
 Progress: `read_file -> apply_patch -> apply_patch -> finish`.
 
-The public result exposed no credentials, provider setup, local or temporary paths, prompt/source/patch bodies, tracebacks, or server errors. Task results are process-local and may return HTTP 404 after a restart or free-tier sleep until the bundled scenario is rerun.
+The public response contained no forbidden local or temporary paths, `LEAK` sentinels, prompt/source/patch bodies, provider key, credential prompt, traceback, or server error.
 
-Task 3 review and final audit pending.
+Task results are process-local and may return HTTP 404 after a restart or free-tier sleep until the bundled scenario is rerun.
+
+Local Docker CLI remains unavailable; no local Docker success is claimed.
+
+Task 13 implementation tasks are reviewed; final broad review pending.
+
+These tracked records cover verified pre-audit commit `82958a82dfc12b171691042c012c5279ae639dea` and do not claim CI or deployment success for the later final-audit commit; post-commit remote verification belongs only in ignored evidence.
 
 ## Credential Security
 

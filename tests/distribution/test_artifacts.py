@@ -41,22 +41,24 @@ EXPECTED_TASK_12_COMMITS = (
     EXPECTED_TASK_12_FINAL_COMMIT,
 )
 EXPECTED_TASK_13_STATUS = (
-    "In progress; hosted evidence recorded; Task 3 review and final audit pending"
+    "In progress; implementation tasks reviewed; final broad review pending"
 )
 EXPECTED_TASK_13_AGENT = "`/root/task13_github`, `/root/task13_render`"
 EXPECTED_TASK_13_SPEC_REVIEW = (
-    "Public repository, final CI, and hosted mock evidence recorded; "
-    "Task 3 review and final audit pending"
+    "Task 1, Task 2, public-mock subplan, and Task 3 scoped reviews CLEAN; "
+    "final broad review pending"
 )
 EXPECTED_TASK_13_QUALITY_REVIEW = (
-    "GitHub Actions run 30562643715 completed with conclusion success; pytest, "
-    "Ruff, package, and Docker succeeded; hosted public mock reached SUCCEEDED; "
-    "review pending"
+    "Verified pre-audit head 82958a8: GitHub Actions 30567593776 success with "
+    "pytest, Ruff, package, and Docker; hosted public mock reached SUCCEEDED; "
+    "final broad review pending"
 )
 EXPECTED_TASK_13_COMMITS = (
     "7f8dd42",
+    "1d4c237",
     "9fdd7c4",
     "89544fc",
+    "cc7ea93",
     "a1672c4",
     "ad4229c",
     "c49283f",
@@ -66,20 +68,50 @@ EXPECTED_TASK_13_COMMITS = (
     "9127380",
     "f776f1e",
     "690e23e",
+    "06a5bf8",
+    "82958a8",
 )
+EXPECTED_EARLY_TASK_ROWS = {
+    "0": (
+        "Complete",
+        "`/root/task0_docs_coldstart`, `/root/task0_docs_coldstart/coldstart_validator`",
+        "Clean re-review",
+        "Documentation contract checks clean",
+        "`2fdb099`, `b5cdd29`, `efc73b3`",
+    ),
+    "1": (
+        "Complete",
+        "`/root/task1_domain_config`",
+        "Clean after fix round 3",
+        "47 passed; Ruff clean",
+        "`297d277`, `6df8353`, `a3908f9`, `920983e`, `a200b8b`",
+    ),
+    "2": (
+        "Complete",
+        "`/root/task2_storage_memory`",
+        "Clean after fix round 1",
+        (
+            "64 passed; Ruff clean; two deferred minors: repository close/context-manager "
+            "support and directory-prefix/validator-scope selector tests"
+        ),
+        "`73261de`, `a606267`",
+    ),
+}
 EXPECTED_PUBLIC_REPOSITORY_URL = "https://github.com/oVLVo11/AI4SE.git"
 EXPECTED_INITIAL_CI_URL = "https://github.com/oVLVo11/AI4SE/actions/runs/30544072702"
 EXPECTED_INITIAL_CI_SHA = "89544fc9d295fdbe0d6d20fd1ffc202d5238144f"
 EXPECTED_INITIAL_CI_CONCLUSION = "success"
 EXPECTED_HOSTED_URL = "https://ai4se.onrender.com"
-EXPECTED_HOSTED_SHA = "690e23e2544936c0bde3e507730c63d34da6af0f"
-EXPECTED_RENDER_DEPLOY_ID = "dep-d9lntmcs728c739h5ffg"
+EXPECTED_HOSTED_SHA = "82958a82dfc12b171691042c012c5279ae639dea"
+EXPECTED_RENDER_DEPLOY_ID = "dep-d9loso4s728c739i80rg"
 EXPECTED_HOSTED_TERMINAL_RESULT = "SUCCEEDED"
-EXPECTED_FINAL_CI_URL = "https://github.com/oVLVo11/AI4SE/actions/runs/30562643715"
+EXPECTED_FINAL_CI_URL = "https://github.com/oVLVo11/AI4SE/actions/runs/30567593776"
+EXPECTED_FINAL_CI_JOB_URL = f"{EXPECTED_FINAL_CI_URL}/job/90955887900"
 EXPECTED_FINAL_CI_CONCLUSION = "success"
 EXPECTED_FINAL_CI_RECORD = (
     f"Final GitHub Actions run {EXPECTED_FINAL_CI_URL} completed with conclusion "
-    f"`{EXPECTED_FINAL_CI_CONCLUSION}`"
+    f"`{EXPECTED_FINAL_CI_CONCLUSION}` for `{EXPECTED_HOSTED_SHA}`; job "
+    f"{EXPECTED_FINAL_CI_JOB_URL} reported pytest, Ruff, package, and Docker successful."
 )
 EXPECTED_HOSTED_LIMITATION = (
     "No credentials, provider configuration, database, or persistent disk are "
@@ -93,11 +125,33 @@ EXPECTED_ACCEPTANCE_PROVENANCE = (
     "real HTTP CSRF form."
 )
 EXPECTED_CI_PROVENANCE = (
-    "GitHub CI evidence was independently verified through the GitHub API."
+    "The controller independently verified GitHub CI through the GitHub API."
 )
 EXPECTED_PROCESS_LOCAL_LIMITATION = (
     "Task results are process-local and may return HTTP 404 after a restart or "
     "free-tier sleep until the bundled scenario is rerun."
+)
+EXPECTED_ACCEPTANCE_TIME = "2026-07-30 17:50:41 GMT"
+EXPECTED_ACCEPTANCE_RECORD = (
+    f"At `{EXPECTED_ACCEPTANCE_TIME}`, the controller independently repeated the real "
+    f"hosted CSRF flow and received HTTP 200 at {EXPECTED_HOSTED_URL}/tasks/public-demo "
+    "with terminal `SUCCEEDED` and zero remaining rounds."
+)
+EXPECTED_NO_LEAKAGE_RECORD = (
+    "The public response contained no forbidden local or temporary paths, `LEAK` "
+    "sentinels, prompt/source/patch bodies, provider key, credential prompt, traceback, "
+    "or server error."
+)
+EXPECTED_DOCKER_LIMITATION = (
+    "Local Docker CLI remains unavailable; no local Docker success is claimed."
+)
+EXPECTED_REVIEW_STATUS = (
+    "Task 13 implementation tasks are reviewed; final broad review pending."
+)
+EXPECTED_NO_SELF_REFERENCE = (
+    f"These tracked records cover verified pre-audit commit `{EXPECTED_HOSTED_SHA}` and "
+    "do not claim CI or deployment success for the later final-audit commit; post-commit "
+    "remote verification belongs only in ignored evidence."
 )
 EXPECTED_GUARDRAIL_EVIDENCE = "Guardrail: `outside action denied`."
 EXPECTED_FEEDBACK_EVIDENCE = "Feedback: `assertion`."
@@ -152,10 +206,14 @@ def _validate_current_task13_sections(readme: str, plan: str, agent_log: str) ->
         EXPECTED_ACCEPTANCE_PROVENANCE,
         EXPECTED_CI_PROVENANCE,
         EXPECTED_PROCESS_LOCAL_LIMITATION,
+        EXPECTED_ACCEPTANCE_RECORD,
+        EXPECTED_NO_LEAKAGE_RECORD,
+        EXPECTED_DOCKER_LIMITATION,
+        EXPECTED_REVIEW_STATUS,
+        EXPECTED_NO_SELF_REFERENCE,
         EXPECTED_GUARDRAIL_EVIDENCE,
         EXPECTED_FEEDBACK_EVIDENCE,
         EXPECTED_PROGRESS_EVIDENCE,
-        "Task 3 review and final audit pending",
     )
     forbidden = (
         "has production availability",
@@ -165,9 +223,17 @@ def _validate_current_task13_sections(readme: str, plan: str, agent_log: str) ->
         "Task 3 review CLEAN",
         "Task 3 review complete",
         "Task 13 final broad review complete",
+        "final broad review CLEAN",
         "CI and Render deployed commit `06a5bf8`",
+        "the final-audit commit passed CI",
+        "the final-audit commit deployed",
+        "this final audit commit passed CI",
+        "this final audit commit deployed",
         "authenticated browser",
         "Hosted acceptance was user-supplied",
+        "30562643715",
+        "690e23e2544936c0bde3e507730c63d34da6af0f",
+        "dep-d9lntmcs728c739h5ffg",
         "https://github.com/example/",
         "https://example.onrender.com",
         "dep-example",
@@ -177,7 +243,7 @@ def _validate_current_task13_sections(readme: str, plan: str, agent_log: str) ->
         EXPECTED_PUBLIC_REPOSITORY_URL,
         EXPECTED_INITIAL_CI_URL,
         EXPECTED_FINAL_CI_URL,
-        f"{EXPECTED_FINAL_CI_URL}/job/90939296464",
+        EXPECTED_FINAL_CI_JOB_URL,
         "https://github.com/oVLVo11/AI4SE/actions/runs/30561047811",
         EXPECTED_HOSTED_URL,
         f"{EXPECTED_HOSTED_URL}/tasks",
@@ -189,7 +255,7 @@ def _validate_current_task13_sections(readme: str, plan: str, agent_log: str) ->
         for text in required:
             assert text in section
         for text in forbidden:
-            assert text not in section
+            assert text.casefold() not in section.casefold()
         for label in ("Guardrail:", "Feedback:", "Progress:"):
             assert len(re.findall(rf"(?m)^{label} .+$", section)) == 1
         urls = {
@@ -205,12 +271,15 @@ def _validate_current_task13_sections(readme: str, plan: str, agent_log: str) ->
 
 def _validate_root_evidence(plan: str, agent_log: str) -> None:
     ledger = _task_ledger_rows(plan)
-    for task in ("11", "11A", "11B", "12", "13"):
+    for task in ("0", "1", "2", "11", "11A", "11B", "12", "13"):
         assert task in ledger
         status, agent, spec_review, quality_review, commits = ledger[task]
         assert all((status, agent, spec_review, quality_review, commits))
         assert agent == "unavailable" or re.fullmatch(r"`/root/[^`]+`(?:, `/root/[^`]+`)*", agent)
         assert re.search(r"\b[0-9a-f]{7,40}\b", commits)
+
+    for task, expected in EXPECTED_EARLY_TASK_ROWS.items():
+        assert ledger[task] == expected
 
     assert ledger["11"][0] == "Implemented; breaker reached"
     assert ledger["11A"][0] == "Blocked; breaker reached"
@@ -235,6 +304,9 @@ def _validate_root_evidence(plan: str, agent_log: str) -> None:
     assert "CLEAN" in ledger["11B"][3]
 
     required_commits = {
+        "0": ("2fdb099", "b5cdd29", "efc73b3"),
+        "1": ("297d277", "6df8353", "a3908f9", "920983e", "a200b8b"),
+        "2": ("73261de", "a606267"),
         "11": (
             "593384e", "e80a17d", "6dcc2ec", "16b4edc", "ba8d95b", "d60a8bc", "10339c0",
             "7c21ce6", "39a21c4", "5ad427a", "f363ccc", "90b9c45", "9f44513",
@@ -296,18 +368,38 @@ def _validate_root_evidence(plan: str, agent_log: str) -> None:
         EXPECTED_FINAL_CI_URL,
         EXPECTED_FINAL_CI_CONCLUSION,
         EXPECTED_HOSTED_LIMITATION,
-        "Task 3 review and final audit pending",
+        EXPECTED_REVIEW_STATUS,
     ):
         assert text in task_13
     for commit in ("6de2411", "cad8e17", *EXPECTED_TASK_12_COMMITS):
         assert commit in agent_log
 
 
+def _validate_task0_process_record(spec_process: str) -> None:
+    for text in (
+        "- Agent: `/root/task0_docs_coldstart/coldstart_validator`",
+        "- Model: `gpt-5.6-sol`",
+        (
+            "- Context supplied: only `SPEC.md` and `PLAN.md` paths plus the instruction "
+            "to dry-run Task 1 and one risk-heavy task, write no implementation code, and "
+            "stop at uncertainty."
+        ),
+        "### Actual Task 1 Findings",
+        "### Actual Task 8 Findings",
+        "Questions:",
+        "Divergent interpretations:",
+        "Expected mismatches:",
+        "### Corrections Made",
+        "These corrections directly address the findings above; no product code was written.",
+    ):
+        assert text in spec_process
+
+
 def test_task12_completion_records_final_clean_local_evidence() -> None:
     _validate_root_evidence(_read("PLAN.md"), _read("AGENT_LOG.md"))
 
 
-def test_task13_records_observed_hosted_release_evidence() -> None:
+def test_task13_final_release_audit_records_exact_evidence() -> None:
     ledger = _task_ledger_rows(_read("PLAN.md"))
     assert ledger["12"][0].strip() == EXPECTED_TASK_12_STATUS
     assert ledger["12"][2].strip() == EXPECTED_TASK_12_SPEC_REVIEW
@@ -324,6 +416,7 @@ def test_task13_records_observed_hosted_release_evidence() -> None:
     _validate_current_task13_sections(
         _read("README.md"), _read("PLAN.md"), _read("AGENT_LOG.md")
     )
+    _validate_task0_process_record(_read("SPEC_PROCESS.md"))
     for document in ("README.md", "PLAN.md", "AGENT_LOG.md"):
         content = _read(document)
         for expected in (
@@ -339,7 +432,15 @@ def test_task13_records_observed_hosted_release_evidence() -> None:
             EXPECTED_FINAL_CI_CONCLUSION,
             EXPECTED_FINAL_CI_RECORD,
             EXPECTED_HOSTED_LIMITATION,
-            "Task 3 review and final audit pending",
+            EXPECTED_DASHBOARD_PROVENANCE,
+            EXPECTED_ACCEPTANCE_PROVENANCE,
+            EXPECTED_CI_PROVENANCE,
+            EXPECTED_PROCESS_LOCAL_LIMITATION,
+            EXPECTED_ACCEPTANCE_RECORD,
+            EXPECTED_NO_LEAKAGE_RECORD,
+            EXPECTED_DOCKER_LIMITATION,
+            EXPECTED_REVIEW_STATUS,
+            EXPECTED_NO_SELF_REFERENCE,
         ):
             assert expected in content
 
@@ -347,6 +448,9 @@ def test_task13_records_observed_hosted_release_evidence() -> None:
 @pytest.mark.parametrize(
     ("path", "old", "new"),
     (
+        ("PLAN.md", "Clean re-review", "Review pending"),
+        ("PLAN.md", "Clean after fix round 3", "Review pending"),
+        ("PLAN.md", "Clean after fix round 1", "Review pending"),
         ("PLAN.md", "Implemented; breaker reached", "Complete; CLEAN"),
         ("PLAN.md", "Blocked; breaker reached", "Complete; CLEAN"),
         (
@@ -469,6 +573,8 @@ def test_root_evidence_contract_rejects_appended_task_12_quality_contradictions(
         ("AGENT_LOG.md", EXPECTED_RENDER_DEPLOY_ID, "dep-example"),
         ("README.md", EXPECTED_HOSTED_TERMINAL_RESULT, "FAILED"),
         ("PLAN.md", EXPECTED_FINAL_CI_URL, "https://github.com/example/actions/runs/1"),
+        ("README.md", EXPECTED_FINAL_CI_JOB_URL, "https://github.com/example/job/1"),
+        ("PLAN.md", EXPECTED_ACCEPTANCE_TIME, "2026-07-30 00:00:00 GMT"),
         ("AGENT_LOG.md", EXPECTED_HOSTED_LIMITATION, "Production service."),
         (
             "README.md",
@@ -486,6 +592,18 @@ def test_root_evidence_contract_rejects_appended_task_12_quality_contradictions(
             "GitHub CI evidence was not independently verified.",
         ),
         ("README.md", EXPECTED_PROCESS_LOCAL_LIMITATION, "Task storage is durable."),
+        (
+            "PLAN.md",
+            EXPECTED_DOCKER_LIMITATION,
+            "Local Docker image build succeeded.",
+        ),
+        (
+            "AGENT_LOG.md",
+            EXPECTED_REVIEW_STATUS,
+            "Task 13 final broad review complete.",
+        ),
+        ("README.md", EXPECTED_NO_LEAKAGE_RECORD, "Forbidden leakage was not checked."),
+        ("PLAN.md", EXPECTED_NO_SELF_REFERENCE, "The final-audit commit passed CI."),
         ("README.md", EXPECTED_GUARDRAIL_EVIDENCE, ""),
         ("PLAN.md", EXPECTED_FEEDBACK_EVIDENCE, ""),
         ("AGENT_LOG.md", EXPECTED_PROGRESS_EVIDENCE, ""),
@@ -497,12 +615,17 @@ def test_task13_release_evidence_rejects_tampered_observed_values(
     expected: str,
     replacement: str,
 ) -> None:
-    documents = {name: _read(name) for name in ("README.md", "PLAN.md", "AGENT_LOG.md")}
+    test_task13_final_release_audit_records_exact_evidence()
+    documents = {
+        name: _read(name)
+        for name in ("README.md", "PLAN.md", "AGENT_LOG.md", "SPEC_PROCESS.md")
+    }
+    assert expected in documents[path]
     documents[path] = documents[path].replace(expected, replacement)
 
     monkeypatch.setitem(globals(), "_read", documents.__getitem__)
     with pytest.raises(AssertionError):
-        test_task13_records_observed_hosted_release_evidence()
+        test_task13_final_release_audit_records_exact_evidence()
 
 
 @pytest.mark.parametrize(
@@ -527,6 +650,16 @@ def test_task13_release_evidence_rejects_tampered_observed_values(
             "PLAN.md",
             "**Files:**",
             "CI and Render deployed commit `06a5bf8`.",
+        ),
+        (
+            "README.md",
+            "## Credential Security",
+            "This final audit commit passed CI and deployed to Render.",
+        ),
+        (
+            "PLAN.md",
+            "**Files:**",
+            "The final-audit commit deployed with provider mode enabled.",
         ),
         (
             "AGENT_LOG.md",
@@ -571,7 +704,11 @@ def test_task13_current_sections_reject_appended_contradictions(
     marker: str | None,
     contradiction: str,
 ) -> None:
-    documents = {name: _read(name) for name in ("README.md", "PLAN.md", "AGENT_LOG.md")}
+    test_task13_final_release_audit_records_exact_evidence()
+    documents = {
+        name: _read(name)
+        for name in ("README.md", "PLAN.md", "AGENT_LOG.md", "SPEC_PROCESS.md")
+    }
     if marker is None:
         documents[path] = f"{documents[path]}\n{contradiction}\n"
     else:
@@ -588,7 +725,32 @@ def test_task13_current_sections_reject_appended_contradictions(
 
     monkeypatch.setitem(globals(), "_read", documents.__getitem__)
     with pytest.raises(AssertionError):
-        test_task13_records_observed_hosted_release_evidence()
+        test_task13_final_release_audit_records_exact_evidence()
+
+
+@pytest.mark.parametrize(
+    ("expected", "replacement"),
+    (
+        ("- Model: `gpt-5.6-sol`", "- Model: unavailable"),
+        (
+            "- Context supplied: only `SPEC.md` and `PLAN.md` paths",
+            "- Context supplied: conversation history and repository",
+        ),
+        ("### Actual Task 1 Findings", "### Task 1 Findings unavailable"),
+        ("Divergent interpretations:", "Interpretations unavailable:"),
+        ("### Corrections Made", "### Corrections pending"),
+    ),
+)
+def test_task0_process_record_rejects_missing_audit_facts(
+    expected: str,
+    replacement: str,
+) -> None:
+    process_record = _read("SPEC_PROCESS.md")
+    _validate_task0_process_record(process_record)
+    assert expected in process_record
+
+    with pytest.raises(AssertionError):
+        _validate_task0_process_record(process_record.replace(expected, replacement))
 
 
 def test_root_evidence_contract_does_not_require_git_history(
