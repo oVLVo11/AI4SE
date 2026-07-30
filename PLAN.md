@@ -16,7 +16,7 @@
 | 11 | Implemented; breaker reached | unavailable | Five-round review breaker | 517 passed, 9 skipped; five-round breaker | `593384e`, `e80a17d`, `6dcc2ec`, `16b4edc`, `ba8d95b`, `d60a8bc`, `10339c0`, `7c21ce6`, `39a21c4`, `5ad427a`, `f363ccc`, `90b9c45`, `9f44513` |
 | 11A | Blocked; breaker reached | unavailable | Fifth review left the POSIX parent-directory durability defect | Remediation reached its five-round breaker | `87e5ad7`, `63b08cf`, `07cffcd`, `5eb42fb`, `ea569a9`, `47bed5d`, `6de2411` |
 | 11B | Complete | `/root/task11b_impl` | `/root/task11b_review`: CLEAN after task and final review | Task and final review CLEAN; focused durability 11 passed; affected 128 passed, 4 skipped; full 581 passed, 10 skipped; Ruff and diff clean | `d396c24`, `e7448ff`, `cad8e17` |
-| 12 | In progress; Task 1 clean, Task 2 under review | `/root/task12_artifacts`, `/root/task12_evidence` | `/root/task12_task1_review`: CLEAN after round 2; Task 2 review pending | Task 1: focused 12 passed; full isolated 593 passed, 10 skipped; wheel/sdist and wheel CLI/demo verified; Docker CLI unavailable | `6d06a3e`, `783a814`, `869dd20`, `8e1792d` |
+| 12 | In progress; Task 1 clean, Task 2 under review | `/root/task12_artifacts`, `/root/task12_evidence` | `/root/task12_task1_review`: CLEAN after round 2; Task 2 review pending | Task 1 review CLEAN; Task 2 review pending; focused 12 passed; full isolated 593 passed, 10 skipped; wheel/sdist and wheel CLI/demo verified; Docker CLI unavailable | `6d06a3e`, `783a814`, `869dd20`, `8e1792d` |
 
 # PyQuality Harness Implementation Plan
 

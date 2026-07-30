@@ -33,28 +33,6 @@ def _task_ledger_rows(plan: str) -> dict[str, tuple[str, str, str, str, str]]:
     return rows
 
 
-def _is_reachable_git_commit(commit: str) -> bool:
-    resolved = subprocess.run(
-        ["git", "rev-parse", "--verify", f"{commit}^{{commit}}"],
-        cwd=REPOSITORY_ROOT,
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    if resolved.returncode != 0:
-        return False
-    return (
-        subprocess.run(
-            ["git", "merge-base", "--is-ancestor", commit, "HEAD"],
-            cwd=REPOSITORY_ROOT,
-            check=False,
-            capture_output=True,
-            text=True,
-        ).returncode
-        == 0
-    )
-
-
 def _validate_root_evidence(plan: str, agent_log: str) -> None:
     ledger = _task_ledger_rows(plan)
     for task in ("11", "11A", "11B", "12"):
@@ -84,6 +62,11 @@ def _validate_root_evidence(plan: str, agent_log: str) -> None:
     assert "Task 2 under review" in ledger["12"][0]
     assert "CLEAN" in ledger["12"][2]
     assert "Task 2 review pending" in ledger["12"][2]
+    assert "task 1 review clean" in ledger["12"][3].lower()
+    assert "task 2 review pending" in ledger["12"][3].lower()
+    assert "docker cli unavailable" in ledger["12"][3].lower()
+    assert "complete" not in ledger["12"][3].lower()
+    assert "docker image build succeeded" not in ledger["12"][3].lower()
 
     required_commits = {
         "11": (
@@ -96,11 +79,7 @@ def _validate_root_evidence(plan: str, agent_log: str) -> None:
     }
     for task, expected in required_commits.items():
         actual = tuple(re.findall(r"\b[0-9a-f]{7,40}\b", ledger[task][4]))
-        assert all(_is_reachable_git_commit(commit) for commit in actual)
-        if task == "12":
-            assert set(expected) <= set(actual)
-        else:
-            assert actual == expected
+        assert actual == expected
 
     headings = (
         "## 2026-07-29 Task 11 implementation and breaker",
@@ -179,6 +158,30 @@ def test_root_evidence_contract_rejects_false_commits_and_review_verdicts(
     monkeypatch.setitem(globals(), "_read", documents.__getitem__)
     with pytest.raises(AssertionError):
         test_root_evidence_records_preserve_task_11_breakers_and_task_12_review_state()
+
+
+def test_root_evidence_contract_rejects_completed_task_12_and_docker_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    documents = {name: _read(name) for name in ("PLAN.md", "AGENT_LOG.md")}
+    documents["PLAN.md"] = documents["PLAN.md"].replace(
+        "Task 1 review CLEAN; Task 2 review pending; focused 12 passed; full isolated 593 passed, 10 skipped; wheel/sdist and wheel CLI/demo verified; Docker CLI unavailable",
+        "Task 12 COMPLETE; Docker image build succeeded",
+    )
+
+    monkeypatch.setitem(globals(), "_read", documents.__getitem__)
+    with pytest.raises(AssertionError):
+        test_root_evidence_records_preserve_task_11_breakers_and_task_12_review_state()
+
+
+def test_root_evidence_contract_does_not_require_git_history(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def unavailable_git(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("root evidence validation must not invoke Git")
+
+    monkeypatch.setattr(subprocess, "run", unavailable_git)
+    _validate_root_evidence(_read("PLAN.md"), _read("AGENT_LOG.md"))
 
 
 def test_required_artifacts_and_readme_headings_exist() -> None:
