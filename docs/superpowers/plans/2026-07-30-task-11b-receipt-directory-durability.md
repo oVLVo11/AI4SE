@@ -11,7 +11,7 @@
 ## Global Constraints
 
 - Implement `docs/superpowers/specs/2026-07-30-task-11b-receipt-directory-durability-design.md` exactly.
-- Execution begins from commit `83a6d7d`; record the resolved base in the Task 11B SDD brief.
+- Execution and cumulative review begin from the resolved HEAD containing this corrected plan; record that exact commit in the SDD brief before dispatch. Commit `83a6d7d` remains the production-behavior RED baseline because intervening commits change documentation only.
 - No production code may be changed before a literal failing test has run against the execution base.
 - Preserve receipt and checkpoint formats, public APIs, capacity accounting, Task 11A migration behavior, Windows ACL/reparse semantics, and typed sanitized errors.
 - POSIX publication order is `create -> write -> file fsync -> receipt-parent directory fsync -> cleared checkpoint fsync`.
@@ -167,5 +167,4 @@ Omit `tests/component/test_audit_process.py` from `git add` if it was not change
 
 - [ ] **Step 10: Prepare the frozen review package**
 
-Create `.superpowers/sdd/2026-07-30-task-11b-receipt-directory-durability/` with a brief, report, progress ledger, literal RED/GREEN outputs, execution base `83a6d7d`, final commit, platform skips, and self-review. Generate a cumulative frozen diff from `83a6d7d` to final HEAD, run `git diff --check` on it, and record its byte size and SHA-256. Do not update root course documents or dispatch Task 12.
-
+Create `.superpowers/sdd/2026-07-30-task-11b-receipt-directory-durability/` with a brief, report, progress ledger, literal RED/GREEN outputs, the exact resolved execution/review base, production-behavior RED baseline `83a6d7d`, final commit, platform skips, and self-review. Generate a cumulative frozen diff from the recorded execution/review base to final HEAD, run `git diff --check` on it, and record its byte size and SHA-256. Do not update root course documents or dispatch Task 12.
