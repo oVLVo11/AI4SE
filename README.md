@@ -59,7 +59,9 @@ docker run --rm -p 8000:8000 pyquality-harness
 
 ### Render-compatible deployment
 
-Create a Docker-based web service from this repository, configure its service port as `8000`, and deploy the supplied Dockerfile unchanged. The image starts only public mock mode, so it needs no provider credential configuration. This is a deployment procedure for a compatible platform, not a hosted service offered by this project.
+The reviewed Docker service is publicly available at https://ai4se.onrender.com. It deploys the supplied Dockerfile unchanged and starts only deterministic public mock mode. The free-tier service can sleep between visits and provides no production availability guarantee.
+
+No credentials, provider configuration, database, or persistent disk are attached to this free-tier public mock service.
 
 ### Release evidence
 
@@ -69,7 +71,13 @@ Initial verified CI run: https://github.com/oVLVo11/AI4SE/actions/runs/305440727
 
 Commit: `89544fc9d295fdbe0d6d20fd1ffc202d5238144f`; conclusion: `success`.
 
-Render deployment pending.
+Final GitHub Actions run https://github.com/oVLVo11/AI4SE/actions/runs/30562643715 completed with conclusion `success`. Pytest, Ruff, package, and Docker jobs succeeded.
+
+Render service: https://ai4se.onrender.com; deployed commit: `690e23e2544936c0bde3e507730c63d34da6af0f`; deploy ID: `dep-d9lntmcs728c739h5ffg`.
+
+Hosted acceptance submitted the bundled scenario and reached terminal `SUCCEEDED` at `/tasks/public-demo` with zero rounds remaining. The public result showed the expected denied outside action, assertion feedback, and `read_file -> apply_patch -> apply_patch -> finish` progress. It exposed no credentials, provider setup, local or temporary paths, prompt/source/patch bodies, tracebacks, or server errors.
+
+Task 3 review and final audit pending.
 
 ## Credential Security
 
@@ -83,8 +91,8 @@ Public mock mode does not require credentials. For local mode, prefer keyring-fi
 
 ## Safety Boundaries
 
-The included public mock mode is intended for local demonstrations and repeatable checks. Local mode keeps state in local SQLite and audit files. Repository confinement controls which paths the tool accepts; it is not an operating-system sandbox. Review any configuration that could access external services before using it, and keep local runtime data outside distributable artifacts.
+The included public mock mode is intended for demonstrations and repeatable checks. Local mode keeps state in local SQLite and audit files. Repository confinement controls which paths the tool accepts; it is not an operating-system sandbox. Review any configuration that could access external services before using it, and keep local runtime data outside distributable artifacts.
 
 ## Known Limitations
 
-No hosted deployment is provided. This repository also does not provide managed credentials or a production service guarantee. Container execution requires a locally available Docker-compatible runtime.
+The hosted demonstration is mock-only, free-tier, ephemeral, and not a production service. This repository does not provide managed credentials or a production service guarantee. Local container execution requires a locally available Docker-compatible runtime; no local Docker CLI success is claimed by the recorded release evidence.

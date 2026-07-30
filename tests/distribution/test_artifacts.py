@@ -40,15 +40,51 @@ EXPECTED_TASK_12_COMMITS = (
     "f916136",
     EXPECTED_TASK_12_FINAL_COMMIT,
 )
-EXPECTED_TASK_13_STATUS = "In progress; repository and CI evidence complete; Render deployment pending"
-EXPECTED_TASK_13_AGENT = "`/root/task13_github`"
-EXPECTED_TASK_13_SPEC_REVIEW = "Public repository and initial CI evidence recorded; Render and hosted evidence pending"
-EXPECTED_TASK_13_QUALITY_REVIEW = "GitHub Actions run 30544072702 completed with conclusion success; pytest, Ruff, package, and Docker build succeeded; Render deployment pending"
-EXPECTED_TASK_13_COMMITS = ("7f8dd42", "9fdd7c4", "89544fc")
+EXPECTED_TASK_13_STATUS = (
+    "In progress; hosted evidence recorded; Task 3 review and final audit pending"
+)
+EXPECTED_TASK_13_AGENT = "`/root/task13_github`, `/root/task13_render`"
+EXPECTED_TASK_13_SPEC_REVIEW = (
+    "Public repository, final CI, and hosted mock evidence recorded; "
+    "Task 3 review and final audit pending"
+)
+EXPECTED_TASK_13_QUALITY_REVIEW = (
+    "GitHub Actions run 30562643715 completed with conclusion success; pytest, "
+    "Ruff, package, and Docker succeeded; hosted public mock reached SUCCEEDED; "
+    "review pending"
+)
+EXPECTED_TASK_13_COMMITS = (
+    "7f8dd42",
+    "9fdd7c4",
+    "89544fc",
+    "a1672c4",
+    "ad4229c",
+    "c49283f",
+    "aceb2d7",
+    "710600d",
+    "3d90e63",
+    "9127380",
+    "f776f1e",
+    "690e23e",
+)
 EXPECTED_PUBLIC_REPOSITORY_URL = "https://github.com/oVLVo11/AI4SE.git"
 EXPECTED_INITIAL_CI_URL = "https://github.com/oVLVo11/AI4SE/actions/runs/30544072702"
 EXPECTED_INITIAL_CI_SHA = "89544fc9d295fdbe0d6d20fd1ffc202d5238144f"
 EXPECTED_INITIAL_CI_CONCLUSION = "success"
+EXPECTED_HOSTED_URL = "https://ai4se.onrender.com"
+EXPECTED_HOSTED_SHA = "690e23e2544936c0bde3e507730c63d34da6af0f"
+EXPECTED_RENDER_DEPLOY_ID = "dep-d9lntmcs728c739h5ffg"
+EXPECTED_HOSTED_TERMINAL_RESULT = "SUCCEEDED"
+EXPECTED_FINAL_CI_URL = "https://github.com/oVLVo11/AI4SE/actions/runs/30562643715"
+EXPECTED_FINAL_CI_CONCLUSION = "success"
+EXPECTED_FINAL_CI_RECORD = (
+    f"Final GitHub Actions run {EXPECTED_FINAL_CI_URL} completed with conclusion "
+    f"`{EXPECTED_FINAL_CI_CONCLUSION}`"
+)
+EXPECTED_HOSTED_LIMITATION = (
+    "No credentials, provider configuration, database, or persistent disk are "
+    "attached to this free-tier public mock service."
+)
 
 
 def _read(relative_path: str) -> str:
@@ -154,7 +190,14 @@ def _validate_root_evidence(plan: str, agent_log: str) -> None:
         EXPECTED_INITIAL_CI_URL,
         EXPECTED_INITIAL_CI_SHA,
         EXPECTED_INITIAL_CI_CONCLUSION,
-        "Render deployment pending",
+        EXPECTED_HOSTED_URL,
+        EXPECTED_HOSTED_SHA,
+        EXPECTED_RENDER_DEPLOY_ID,
+        EXPECTED_HOSTED_TERMINAL_RESULT,
+        EXPECTED_FINAL_CI_URL,
+        EXPECTED_FINAL_CI_CONCLUSION,
+        EXPECTED_HOSTED_LIMITATION,
+        "Task 3 review and final audit pending",
     ):
         assert text in task_13
     for commit in ("6de2411", "cad8e17", *EXPECTED_TASK_12_COMMITS):
@@ -165,7 +208,7 @@ def test_task12_completion_records_final_clean_local_evidence() -> None:
     _validate_root_evidence(_read("PLAN.md"), _read("AGENT_LOG.md"))
 
 
-def test_task13_records_observed_public_repository_and_initial_ci_evidence() -> None:
+def test_task13_records_observed_hosted_release_evidence() -> None:
     ledger = _task_ledger_rows(_read("PLAN.md"))
     assert ledger["12"][0].strip() == EXPECTED_TASK_12_STATUS
     assert ledger["12"][2].strip() == EXPECTED_TASK_12_SPEC_REVIEW
@@ -186,7 +229,15 @@ def test_task13_records_observed_public_repository_and_initial_ci_evidence() -> 
             EXPECTED_INITIAL_CI_URL,
             EXPECTED_INITIAL_CI_SHA,
             EXPECTED_INITIAL_CI_CONCLUSION,
-            "Render deployment pending",
+            EXPECTED_HOSTED_URL,
+            EXPECTED_HOSTED_SHA,
+            EXPECTED_RENDER_DEPLOY_ID,
+            EXPECTED_HOSTED_TERMINAL_RESULT,
+            EXPECTED_FINAL_CI_URL,
+            EXPECTED_FINAL_CI_CONCLUSION,
+            EXPECTED_FINAL_CI_RECORD,
+            EXPECTED_HOSTED_LIMITATION,
+            "Task 3 review and final audit pending",
         ):
             assert expected in content
 
@@ -311,6 +362,12 @@ def test_root_evidence_contract_rejects_appended_task_12_quality_contradictions(
         ("PLAN.md", EXPECTED_INITIAL_CI_URL, "https://github.com/example/AI4SE/actions/runs/1"),
         ("AGENT_LOG.md", EXPECTED_INITIAL_CI_SHA, "deadbeef"),
         ("AGENT_LOG.md", EXPECTED_INITIAL_CI_CONCLUSION, "failure"),
+        ("README.md", EXPECTED_HOSTED_URL, "https://example.onrender.com"),
+        ("PLAN.md", EXPECTED_HOSTED_SHA, "deadbeef"),
+        ("AGENT_LOG.md", EXPECTED_RENDER_DEPLOY_ID, "dep-example"),
+        ("README.md", EXPECTED_HOSTED_TERMINAL_RESULT, "FAILED"),
+        ("PLAN.md", EXPECTED_FINAL_CI_URL, "https://github.com/example/actions/runs/1"),
+        ("AGENT_LOG.md", EXPECTED_HOSTED_LIMITATION, "Production service."),
     ),
 )
 def test_task13_release_evidence_rejects_tampered_observed_values(
@@ -324,7 +381,7 @@ def test_task13_release_evidence_rejects_tampered_observed_values(
 
     monkeypatch.setitem(globals(), "_read", documents.__getitem__)
     with pytest.raises(AssertionError):
-        test_task13_records_observed_public_repository_and_initial_ci_evidence()
+        test_task13_records_observed_hosted_release_evidence()
 
 
 def test_root_evidence_contract_does_not_require_git_history(
@@ -372,7 +429,8 @@ def test_readme_documents_safe_local_and_portable_delivery_limits() -> None:
         "docker build -t pyquality-harness .",
         "docker run --rm -p 8000:8000 pyquality-harness",
         "### Render-compatible deployment",
-        "No hosted deployment is provided",
+        EXPECTED_HOSTED_URL,
+        EXPECTED_HOSTED_LIMITATION,
     ):
         assert text in readme
 

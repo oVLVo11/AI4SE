@@ -103,3 +103,13 @@ Final unified fix `e7892cd` closed Task 12. The final scoped review CLEAN and br
 ## 2026-07-30 Task 13 pre-publication gate
 
 Task 13 is In progress; repository and CI evidence complete; Render deployment pending. Public repository and initial CI evidence recorded; Render and hosted evidence pending. Public repository: https://github.com/oVLVo11/AI4SE.git. GitHub Actions run https://github.com/oVLVo11/AI4SE/actions/runs/30544072702 completed with conclusion success for `89544fc9d295fdbe0d6d20fd1ffc202d5238144f`; pytest, Ruff, package, and Docker build succeeded. Render deployment pending. The related release commits are `7f8dd42`, `9fdd7c4`, and `89544fc`.
+
+## 2026-07-31 Task 13 hosted public mock evidence
+
+Task 13 is In progress; hosted evidence recorded; Task 3 review and final audit pending. Public repository, final CI, and hosted mock evidence recorded; Task 3 review and final audit pending. The reviewed implementation sequence is `a1672c4`, `ad4229c`, `c49283f`, `aceb2d7`, `710600d`, `3d90e63`, `9127380`, `f776f1e`, and `690e23e`, ending at deployed Git SHA `690e23e2544936c0bde3e507730c63d34da6af0f` on remote `master`.
+
+User-supplied Render dashboard evidence identified deploy `dep-d9lntmcs728c739h5ffg` for public service https://ai4se.onrender.com. Public root and task pages returned HTTP 200. Submitting the bundled form redirected with HTTP 200 to https://ai4se.onrender.com/tasks/public-demo, which showed terminal `SUCCEEDED`, zero remaining rounds, guardrail evidence `outside action denied`, feedback `assertion`, and progress `read_file -> apply_patch -> apply_patch -> finish`. The public response contained no forbidden local or temporary paths, `LEAK` sentinels, prompt/source/patch bodies, provider key, credential prompt, traceback, or server error.
+
+No credentials, provider configuration, database, or persistent disk are attached to this free-tier public mock service. It is mock-only, ephemeral, and has no production availability guarantee. No local Docker CLI success is claimed.
+
+Final GitHub Actions run https://github.com/oVLVo11/AI4SE/actions/runs/30562643715 completed with conclusion `success` for `690e23e2544936c0bde3e507730c63d34da6af0f`; job https://github.com/oVLVo11/AI4SE/actions/runs/30562643715/job/90939296464 ran from `2026-07-30T16:42:07Z` through `2026-07-30T16:43:20Z`, and pytest, Ruff, package, and Docker succeeded. The run was created at `2026-07-30T16:42:03Z`. Earlier run https://github.com/oVLVo11/AI4SE/actions/runs/30561047811 failed and was superseded; it is not represented as final passing evidence. The complete Task 13 commit record is `7f8dd42`, `9fdd7c4`, `89544fc`, `a1672c4`, `ad4229c`, `c49283f`, `aceb2d7`, `710600d`, `3d90e63`, `9127380`, `f776f1e`, and `690e23e`.
