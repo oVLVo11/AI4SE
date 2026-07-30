@@ -33,6 +33,28 @@ def _task_ledger_rows(plan: str) -> dict[str, tuple[str, str, str, str, str]]:
     return rows
 
 
+def _is_reachable_git_commit(commit: str) -> bool:
+    resolved = subprocess.run(
+        ["git", "rev-parse", "--verify", f"{commit}^{{commit}}"],
+        cwd=REPOSITORY_ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if resolved.returncode != 0:
+        return False
+    return (
+        subprocess.run(
+            ["git", "merge-base", "--is-ancestor", commit, "HEAD"],
+            cwd=REPOSITORY_ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+        ).returncode
+        == 0
+    )
+
+
 def _validate_root_evidence(plan: str, agent_log: str) -> None:
     ledger = _task_ledger_rows(plan)
     for task in ("11", "11A", "11B", "12"):
@@ -48,6 +70,20 @@ def _validate_root_evidence(plan: str, agent_log: str) -> None:
     assert "CLEAN" in ledger["11B"][2]
     assert ledger["12"][0] == "In progress; Task 1 clean, Task 2 under review"
     assert "Task 2 review pending" in ledger["12"][2]
+    assert "breaker" in ledger["11"][2].lower()
+    assert "breaker" in ledger["11"][3].lower()
+    assert "clean" not in ledger["11"][2].lower()
+    assert "clean" not in ledger["11"][3].lower()
+    assert "fifth review" in ledger["11A"][2].lower()
+    assert "breaker" in ledger["11A"][3].lower()
+    assert "clean" not in ledger["11A"][2].lower()
+    assert "clean" not in ledger["11A"][3].lower()
+    assert "CLEAN" in ledger["11B"][2]
+    assert "CLEAN" in ledger["11B"][3]
+    assert "Task 1 clean" in ledger["12"][0]
+    assert "Task 2 under review" in ledger["12"][0]
+    assert "CLEAN" in ledger["12"][2]
+    assert "Task 2 review pending" in ledger["12"][2]
 
     required_commits = {
         "11": (
@@ -60,6 +96,7 @@ def _validate_root_evidence(plan: str, agent_log: str) -> None:
     }
     for task, expected in required_commits.items():
         actual = tuple(re.findall(r"\b[0-9a-f]{7,40}\b", ledger[task][4]))
+        assert all(_is_reachable_git_commit(commit) for commit in actual)
         if task == "12":
             assert set(expected) <= set(actual)
         else:
@@ -107,6 +144,37 @@ def test_root_evidence_contract_rejects_reviewed_history_mutations(
 ) -> None:
     documents = {name: _read(name) for name in ("PLAN.md", "AGENT_LOG.md")}
     documents[path] = documents[path].replace(old, new)
+
+    monkeypatch.setitem(globals(), "_read", documents.__getitem__)
+    with pytest.raises(AssertionError):
+        test_root_evidence_records_preserve_task_11_breakers_and_task_12_review_state()
+
+
+@pytest.mark.parametrize(
+    ("path", "replacements"),
+    (
+        (
+            "PLAN.md",
+            (("`6d06a3e`, `783a814`, `869dd20`, `8e1792d`", "`6d06a3e`, `783a814`, `869dd20`, `8e1792d`, `deadbee`"),),
+        ),
+        (
+            "PLAN.md",
+            (("Five-round review breaker", "CLEAN"), ("517 passed, 9 skipped; five-round breaker", "CLEAN")),
+        ),
+        (
+            "PLAN.md",
+            (("Task and final review CLEAN; focused durability 11 passed; affected 128 passed, 4 skipped; full 581 passed, 10 skipped; Ruff and diff clean", "FAILED"),),
+        ),
+    ),
+)
+def test_root_evidence_contract_rejects_false_commits_and_review_verdicts(
+    monkeypatch: pytest.MonkeyPatch,
+    path: str,
+    replacements: tuple[tuple[str, str], ...],
+) -> None:
+    documents = {name: _read(name) for name in ("PLAN.md", "AGENT_LOG.md")}
+    for old, new in replacements:
+        documents[path] = documents[path].replace(old, new)
 
     monkeypatch.setitem(globals(), "_read", documents.__getitem__)
     with pytest.raises(AssertionError):
