@@ -20,7 +20,7 @@ The delivery surfaces share one runtime contract:
 - the container installs the built wheel rather than running from an editable source tree;
 - the container starts only `pyquality serve --host 0.0.0.0 --port 8000 --public-mock` with `PYQUALITY_MODE=public_mock` and no provider credential.
 
-No new application behavior or public API is introduced.
+The only application-surface amendment permitted by Task 12 is the missing composition-layer selector required to make the already approved public-mock deployment runnable. The `serve` command accepts `--public-mock`; either that flag or `PYQUALITY_MODE=public_mock` selects the existing public-mock service composition. This does not change the agent loop, provider client, policy, persistence, audit formats, or local-mode semantics.
 
 ## Course Documentation
 
@@ -89,6 +89,8 @@ Verification is evidence-driven:
 5. Run `docker build -t pyquality-harness:local .` and inspect its configured command/environment when Docker is available.
 6. Run the secret-pattern scan, complete pytest suite, Ruff, and `git diff --check`.
 
+The distribution contract includes an executable CLI test, not only Dockerfile text inspection. It must prove that `pyquality serve --host 0.0.0.0 --port 8000 --public-mock` parses successfully and constructs the existing public-mock application without reading a provider credential or making a network request. A second test proves `PYQUALITY_MODE=public_mock` selects the same composition when the flag is absent. Invalid environment values fail typed at startup rather than silently selecting local or public mode.
+
 A missing or inaccessible Docker daemon is recorded as an environment capability blocker for the image-build evidence. It must not be reported as a successful build, replaced with fabricated output, or worked around by weakening the Docker contract tests. Non-Docker distribution work may still be reviewed, but Task 12 cannot be declared fully verified until the approved review process adjudicates that capability result.
 
 Errors and documentation must not disclose credentials, authorization headers, full prompts, model bodies, owner tokens, absolute audit paths, or secret-bearing exception chains.
@@ -103,7 +105,8 @@ Task 12 may modify only:
 - `Dockerfile` and `.dockerignore`;
 - `pyproject.toml`;
 - focused distribution tests and small packaging fixtures required by those tests.
+- `src/pyquality/cli.py` and focused CLI/service tests solely for the approved `--public-mock` and `PYQUALITY_MODE=public_mock` composition selector.
 
-It must not change application behavior, security policy, audit formats, public APIs, demo semantics, Task 11B durability logic, user-provided untracked course source documents, or Task 13 hosted evidence.
+It must not change agent-loop behavior, provider semantics, security policy, audit formats, other public APIs, demo semantics, Task 11B durability logic, user-provided untracked course source documents, or Task 13 hosted evidence.
 
 Task 12 receives a five-round task-review budget. Each implementation task requires specification-compliance and code-quality approval, followed by a broad final review.

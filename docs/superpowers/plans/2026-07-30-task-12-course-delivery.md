@@ -13,7 +13,7 @@
 - Implement `docs/superpowers/specs/2026-07-30-task-12-course-delivery-design.md` exactly.
 - Work in a Superpowers-owned isolated worktree created from the resolved plan commit; record that exact execution/review base before dispatch.
 - No production, packaging, CI, or documentation artifact change before the corresponding literal failing contract test is run and recorded.
-- Do not modify application behavior, public APIs, security policy, audit formats, Task 11B durability logic, or deterministic demo semantics.
+- The only permitted application change is the approved `serve --public-mock` / `PYQUALITY_MODE=public_mock` composition selector in `src/pyquality/cli.py`; do not modify agent-loop behavior, provider semantics, other public APIs, security policy, audit formats, Task 11B durability logic, or deterministic demo semantics.
 - Do not edit or stage the untracked source documents `AI4SE_Final_Project_A_Coding_Agent_Harness.md` and `通用要求.md`.
 - Do not enumerate, modify, stage, or delete inaccessible pytest residue directories.
 - Do not claim a hosted URL, remote CI success, published package/image, or Docker build that was not actually observed.
@@ -33,9 +33,11 @@
 - Create: `Dockerfile`
 - Create: `.dockerignore`
 - Modify: `pyproject.toml`
+- Modify: `src/pyquality/cli.py`
+- Modify: `tests/unit/test_application.py` or a focused CLI test module
 
 **Interfaces:**
-- Consumes: `pyquality` console script, `pyquality.web.templates`, `pyquality.demo_fixture`, and `pyquality demo --json` from the completed application.
+- Consumes: `pyquality` console script, existing local/public-mock application composition, `pyquality.web.templates`, `pyquality.demo_fixture`, and `pyquality demo --json` from the completed application.
 - Produces: wheel/sdist build metadata, delivery files, GitHub/GitLab CI contracts, mock-only OCI build definition, and `tests/distribution/test_artifacts.py` as their executable source-of-truth.
 - The built wheel must contain `src/pyquality/web/templates/*.html` and `src/pyquality/demo_fixture/*`, and must exclude `tests/`, `.superpowers/`, `.git/`, databases, audit logs, and caches.
 
@@ -108,13 +110,15 @@ assert not any(name.startswith(("tests/", ".superpowers/", ".git/")) for name in
 
 Assert the Dockerfile has two named stages, builds and installs a wheel, sets only public mock mode, exposes 8000, and has the exact public-mock command. Reject credential-like `ENV` declarations and editable installs. Assert `.dockerignore` excludes `.git`, `.superpowers`, `.worktrees`, pytest/Ruff caches, `*.db*`, audit/log files, build artifacts, tests, and untracked course-source documents.
 
+Add executable CLI RED tests before changing `src/pyquality/cli.py`. Patch the server runner and application factory, invoke `main()` with `serve --host 0.0.0.0 --port 8000 --public-mock`, and assert the factory receives the existing public-mock composition with no credential lookup or network call. Add a second test with `PYQUALITY_MODE=public_mock` and no flag, plus a rejection test for an unsupported `PYQUALITY_MODE` value.
+
 - [ ] **Step 4: Run package/container tests and capture RED**
 
 ```powershell
 D:\Python\python.exe -m pytest tests/distribution/test_artifacts.py -k "package or wheel or docker" -v --basetemp "$env:TEMP\pyquality-task12-red-package"
 ```
 
-Expected: static container tests fail because files are absent. If the wheel-content characterization already passes under hatchling, record it honestly rather than weakening it.
+Expected: static container tests fail because files are absent; executable CLI tests fail because `--public-mock` is unrecognized and the environment selector is ignored. If the wheel-content characterization already passes under hatchling, record it honestly rather than weakening it.
 
 - [ ] **Step 5: Implement README and package metadata**
 
@@ -174,6 +178,8 @@ CMD ["pyquality", "serve", "--host", "0.0.0.0", "--port", "8000", "--public-mock
 
 The Dockerfile contains no API-key `ARG`/`ENV`, editable install, test invocation, host database copy, or provider-mode command. `.dockerignore` implements every exclusion asserted in Step 3 while leaving `pyproject.toml`, `src/`, and runtime bundled resources available to the builder.
 
+Implement the minimal CLI composition selector. Add `--public-mock` only to `serve`. Resolve the effective mode as public mock when the flag is present or `PYQUALITY_MODE` equals `public_mock`; retain local mode when neither is set. Reject any other non-empty environment value through the existing sanitized CLI error boundary. Reuse the existing public-mock application/service constructor and do not introduce a second mock implementation.
+
 - [ ] **Step 8: Rerun the unchanged distribution contract selectors to GREEN**
 
 Run the Step 2 and Step 4 commands unchanged. Expected: all selected tests pass without warnings. Run the complete file:
@@ -231,7 +237,7 @@ Expected: secret scan has no matches; pytest exits 0 at 100%; Ruff and diff chec
 - [ ] **Step 13: Commit Task 1 and prepare task review evidence**
 
 ```powershell
-git add README.md .github/workflows/ci.yml .gitlab-ci.yml Dockerfile .dockerignore pyproject.toml tests/distribution/test_artifacts.py
+git add README.md .github/workflows/ci.yml .gitlab-ci.yml Dockerfile .dockerignore pyproject.toml src/pyquality/cli.py tests/distribution/test_artifacts.py tests/unit/test_application.py
 git commit -m "build: define course distribution contract"
 ```
 
