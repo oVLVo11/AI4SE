@@ -287,6 +287,8 @@ def test_cleanup_exception_is_published_after_remaining_resources_are_released(
     original_release = repository.release_project_lease
     original_owns = repository.owns_project_lease
     failed_once = False
+    worker_entered = Event()
+    allow_worker = Event()
 
     def own_terminal_cleanup(task_id: str, *, owner_token: str) -> bool:
         if repository.resume_snapshot(task_id).task.status is TaskStatus.SUCCEEDED:
@@ -303,10 +305,21 @@ def test_cleanup_exception_is_published_after_remaining_resources_are_released(
     repository.owns_project_lease = own_terminal_cleanup
     repository.release_project_lease = release_then_fail
     service = make_service(repository)
+    original_run = service._loop.run
+
+    def block_worker(task_id: str) -> TaskResult:
+        worker_entered.set()
+        assert allow_worker.wait(2)
+        return original_run(task_id)
+
+    service._loop.run = block_worker
     task = service.create_task(first_repo, "first")
+    assert worker_entered.wait(1)
+    future = service.start_task(task.id)
+    allow_worker.set()
 
     with pytest.raises(RuntimeError, match="cleanup failed"):
-        service.start_task(task.id).result(timeout=2)
+        future.result(timeout=2)
 
     assert service._futures == {}
     replacement = service.create_task(second_repo, "capacity was released")
