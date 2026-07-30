@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
+from threading import Event, Lock, Thread
 
 import pytest
 from fastapi.testclient import TestClient
@@ -120,9 +121,6 @@ def test_public_scenario_replaces_prior_result_without_history_accumulation() ->
                     "denied_action": DeniedActionEvidence(
                         attempted=False, dispatch_count=0
                     ),
-                    "action_order": ("finish",),
-                    "first_failure_category": "runtime",
-                    "model_saw_first_failure": False,
                 }
             ),
         )
@@ -152,10 +150,127 @@ def test_public_scenario_replaces_prior_result_without_history_accumulation() ->
     assert service.get_evidence(second.id) == web_app.PublicDemoEvidence(
         denied_action=False,
         denied_dispatch_count=0,
-        first_failure_category="runtime",
-        model_saw_first_failure=False,
-        action_order=("finish",),
+        first_failure_category="assertion",
+        model_saw_first_failure=True,
+        action_order=("read_file", "apply_patch", "apply_patch", "finish"),
     )
+
+
+def test_public_scenario_rejects_oversized_secret_bearing_evidence() -> None:
+    secret = "secret C:/users/private/source.py prompt body"
+    report = succeeded_demo_report().model_copy(
+        update={
+            "first_failure_category": secret,
+            "action_order": ("finish",) * 1_000,
+        }
+    )
+    service = PublicDemoService({"broken_calculator": "public-demo"}, lambda: report)
+
+    with pytest.raises(PreflightError, match=r"^public demo execution failed$") as error:
+        service.run_scenario("broken_calculator")
+
+    assert secret not in str(error.value)
+    assert service.get_evidence("public-demo") is None
+
+
+def test_public_scenario_propagates_keyboard_interrupt_without_state() -> None:
+    def runner() -> DemoReport:
+        raise KeyboardInterrupt
+
+    service = PublicDemoService({"broken_calculator": "public-demo"}, runner)
+
+    with pytest.raises(KeyboardInterrupt):
+        service.run_scenario("broken_calculator")
+
+    assert service.get_evidence("public-demo") is None
+
+
+def test_public_scenario_serializes_delayed_success_before_newer_success() -> None:
+    first_started = Event()
+    release_first = Event()
+    runner_lock = Lock()
+    invocations: list[str] = []
+    completions: list[str] = []
+
+    def runner() -> DemoReport:
+        with runner_lock:
+            invocation = len(invocations)
+            invocations.append("first" if invocation == 0 else "second")
+        if invocation == 0:
+            first_started.set()
+            assert release_first.wait(timeout=2)
+            return succeeded_demo_report()
+        return succeeded_demo_report().model_copy(
+            update={"denied_action": DeniedActionEvidence(attempted=False, dispatch_count=0)}
+        )
+
+    service = PublicDemoService({"broken_calculator": "public-demo"}, runner)
+
+    def run(label: str) -> None:
+        service.run_scenario("broken_calculator")
+        completions.append(label)
+
+    first = Thread(target=run, args=("first",))
+    second = Thread(target=run, args=("second",))
+    first.start()
+    assert first_started.wait(timeout=2)
+    second.start()
+    release_first.set()
+    first.join(timeout=2)
+    second.join(timeout=2)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert invocations == ["first", "second"]
+    assert completions == ["first", "second"]
+    assert service.get_evidence("public-demo").denied_action is False  # type: ignore[union-attr]
+
+
+def test_public_scenario_serializes_delayed_failure_before_newer_success() -> None:
+    first_started = Event()
+    release_first = Event()
+    runner_lock = Lock()
+    invocations: list[str] = []
+    completions: list[str] = []
+    failures: list[BaseException] = []
+
+    def runner() -> DemoReport:
+        with runner_lock:
+            invocation = len(invocations)
+            invocations.append("first" if invocation == 0 else "second")
+        if invocation == 0:
+            first_started.set()
+            assert release_first.wait(timeout=2)
+            raise RuntimeError("secret failure")
+        return succeeded_demo_report().model_copy(
+            update={"denied_action": DeniedActionEvidence(attempted=False, dispatch_count=0)}
+        )
+
+    service = PublicDemoService({"broken_calculator": "public-demo"}, runner)
+
+    def run(label: str) -> None:
+        try:
+            service.run_scenario("broken_calculator")
+        except BaseException as error:  # noqa: BLE001 - capture the thread result for assertion.
+            failures.append(error)
+        else:
+            completions.append(label)
+
+    first = Thread(target=run, args=("first",))
+    second = Thread(target=run, args=("second",))
+    first.start()
+    assert first_started.wait(timeout=2)
+    second.start()
+    release_first.set()
+    first.join(timeout=2)
+    second.join(timeout=2)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert invocations == ["first", "second"]
+    assert completions == ["second"]
+    assert len(failures) == 1
+    assert service.get_evidence("public-demo").denied_action is False  # type: ignore[union-attr]
 
 
 def csrf(client: TestClient) -> str:

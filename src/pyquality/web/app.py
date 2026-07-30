@@ -7,6 +7,7 @@ import hmac
 import secrets
 from collections.abc import Callable, Mapping
 from pathlib import Path
+from threading import Lock
 from typing import Literal, Protocol
 
 from fastapi import FastAPI, Request
@@ -45,10 +46,15 @@ class PublicDemoEvidence(PublicModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     denied_action: bool
-    denied_dispatch_count: int = Field(ge=0)
-    first_failure_category: str
+    denied_dispatch_count: int = Field(ge=0, le=0)
+    first_failure_category: Literal["assertion"]
     model_saw_first_failure: bool
-    action_order: tuple[str, ...]
+    action_order: tuple[
+        Literal["read_file"],
+        Literal["apply_patch"],
+        Literal["apply_patch"],
+        Literal["finish"],
+    ]
 
 
 class _SessionCodec:
@@ -99,48 +105,52 @@ class PublicDemoService:
         self._scenarios = dict(scenarios)
         self._runner = runner
         self._state: tuple[TaskView, PublicDemoEvidence] | None = None
+        self._lock = Lock()
 
     def run_scenario(self, scenario_id: str) -> TaskView:
-        task_id = self._scenarios.get(scenario_id)
-        if (
-            scenario_id != _BUNDLED_SCENARIO
-            or task_id != _PUBLIC_DEMO_TASK_ID
-        ):
-            raise PreflightError("public scenario is unavailable")
+        with self._lock:
+            task_id = self._scenarios.get(scenario_id)
+            if (
+                scenario_id != _BUNDLED_SCENARIO
+                or task_id != _PUBLIC_DEMO_TASK_ID
+            ):
+                raise PreflightError("public scenario is unavailable")
 
-        try:
-            report = self._runner()
-            if report.final_status is not TaskStatus.SUCCEEDED:
-                raise RuntimeError("public demo did not succeed")
-            evidence = PublicDemoEvidence(
-                denied_action=report.denied_action.attempted,
-                denied_dispatch_count=report.denied_action.dispatch_count,
-                first_failure_category=report.first_failure_category,
-                model_saw_first_failure=report.model_saw_first_failure,
-                action_order=report.action_order,
-            )
-            view = TaskView(
-                id=_PUBLIC_DEMO_TASK_ID,
-                status=TaskStatus.SUCCEEDED,
-                round_limit=1,
-                remaining_rounds=0,
-                verification_summary=self._summary(evidence),
-            )
-        except BaseException:  # noqa: BLE001 - sanitize all runner failures.
-            self._state = None
-            raise PreflightError("public demo execution failed") from None
-        self._state = (view, evidence)
-        return view
+            try:
+                report = self._runner()
+                if report.final_status is not TaskStatus.SUCCEEDED:
+                    raise RuntimeError("public demo did not succeed")
+                evidence = PublicDemoEvidence(
+                    denied_action=report.denied_action.attempted,
+                    denied_dispatch_count=report.denied_action.dispatch_count,
+                    first_failure_category=report.first_failure_category,
+                    model_saw_first_failure=report.model_saw_first_failure,
+                    action_order=report.action_order,
+                )
+                view = TaskView(
+                    id=_PUBLIC_DEMO_TASK_ID,
+                    status=TaskStatus.SUCCEEDED,
+                    round_limit=1,
+                    remaining_rounds=0,
+                    verification_summary=self._summary(evidence),
+                )
+            except Exception:  # noqa: BLE001 - sanitize ordinary runner failures.
+                self._state = None
+                raise PreflightError("public demo execution failed") from None
+            self._state = (view, evidence)
+            return view
 
     def get_task(self, task_id: str) -> TaskView:
-        if self._state is None or task_id != _PUBLIC_DEMO_TASK_ID:
-            raise PreflightError("task does not exist")
-        return self._state[0]
+        with self._lock:
+            if self._state is None or task_id != _PUBLIC_DEMO_TASK_ID:
+                raise PreflightError("task does not exist")
+            return self._state[0]
 
     def get_evidence(self, task_id: str) -> PublicDemoEvidence | None:
-        if self._state is None or task_id != _PUBLIC_DEMO_TASK_ID:
-            return None
-        return self._state[1]
+        with self._lock:
+            if self._state is None or task_id != _PUBLIC_DEMO_TASK_ID:
+                return None
+            return self._state[1]
 
     @staticmethod
     def _summary(evidence: PublicDemoEvidence) -> str:
