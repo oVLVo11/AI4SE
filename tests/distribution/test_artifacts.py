@@ -449,6 +449,9 @@ def test_wheel_contains_runtime_assets_but_no_development_or_data_residue(tmp_pa
     wheel_path = next(distribution_directory.glob("*.whl"))
     with zipfile.ZipFile(wheel_path) as wheel:
         contents = set(wheel.namelist())
+        metadata = wheel.read(
+            next(name for name in contents if name.endswith(".dist-info/METADATA"))
+        ).decode("utf-8")
 
     assert {
         "pyquality/web/templates/approval.html",
@@ -469,6 +472,11 @@ def test_wheel_contains_runtime_assets_but_no_development_or_data_residue(tmp_pa
         or "/cache/" in name
         for name in contents
     )
+    for tool in ("pytest", "ruff"):
+        assert any(
+            line.startswith(f"Requires-Dist: {tool}") and "extra ==" not in line
+            for line in metadata.splitlines()
+        )
 
 
 def test_sdist_excludes_development_and_local_data_but_keeps_runtime_inputs(
@@ -495,6 +503,11 @@ def test_sdist_excludes_development_and_local_data_but_keeps_runtime_inputs(
     assert any(name.endswith("/README.md") for name in contents)
     assert any(name.endswith("/src/pyquality/web/templates/base.html") for name in contents)
     assert any(name.endswith("/src/pyquality/demo_fixture/calculator.py") for name in contents)
+    assert not any(
+        part.startswith(".venv")
+        for name in contents
+        for part in Path(name).parts[1:]
+    )
     assert not any(
         (relative_parts := Path(name).parts[1:])[:1] in {("examples",), ("tests",)}
         or any(part in {".git", ".superpowers", "__pycache__"} for part in relative_parts)

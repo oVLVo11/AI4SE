@@ -37,6 +37,7 @@ exclude = [
   "/.git",
   "/.superpowers",
   "/.worktrees",
+  "/.venv*",
   "/tests",
   "/examples",
   "/__pycache__",
