@@ -75,3 +75,19 @@ The approved Task 9A plan in `4e4899b` adopted a closed credential domain and at
 Task 10's application service, CLI, secure local WebUI, and public mock boundary began in `49072fe`. Five formal fix rounds through `65f26c2`, `88993f7`, `9fb90d0`, `67f4e39`, and `3b3859f` established atomic acceptance, durable nonterminal reservations, lease-before-submit and same-token adoption, atomic approval resume, cleanup-before-publication, bounded registries, durable recovery, and the mock-capability/session boundary. The fifth review still found that cleanup exceptions could interrupt setup compensation and that cancellation could delete concurrently started work, so the breaker stopped Task 11.
 
 The approved Task 10A design and plan were committed in `f0c5fa4` and `71efb7c`. Implementation `0a4a15c` added transactional CREATED-only cancellation, owner-token RUNNING rollback, and unified best-effort compensation; review fixes `eb7afd3` and `6e4b44e` added exact creation reconciliation and nonce-bound creation rollback. The final independent review was CLEAN with no Critical or Important findings. Final affected verification reported 157 passed; the pristine full suite reported 460 passed and 8 skipped; Ruff and cumulative diff checks were clean. The frozen cumulative package is `.superpowers/sdd/2026-07-29-task-10a-atomic-lifecycle/review-71efb7c..6e4b44e.diff`.
+
+## 2026-07-29 Task 11 implementation and breaker
+
+Task 11's approved design and plan were `23aed39` and `55ea73e`; the implementing identity is unavailable in retained evidence. Implementation and review-fix commits were `593384e`, `e80a17d`, `6dcc2ec`, `16b4edc`, `ba8d95b`, `d60a8bc`, `10339c0`, `7c21ce6`, `39a21c4`, `5ad427a`, `f363ccc`, `90b9c45`, and `9f44513`. The retained Task 11 report records final verification of 517 passed and 9 skipped, with Ruff and diff checks clean. Five formal review rounds nevertheless reached the breaker; that outcome remains historical and is not recast as a clean review.
+
+## 2026-07-30 Task 11A remediation and breaker
+
+Task 11A's approved design and plan were `6e96ea8` and `32c9d78`. Its remediation commits were `87e5ad7`, `63b08cf`, `07cffcd`, `5eb42fb`, `ea569a9`, `47bed5d`, and `6de2411`; the implementing identity is unavailable in retained evidence. The fifth review identified the real missing POSIX parent-directory fsync durability defect, so this remediation also reached its five-round breaker and remained blocked. Task 11B was then authorized as the distinct path to close that remaining defect.
+
+## 2026-07-30 Task 11B remediation and CLEAN review
+
+Controller and reviewer evidence identify `/root/task11b_impl` and `/root/task11b_review`. Approved design/plan/base clarification commits were `83a6d7d`, `10d5710`, and `28fb38e`; implementation and scoped fixes were `d396c24`, `e7448ff`, and `cad8e17`. Task and broad final reviews were CLEAN after the final scoped fix. Recorded verification was focused durability 11 passed, affected 128 passed with 4 skipped, full 581 passed with 10 skipped, plus Ruff and diff checks clean. This closes the remaining Task 11A receipt-directory durability defect without erasing its breaker history.
+
+## 2026-07-30 Task 12 distribution work
+
+Agent `/root/task12_artifacts` implemented Task 12 delivery commits `6d06a3e`, `783a814`, `869dd20`, and `8e1792d`; reviewer `/root/task12_task1_review` marked Task 1 CLEAN after round 2. Task 1 evidence records focused distribution/CLI 12 passed, full isolated verification 593 passed with 10 skipped, inspected wheel and clean sdist, and an isolated wheel CLI/demo passing without credentials or network activity. The human-approved public-mock amendment is `783a814`. `docker version` produced PowerShell `CommandNotFoundException` because the Docker CLI is absent, so no local image-build success is claimed. Task 12 remains in progress while its Task 2 evidence synchronization and final review are pending.

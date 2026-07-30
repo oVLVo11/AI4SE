@@ -18,6 +18,49 @@ def _read(relative_path: str) -> str:
     return (REPOSITORY_ROOT / relative_path).read_text(encoding="utf-8")
 
 
+def _task_ledger_rows(plan: str) -> dict[str, tuple[str, str, str, str, str]]:
+    header = "| Task | Status | Implementing agent | Spec review | Quality review | Commit |"
+    table = plan[plan.index(header) :]
+    rows: dict[str, tuple[str, str, str, str, str]] = {}
+    for line in table.splitlines()[2:]:
+        if not line.startswith("|"):
+            break
+        cells = [cell.strip() for cell in line.strip("|").split("|")]
+        if len(cells) == 6:
+            rows[cells[0]] = tuple(cells[1:])  # type: ignore[assignment]
+    return rows
+
+
+def test_root_evidence_records_preserve_task_11_breakers_and_task_12_review_state() -> None:
+    ledger = _task_ledger_rows(_read("PLAN.md"))
+    for task in ("11", "11A", "11B", "12"):
+        assert task in ledger
+        status, agent, spec_review, quality_review, commits = ledger[task]
+        assert all((status, agent, spec_review, quality_review, commits))
+        assert agent == "unavailable" or re.fullmatch(r"`/root/[^`]+`(?:, `/root/[^`]+`)*", agent)
+        assert re.search(r"\b[0-9a-f]{7,40}\b", commits)
+
+    agent_log = _read("AGENT_LOG.md")
+    headings = (
+        "## 2026-07-29 Task 11 implementation and breaker",
+        "## 2026-07-30 Task 11A remediation and breaker",
+        "## 2026-07-30 Task 11B remediation and CLEAN review",
+        "## 2026-07-30 Task 12 distribution work",
+    )
+    heading_positions = [agent_log.index(heading) for heading in headings]
+    assert heading_positions == sorted(heading_positions)
+
+    task_11 = agent_log[heading_positions[0] : heading_positions[1]].lower()
+    task_11a = agent_log[heading_positions[1] : heading_positions[2]].lower()
+    task_11b = agent_log[heading_positions[2] : heading_positions[3]]
+    assert "breaker" in task_11
+    assert "breaker" in task_11a
+    assert "remaining" in task_11b.lower() and "defect" in task_11b.lower()
+    assert "CLEAN" in task_11b
+    for commit in ("6de2411", "cad8e17", "6d06a3e", "869dd20", "8e1792d"):
+        assert commit in agent_log
+
+
 def test_required_artifacts_and_readme_headings_exist() -> None:
     required_paths = (
         "README.md",

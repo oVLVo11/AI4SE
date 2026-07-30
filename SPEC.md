@@ -294,6 +294,8 @@ User errors such as invalid paths, malformed configuration, or missing verifier 
 
 JSON Lines logs contain task ID, iteration, component, event type, duration, and outcome. They exclude API keys, authorization headers, complete prompts, complete model responses, and source bodies by default. A task can export a redacted audit report.
 
+For audit receipt recovery, a durable pending reservation precedes receipt publication. The receipt file is fsynced and, for a new or uncertain POSIX directory entry, the exact validated parent directory chain is fsynced before pending state is cleared or migration/checkpoint state advances. Existing formats, bounds, and security guarantees remain unchanged.
+
 The UI summarizes LLM call count, verifier duration, finding counts by category, repeated-failure count, budget consumption, and final stop reason. No external observability service is required in the first version.
 
 ## 11. Testing Strategy and Mechanism Demonstration
