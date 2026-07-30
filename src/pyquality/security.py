@@ -1608,6 +1608,8 @@ def _recover_pending_audit_reservation(
             _verify_audit_receipt(audit_descriptor, receipt, event_id)
             if receipt["offset"] != start_offset:
                 raise AuditRecoveryRequired
+        if not receipt_created:
+            _sync_audit_directory_chain(index_root, receipt_path.parent)
     finally:
         os.close(receipt_descriptor)
     return _store_audit_checkpoint(
@@ -2469,6 +2471,8 @@ def _copy_r4_receipt(
                 )
             except OSError:
                 raise AuditRecoveryRequired from None
+        if not target_created:
+            _sync_audit_directory_chain(index_root, target_path.parent)
     finally:
         os.close(target_descriptor)
 

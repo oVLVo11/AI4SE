@@ -840,6 +840,70 @@ def test_receipt_directory_durability_normal_append_recovers_after_post_sync_che
     assert security._audit_receipt_path(index_root, event.event_id).exists()
 
 
+def test_receipt_directory_durability_normal_append_retry_resyncs_before_clearing_pending(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A visible receipt after failed publication must be synced again before it is counted."""
+    from pyquality import security
+
+    logger, path, index_root = _prepare_receipt_directory_durability_logger(tmp_path)
+    event = AuditEvent(event_id="2" * 64, event_type="transition")
+    receipt_parent = security._audit_receipt_path(index_root, event.event_id).parent
+    sync_calls: list[tuple[Path, Path]] = []
+    calls: list[str] = []
+    real_store = security._store_audit_checkpoint
+
+    def fail_then_record_sync(root: Path, leaf: Path) -> None:
+        sync_calls.append((root, leaf))
+        if len(sync_calls) == 1:
+            raise OSError("simulated directory sync failure")
+        calls.append("retry-receipt-directory-fsync")
+
+    def record_store(*args: object, **kwargs: object):
+        previous = args[1] if len(args) > 1 else kwargs.get("previous")
+        if (
+            previous is not None
+            and previous.pending_event_id == event.event_id
+            and kwargs.get("pending_event_id") is None
+        ):
+            calls.append("clear-pending-checkpoint")
+        return real_store(*args, **kwargs)
+
+    monkeypatch.setattr(security, "_sync_audit_directory_chain", fail_then_record_sync)
+    monkeypatch.setattr(security, "_store_audit_checkpoint", record_store)
+
+    with pytest.raises(AuditWriteError):
+        logger.emit(event)
+    checkpoint_descriptor = security._open_audit(index_root / "checkpoint", append=False)
+    try:
+        failed_checkpoint = security._load_audit_checkpoint(
+            checkpoint_descriptor,
+            audit_size=path.stat().st_size,
+        )
+    finally:
+        os.close(checkpoint_descriptor)
+    assert failed_checkpoint is not None
+    assert failed_checkpoint.pending_event_id == event.event_id
+    logger.emit(event)
+
+    assert sync_calls == [(index_root, receipt_parent), (index_root, receipt_parent)]
+    assert calls.index("retry-receipt-directory-fsync") < calls.index(
+        "clear-pending-checkpoint"
+    )
+    checkpoint_descriptor = security._open_audit(index_root / "checkpoint", append=False)
+    try:
+        checkpoint = security._load_audit_checkpoint(
+            checkpoint_descriptor,
+            audit_size=path.stat().st_size,
+        )
+    finally:
+        os.close(checkpoint_descriptor)
+    assert checkpoint is not None
+    assert checkpoint.pending_event_id is None
+    assert checkpoint.committed_receipt_count == 1
+
+
 def test_receipt_directory_durability_reconciliation_orders_new_receipt_before_checkpoint_clear(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -953,6 +1017,70 @@ def test_receipt_directory_durability_reconciliation_sync_failure_retains_pendin
     assert checkpoint is not None
     assert checkpoint.pending_event_id == event.event_id
     assert checkpoint.committed_receipt_count == 0
+
+
+def test_receipt_directory_durability_reconciliation_retry_resyncs_before_clearing_pending(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed suffix receipt publication must retry its exact parent before count advance."""
+    from pyquality import security
+
+    path = tmp_path / "audit.jsonl"
+    index_base = tmp_path / "index"
+    logger = AuditLogger(path, index_root=index_base)
+    event = AuditEvent(event_id="1" * 64, event_type="transition")
+    _prepare_existing_audit(path, logger._encode(event))
+    descriptor = security._open_audit(path)
+    try:
+        os.fsync(descriptor)
+        index_root = security._audit_index_root(path, descriptor, index_base)
+        security._ensure_secure_audit_index_root(index_base, index_root)
+    finally:
+        os.close(descriptor)
+    receipt_parent = security._audit_receipt_path(index_root, event.event_id).parent
+    sync_calls: list[tuple[Path, Path]] = []
+    calls: list[str] = []
+    real_store = security._store_audit_checkpoint
+
+    def fail_then_record_sync(root: Path, leaf: Path) -> None:
+        sync_calls.append((root, leaf))
+        if len(sync_calls) == 1:
+            raise OSError("simulated directory sync failure")
+        calls.append("retry-receipt-directory-fsync")
+
+    def record_store(*args: object, **kwargs: object):
+        previous = args[1] if len(args) > 1 else kwargs.get("previous")
+        if (
+            previous is not None
+            and previous.pending_event_id == event.event_id
+            and kwargs.get("pending_event_id") is None
+        ):
+            calls.append("clear-pending-checkpoint")
+        return real_store(*args, **kwargs)
+
+    monkeypatch.setattr(security, "_sync_audit_directory_chain", fail_then_record_sync)
+    monkeypatch.setattr(security, "_store_audit_checkpoint", record_store)
+
+    with pytest.raises(AuditWriteError):
+        logger.emit(event)
+    logger.emit(event)
+
+    assert sync_calls == [(index_root, receipt_parent), (index_root, receipt_parent)]
+    assert calls.index("retry-receipt-directory-fsync") < calls.index(
+        "clear-pending-checkpoint"
+    )
+    checkpoint_descriptor = security._open_audit(index_root / "checkpoint", append=False)
+    try:
+        checkpoint = security._load_audit_checkpoint(
+            checkpoint_descriptor,
+            audit_size=path.stat().st_size,
+        )
+    finally:
+        os.close(checkpoint_descriptor)
+    assert checkpoint is not None
+    assert checkpoint.pending_event_id is None
+    assert checkpoint.committed_receipt_count == 1
 
 
 def test_receipt_directory_durability_existing_receipt_skips_publication_sync(
@@ -2278,6 +2406,70 @@ def test_r4_migration_interruption_resumes_and_hardlink_alias_converges(
     assert process.exitcode == 0
     assert path.read_bytes() == before
     assert (new_root / "migration").is_file()
+
+
+def test_receipt_directory_durability_r4_retry_resyncs_before_cursor_advance(
+    r4_tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A visible migration target after sync failure must not advance its cursor unsynced."""
+    from pyquality import security
+
+    path = r4_tmp_path / "migration-retry" / "audit.jsonl"
+    index_base = r4_tmp_path / "migration-retry-index"
+    events, _, _, index_root = _build_released_r4_audit_index(
+        path,
+        index_base,
+        event_count=1,
+    )
+    event = events[0]
+    receipt_parent = security._audit_receipt_path(index_root, event.event_id).parent
+    sync_calls: list[tuple[Path, Path]] = []
+
+    def fail_then_record_receipt_sync(root: Path, leaf: Path) -> None:
+        if (root, leaf) != (index_root, receipt_parent):
+            return
+        sync_calls.append((root, leaf))
+        if len(sync_calls) == 1:
+            raise OSError("simulated migration receipt directory sync failure")
+
+    def load_marker_state():
+        audit_descriptor = security._open_audit(path, create=False)
+        try:
+            identity = security._audit_stream_identity(audit_descriptor)
+            audit_size = os.lseek(audit_descriptor, 0, os.SEEK_END)
+        finally:
+            os.close(audit_descriptor)
+        marker_descriptor = security._open_audit(
+            index_root / "migration",
+            append=False,
+            create=False,
+        )
+        try:
+            return security._load_r4_migration_state(
+                marker_descriptor,
+                source_identity=identity,
+                audit_size=audit_size,
+            )
+        finally:
+            os.close(marker_descriptor)
+
+    monkeypatch.setattr(
+        security,
+        "_sync_audit_directory_chain",
+        fail_then_record_receipt_sync,
+    )
+
+    with pytest.raises(AuditWriteError):
+        AuditLogger(path, index_root=index_base).emit(event)
+    assert load_marker_state().next_cursor == 0
+
+    AuditLogger(path, index_root=index_base).emit(event)
+
+    assert sync_calls == [(index_root, receipt_parent), (index_root, receipt_parent)]
+    state = load_marker_state()
+    assert state.next_cursor == 1
+    assert state.completed is True
 
 
 def test_completed_r4_marker_allows_live_checkpoint_to_advance(
