@@ -186,6 +186,27 @@ def _read(relative_path: str) -> str:
     return (REPOSITORY_ROOT / relative_path).read_text(encoding="utf-8")
 
 
+def _copy_sdist_source(source_root: Path) -> None:
+    source_root.mkdir()
+    pyproject = REPOSITORY_ROOT / "pyproject.toml"
+    shutil.copy2(pyproject, source_root / "pyproject.toml")
+    shutil.copy2(REPOSITORY_ROOT / "README.md", source_root / "README.md")
+
+    license_specification = tomllib.loads(pyproject.read_text(encoding="utf-8"))["project"].get(
+        "license"
+    )
+    if isinstance(license_specification, dict) and "file" in license_specification:
+        license_filename = license_specification["file"]
+        if not isinstance(license_filename, str):
+            raise TypeError("project license file must be a string")
+        shutil.copy2(
+            REPOSITORY_ROOT / license_filename,
+            source_root / license_filename,
+        )
+
+    shutil.copytree(REPOSITORY_ROOT / "src", source_root / "src")
+
+
 def _task_ledger_rows(plan: str) -> dict[str, tuple[str, str, str, str, str]]:
     header = "| Task | Status | Implementing agent | Spec review | Quality review | Commit |"
     table = plan[plan.index(header) :]
@@ -1028,25 +1049,73 @@ def test_wheel_contains_runtime_assets_but_no_development_or_data_residue(tmp_pa
     assert {canonicalize_name("pytest"), canonicalize_name("ruff")} <= runtime_names
 
 
+def test_copy_sdist_source_copies_explicit_inputs_without_traversing_repository_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture_root = tmp_path / "fixture-repository"
+    (fixture_root / "src" / "pyquality" / "web" / "templates").mkdir(parents=True)
+    (fixture_root / "src" / "pyquality" / "demo_fixture").mkdir()
+    (fixture_root / "pyproject.toml").write_text("[project]\nname = 'fixture'\n", encoding="utf-8")
+    (fixture_root / "README.md").write_text("fixture readme\n", encoding="utf-8")
+    (fixture_root / "src" / "pyquality" / "public_demo_worker.py").write_text(
+        "worker = True\n", encoding="utf-8"
+    )
+    (fixture_root / "src" / "pyquality" / "web" / "templates" / "base.html").write_text(
+        "<main>fixture</main>\n", encoding="utf-8"
+    )
+    (fixture_root / "src" / "pyquality" / "demo_fixture" / "calculator.py").write_text(
+        "def add(left, right): return left + right\n", encoding="utf-8"
+    )
+    (fixture_root / ".pytest-task-residue").mkdir()
+    (fixture_root / ".pytest-task-residue" / "locked.txt").write_text(
+        "unrelated\n", encoding="utf-8"
+    )
+    source_root = tmp_path / "source"
+    real_copytree = shutil.copytree
+
+    def copy_only_src(source: str | Path, destination: str | Path, **kwargs: object) -> Path:
+        assert Path(source) == fixture_root / "src"
+        monkeypatch.setattr(shutil, "copytree", real_copytree)
+        return real_copytree(source, destination, **kwargs)
+
+    monkeypatch.setitem(globals(), "REPOSITORY_ROOT", fixture_root)
+    monkeypatch.setattr(shutil, "copytree", copy_only_src)
+
+    _copy_sdist_source(source_root)
+
+    assert (source_root / "pyproject.toml").is_file()
+    assert (source_root / "README.md").is_file()
+    assert (source_root / "src" / "pyquality" / "public_demo_worker.py").is_file()
+    assert (source_root / "src" / "pyquality" / "web" / "templates" / "base.html").is_file()
+    assert (source_root / "src" / "pyquality" / "demo_fixture" / "calculator.py").is_file()
+    assert not (source_root / ".pytest-task-residue").exists()
+
+
+def test_copy_sdist_source_copies_directly_declared_license_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture_root = tmp_path / "fixture-repository"
+    (fixture_root / "src").mkdir(parents=True)
+    (fixture_root / "pyproject.toml").write_text(
+        "[project]\nname = 'fixture'\nlicense = {file = 'COPYING'}\n",
+        encoding="utf-8",
+    )
+    (fixture_root / "README.md").write_text("fixture readme\n", encoding="utf-8")
+    (fixture_root / "COPYING").write_text("fixture license\n", encoding="utf-8")
+    monkeypatch.setitem(globals(), "REPOSITORY_ROOT", fixture_root)
+
+    _copy_sdist_source(tmp_path / "source")
+
+    assert (tmp_path / "source" / "COPYING").read_text(encoding="utf-8") == "fixture license\n"
+
+
 def test_sdist_excludes_development_and_local_data_but_keeps_runtime_inputs(
     tmp_path: Path,
 ) -> None:
     source_root = tmp_path / "source"
-    shutil.copytree(
-        REPOSITORY_ROOT,
-        source_root,
-        ignore=shutil.ignore_patterns(
-            ".git",
-            ".superpowers",
-            ".worktrees",
-            ".venv*",
-            ".pytest_cache",
-            ".ruff_cache",
-            "__pycache__",
-            "build",
-            "dist",
-        ),
-    )
+    _copy_sdist_source(source_root)
     sentinel = source_root / ".venv-sentinel" / "marker"
     sentinel.parent.mkdir()
     sentinel.write_text("must never ship\n", encoding="utf-8")
