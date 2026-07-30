@@ -21,7 +21,7 @@ from .loop import AgentLoop
 from .policy import PolicyEngine
 from .service import HarnessService
 from .storage.sqlite import SQLiteTaskRepository
-from .tools import SubprocessRunner, ToolDispatcher
+from .tools import ProcessRunner, SubprocessRunner, ToolDispatcher
 from .validators import QualityPipeline
 
 
@@ -128,17 +128,21 @@ def _write_fixture(root: Path) -> None:
     )
 
 
-def run_demo(work_dir: Path) -> DemoReport:
+def run_demo(
+    work_dir: Path, *, process_runner: ProcessRunner | None = None
+) -> DemoReport:
     """Run the fixed offline scenario and return path/timestamp-free evidence."""
     try:
-        return _run_demo(Path(work_dir))
+        return _run_demo(Path(work_dir), process_runner=process_runner)
     except DemoError:
         raise
     except BaseException as error:  # noqa: BLE001 - sanitize the complete demo lifecycle.
         raise DemoError(f"deterministic demo failed: {type(error).__name__}") from None
 
 
-def _run_demo(work_dir: Path) -> DemoReport:
+def _run_demo(
+    work_dir: Path, *, process_runner: ProcessRunner | None = None
+) -> DemoReport:
     """Compose and execute the demo inside the sanitized public boundary."""
     base = Path(work_dir)
     base.mkdir(parents=True, exist_ok=True)
@@ -150,8 +154,10 @@ def _run_demo(work_dir: Path) -> DemoReport:
         database = SQLiteTaskRepository(runtime / "state.sqlite")
         settings = Settings(round_limit=8, subprocess_timeout_s=30)
         policy = PolicyEngine(repository_root)
+        dispatcher_runner = process_runner or SubprocessRunner()
+        pipeline_runner = process_runner or SubprocessRunner()
         dispatcher = _RecordingDispatcher(
-            ToolDispatcher(repository_root, policy, SubprocessRunner(), settings)
+            ToolDispatcher(repository_root, policy, dispatcher_runner, settings)
         )
         first_patch = _patch("left - right", "left + right + 1")
         second_patch = _patch("left + right + 1", "left + right")
@@ -167,7 +173,7 @@ def _run_demo(work_dir: Path) -> DemoReport:
             repository=database,
             policy=policy,
             dispatcher=dispatcher,
-            pipeline=QualityPipeline(SubprocessRunner(), settings, repository_root),
+            pipeline=QualityPipeline(pipeline_runner, settings, repository_root),
             parser=ActionParser(settings),
             llm=model,
             context_builder=ContextBuilder(

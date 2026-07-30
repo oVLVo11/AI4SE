@@ -29,6 +29,7 @@ _DEFAULT_EXCLUDED_DIRECTORIES = frozenset(
     {".git", ".venv", "__pycache__", ".pytest_cache", ".ruff_cache"}
 )
 _MAX_SEARCH_MATCHES = 1_000
+_SIGKILL = getattr(signal, "SIGKILL", 9)
 
 
 @dataclass(frozen=True)
@@ -47,6 +48,112 @@ class ProcessRunner(Protocol):
     """Injectable subprocess boundary for quality validation."""
 
     def run(self, argv: list[str], cwd: Path, timeout_s: int, output_limit: int) -> ProcessResult: ...
+
+
+class _WindowsJob:
+    """Kill-on-close containment for a Windows process and all descendants."""
+
+    __slots__ = ("_handle",)
+
+    def __init__(self, handle: int) -> None:
+        self._handle = handle
+
+    @classmethod
+    def assign(cls, process: subprocess.Popen[bytes]) -> _WindowsJob | None:
+        if os.name != "nt":
+            return None
+        import ctypes
+        from ctypes import wintypes
+
+        class _BasicLimitInformation(ctypes.Structure):
+            _fields_ = (
+                ("PerProcessUserTimeLimit", wintypes.LARGE_INTEGER),
+                ("PerJobUserTimeLimit", wintypes.LARGE_INTEGER),
+                ("LimitFlags", wintypes.DWORD),
+                ("MinimumWorkingSetSize", ctypes.c_size_t),
+                ("MaximumWorkingSetSize", ctypes.c_size_t),
+                ("ActiveProcessLimit", wintypes.DWORD),
+                ("Affinity", ctypes.c_size_t),
+                ("PriorityClass", wintypes.DWORD),
+                ("SchedulingClass", wintypes.DWORD),
+            )
+
+        class _IoCounters(ctypes.Structure):
+            _fields_ = tuple(
+                (name, ctypes.c_ulonglong)
+                for name in (
+                    "ReadOperationCount",
+                    "WriteOperationCount",
+                    "OtherOperationCount",
+                    "ReadTransferCount",
+                    "WriteTransferCount",
+                    "OtherTransferCount",
+                )
+            )
+
+        class _ExtendedLimitInformation(ctypes.Structure):
+            _fields_ = (
+                ("BasicLimitInformation", _BasicLimitInformation),
+                ("IoInfo", _IoCounters),
+                ("ProcessMemoryLimit", ctypes.c_size_t),
+                ("JobMemoryLimit", ctypes.c_size_t),
+                ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                ("PeakJobMemoryUsed", ctypes.c_size_t),
+            )
+
+        kernel32 = ctypes.windll.kernel32
+        create_job = kernel32.CreateJobObjectW
+        create_job.argtypes = (wintypes.LPVOID, wintypes.LPCWSTR)
+        create_job.restype = wintypes.HANDLE
+        set_information = kernel32.SetInformationJobObject
+        set_information.argtypes = (
+            wintypes.HANDLE,
+            ctypes.c_int,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+        )
+        set_information.restype = wintypes.BOOL
+        open_process = kernel32.OpenProcess
+        open_process.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+        open_process.restype = wintypes.HANDLE
+        assign_process = kernel32.AssignProcessToJobObject
+        assign_process.argtypes = (wintypes.HANDLE, wintypes.HANDLE)
+        assign_process.restype = wintypes.BOOL
+        close_handle = kernel32.CloseHandle
+        close_handle.argtypes = (wintypes.HANDLE,)
+        close_handle.restype = wintypes.BOOL
+
+        job_handle = create_job(None, None)
+        if not job_handle:
+            return None
+        information = _ExtendedLimitInformation()
+        information.BasicLimitInformation.LimitFlags = 0x00002000
+        if not set_information(
+            job_handle, 9, ctypes.byref(information), ctypes.sizeof(information)
+        ):
+            close_handle(job_handle)
+            return None
+        process_handle = open_process(0x0001 | 0x0100, False, process.pid)
+        if not process_handle:
+            close_handle(job_handle)
+            return None
+        try:
+            assigned = bool(assign_process(job_handle, process_handle))
+        finally:
+            close_handle(process_handle)
+        if not assigned:
+            close_handle(job_handle)
+            return None
+        return cls(int(job_handle))
+
+    def close(self) -> None:
+        if self._handle == 0:
+            return
+        import ctypes
+        from ctypes import wintypes
+
+        ctypes.windll.kernel32.CloseHandle(wintypes.HANDLE(self._handle))
+        self._handle = 0
 
 
 class CommitObserver(Protocol):
@@ -233,6 +340,19 @@ class PinnedDirectory:
 class SubprocessRunner:
     """Run a fixed argv without a shell and keep all captured output byte-bounded."""
 
+    def __init__(
+        self,
+        *,
+        inherit_process_group: bool = False,
+        require_tree_containment: bool = False,
+        abort_inherited_group_on_timeout: bool = False,
+    ) -> None:
+        if abort_inherited_group_on_timeout and not inherit_process_group:
+            raise ValueError("group abort requires an inherited process group")
+        self._inherit_process_group = inherit_process_group
+        self._require_tree_containment = require_tree_containment
+        self._abort_inherited_group_on_timeout = abort_inherited_group_on_timeout
+
     def run(self, argv: list[str], cwd: Path, timeout_s: int, output_limit: int) -> ProcessResult:
         if not argv or not all(isinstance(argument, str) and argument for argument in argv):
             raise ValueError("argv must contain non-empty strings")
@@ -242,16 +362,32 @@ class SubprocessRunner:
         if not fixed_cwd.is_dir():
             raise ValueError("cwd must be a directory")
 
+        containment_gate = os.name == "nt" and self._require_tree_containment
         process = subprocess.Popen(
             argv,
             cwd=fixed_cwd,
             shell=False,
-            stdin=subprocess.DEVNULL,
+            stdin=subprocess.PIPE if containment_gate else subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            start_new_session=os.name != "nt",
+            start_new_session=os.name != "nt" and not self._inherit_process_group,
             creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
         )
+        job = _WindowsJob.assign(process) if os.name == "nt" else None
+        if os.name == "nt" and self._require_tree_containment and job is None:
+            process.kill()
+            process.wait()
+            raise RuntimeError("process tree containment is unavailable")
+        if containment_gate:
+            assert process.stdin is not None
+            try:
+                process.stdin.write(b"\0")
+                process.stdin.close()
+            except OSError:
+                if job is not None:
+                    job.close()
+                process.wait()
+                raise RuntimeError("process tree containment is unavailable") from None
         captured: dict[str, bytearray] = {"stdout": bytearray(), "stderr": bytearray(), "output": bytearray()}
         lock = threading.Lock()
         truncated = False
@@ -285,7 +421,13 @@ class SubprocessRunner:
             process.wait(timeout=timeout_s)
         except subprocess.TimeoutExpired:
             timed_out = True
-            _terminate_process_tree(process)
+            if self._abort_inherited_group_on_timeout and os.name != "nt":
+                os.killpg(os.getpgrp(), _SIGKILL)
+            elif job is not None:
+                job.close()
+                job = None
+            else:
+                _terminate_process_tree(process)
             for stream in (process.stdout, process.stderr):
                 threading.Thread(target=_close_pipe, args=(stream,), daemon=True).start()
             try:
@@ -293,6 +435,13 @@ class SubprocessRunner:
             except subprocess.TimeoutExpired:
                 process.kill()
         finally:
+            if job is not None:
+                job.close()
+            if os.name != "nt" and self._require_tree_containment:
+                try:
+                    os.killpg(process.pid, _SIGKILL)
+                except ProcessLookupError:
+                    pass
             join_deadline = time.monotonic() + 0.25
             for reader in readers:
                 reader.join(timeout=max(0, join_deadline - time.monotonic()))
@@ -1056,10 +1205,7 @@ def _terminate_process_tree(process: subprocess.Popen[bytes]) -> None:
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
-            try:
-                taskkill.wait(timeout=0.25)
-            except subprocess.TimeoutExpired:
-                taskkill.kill()
+            taskkill.wait()
         except OSError:
             pass
         finally:
@@ -1069,7 +1215,7 @@ def _terminate_process_tree(process: subprocess.Popen[bytes]) -> None:
                 pass
         return
     try:
-        os.killpg(process.pid, signal.SIGKILL)
+        os.killpg(process.pid, _SIGKILL)
     except ProcessLookupError:
         pass
 

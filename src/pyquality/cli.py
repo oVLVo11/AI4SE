@@ -6,6 +6,7 @@ import argparse
 import getpass
 import json
 import os
+import sys
 from collections.abc import Callable, Sequence
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -13,7 +14,12 @@ from typing import Protocol
 
 import uvicorn
 
+from .demo import DemoError, DemoReport
 from .security import CredentialService, CredentialStatus
+from .tools import ProcessRunner, SubprocessRunner
+
+_PUBLIC_DEMO_TIMEOUT_S = 15
+_PUBLIC_DEMO_OUTPUT_BYTES = 65_536
 
 
 class _Credentials(Protocol):
@@ -65,11 +71,30 @@ def _default_run_service(repo: Path) -> _RunService:
     return build_service(repo)
 
 
-def _run_public_demo():
-    from .demo import run_demo
-
+def _run_public_demo(
+    *, process_runner: ProcessRunner | None = None
+) -> DemoReport:
+    """Run the whole demo in one killable process tree with a wall deadline."""
     with TemporaryDirectory(prefix="pyquality-public-demo-") as directory:
-        return run_demo(Path(directory))
+        result = (
+            process_runner or SubprocessRunner(require_tree_containment=True)
+        ).run(
+            [
+                sys.executable,
+                "-m",
+                "pyquality.public_demo_worker",
+                directory,
+            ],
+            cwd=Path(directory),
+            timeout_s=_PUBLIC_DEMO_TIMEOUT_S,
+            output_limit=_PUBLIC_DEMO_OUTPUT_BYTES,
+        )
+    if result.timed_out or result.truncated or result.returncode != 0:
+        raise DemoError("public demo execution failed")
+    try:
+        return DemoReport.model_validate_json(result.stdout)
+    except (TypeError, ValueError):
+        raise DemoError("public demo execution failed") from None
 
 
 def _default_app_factory(repo: Path, mode: str) -> object:

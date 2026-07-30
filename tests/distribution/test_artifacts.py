@@ -4,14 +4,18 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tarfile
 import tomllib
 import zipfile
+from email.parser import Parser
 from pathlib import Path
 
 import pytest
+from packaging.requirements import Requirement
+from packaging.utils import canonicalize_name
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 EXPECTED_TASK_12_STATUS = "Complete"
@@ -472,16 +476,40 @@ def test_wheel_contains_runtime_assets_but_no_development_or_data_residue(tmp_pa
         or "/cache/" in name
         for name in contents
     )
-    for tool in ("pytest", "ruff"):
-        assert any(
-            line.startswith(f"Requires-Dist: {tool}") and "extra ==" not in line
-            for line in metadata.splitlines()
+    requirement_values = Parser().parsestr(metadata).get_all("Requires-Dist", [])
+    runtime_names = {
+        canonicalize_name(parsed.name)
+        for value in requirement_values
+        if (
+            (parsed := Requirement(value)).marker is None
+            or parsed.marker.evaluate({"extra": ""})
         )
+    }
+    assert {canonicalize_name("pytest"), canonicalize_name("ruff")} <= runtime_names
 
 
 def test_sdist_excludes_development_and_local_data_but_keeps_runtime_inputs(
     tmp_path: Path,
 ) -> None:
+    source_root = tmp_path / "source"
+    shutil.copytree(
+        REPOSITORY_ROOT,
+        source_root,
+        ignore=shutil.ignore_patterns(
+            ".git",
+            ".superpowers",
+            ".worktrees",
+            ".venv*",
+            ".pytest_cache",
+            ".ruff_cache",
+            "__pycache__",
+            "build",
+            "dist",
+        ),
+    )
+    sentinel = source_root / ".venv-sentinel" / "marker"
+    sentinel.parent.mkdir()
+    sentinel.write_text("must never ship\n", encoding="utf-8")
     distribution_directory = tmp_path / "dist"
     subprocess.run(
         [
@@ -493,7 +521,7 @@ def test_sdist_excludes_development_and_local_data_but_keeps_runtime_inputs(
             "--outdir",
             str(distribution_directory),
         ],
-        cwd=REPOSITORY_ROOT,
+        cwd=source_root,
         check=True,
     )
     with tarfile.open(next(distribution_directory.glob("*.tar.gz"))) as sdist:
@@ -503,6 +531,7 @@ def test_sdist_excludes_development_and_local_data_but_keeps_runtime_inputs(
     assert any(name.endswith("/README.md") for name in contents)
     assert any(name.endswith("/src/pyquality/web/templates/base.html") for name in contents)
     assert any(name.endswith("/src/pyquality/demo_fixture/calculator.py") for name in contents)
+    assert not any(name.endswith("/.venv-sentinel/marker") for name in contents)
     assert not any(
         part.startswith(".venv")
         for name in contents

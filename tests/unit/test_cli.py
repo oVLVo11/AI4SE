@@ -7,10 +7,13 @@ from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
+from packaging.requirements import Requirement
+from packaging.utils import canonicalize_name
 
-from pyquality.cli import _default_app_factory, main
-from pyquality.demo import DemoReport, DeniedActionEvidence
+from pyquality.cli import _default_app_factory, _run_public_demo, main
+from pyquality.demo import DemoError, DemoReport, DeniedActionEvidence
 from pyquality.domain.models import TaskStatus
+from pyquality.tools import ProcessResult
 
 
 def _capture_server(monkeypatch: pytest.MonkeyPatch) -> list[object]:
@@ -52,12 +55,16 @@ def _succeeded_demo_report() -> DemoReport:
 
 def test_public_mock_runtime_includes_its_offline_quality_tools() -> None:
     runtime_requirements = requires("pyquality-harness") or []
-
-    for tool in ("pytest", "ruff"):
-        assert any(
-            requirement.startswith(tool) and "extra ==" not in requirement
-            for requirement in runtime_requirements
+    runtime_names = {
+        canonicalize_name(parsed.name)
+        for value in runtime_requirements
+        if (
+            (parsed := Requirement(value)).marker is None
+            or parsed.marker.evaluate({"extra": ""})
         )
+    }
+
+    assert {canonicalize_name("pytest"), canonicalize_name("ruff")} <= runtime_names
 
 
 def test_default_public_app_executes_the_bundled_runner(
@@ -76,6 +83,27 @@ def test_default_public_app_executes_the_bundled_runner(
     _assert_public_app_accepts_the_bundled_scenario(application)
 
     assert calls == 1
+
+
+def test_public_demo_runner_enforces_whole_run_deadline() -> None:
+    calls: list[tuple[list[str], Path, int, int]] = []
+
+    class TimedOutRunner:
+        def run(
+            self, argv: list[str], cwd: Path, timeout_s: int, output_limit: int
+        ) -> ProcessResult:
+            calls.append((argv, cwd, timeout_s, output_limit))
+            return ProcessResult(None, "", "private child failure", "", True, False)
+
+    with pytest.raises(DemoError, match=r"^public demo execution failed$"):
+        _run_public_demo(process_runner=TimedOutRunner())
+
+    assert len(calls) == 1
+    argv, cwd, timeout_s, output_limit = calls[0]
+    assert argv[1:3] == ["-m", "pyquality.public_demo_worker"]
+    assert cwd == Path(argv[3])
+    assert timeout_s > 0
+    assert output_limit <= 65_536
 
 
 def test_serve_public_mock_flag_uses_offline_public_composition(

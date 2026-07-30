@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import os
+import subprocess
 import sys
 import time
 from pathlib import Path
 
 import pytest
 
+from pyquality import tools
 from pyquality.config import Settings
 from pyquality.domain.models import Action, PolicyOutcome
 from pyquality.policy import PolicyEngine
@@ -180,3 +183,82 @@ def test_process_runner_times_out_a_child_that_keeps_inherited_pipes_open(repo: 
 
     assert result.timed_out is True
     assert time.monotonic() - started < 2.5
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX process-group contract")
+def test_process_runner_can_keep_a_worker_inside_its_parent_group(repo: Path) -> None:
+    """Public validators must remain in the outer worker's killable group."""
+    runner = SubprocessRunner(inherit_process_group=True)
+
+    result = runner.run(
+        [sys.executable, "-c", "import os; print(os.getpgrp())"],
+        repo,
+        timeout_s=2,
+        output_limit=64,
+    )
+
+    assert result.returncode == 0
+    assert int(result.stdout.strip()) == os.getpgrp()  # type: ignore[attr-defined]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX process-group contract")
+def test_required_posix_containment_cleans_children_after_worker_exit(
+    repo: Path,
+) -> None:
+    marker = repo / "orphaned-child"
+    child = (
+        "import time; from pathlib import Path; "
+        f"time.sleep(1); Path({str(marker)!r}).write_text('leaked', encoding='utf-8')"
+    )
+    parent = (
+        "import subprocess,sys; "
+        f"subprocess.Popen([sys.executable, '-c', {child!r}]); sys.exit(1)"
+    )
+    runner = SubprocessRunner(require_tree_containment=True)
+
+    result = runner.run(
+        [sys.executable, "-c", parent], repo, timeout_s=2, output_limit=64
+    )
+    time.sleep(1.2)
+
+    assert result.returncode == 1
+    assert not marker.exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows Job Object contract")
+def test_windows_job_close_kills_the_complete_process_tree(tmp_path: Path) -> None:
+    """Closing timeout containment must kill a worker and its descendants."""
+    marker = tmp_path / "orphaned-child"
+    gate = tmp_path / "start-child"
+    ready = tmp_path / "child-started"
+    child = (
+        "import time; from pathlib import Path; "
+        f"time.sleep(1); Path({str(marker)!r}).write_text('leaked', encoding='utf-8')"
+    )
+    parent = (
+        "import subprocess,sys,time; from pathlib import Path; "
+        f"gate=Path({str(gate)!r}); "
+        "\nwhile not gate.exists(): time.sleep(0.01)\n"
+        f"subprocess.Popen([sys.executable, '-c', {child!r}]); "
+        f"Path({str(ready)!r}).write_text('ready', encoding='utf-8'); time.sleep(10)"
+    )
+    process = subprocess.Popen(
+        [sys.executable, "-c", parent],
+        creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+    )
+    try:
+        job = tools._WindowsJob.assign(process)  # type: ignore[attr-defined]
+        assert job is not None
+        gate.write_text("go", encoding="utf-8")
+        deadline = time.monotonic() + 2
+        while not ready.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert ready.exists()
+        job.close()
+        process.wait(timeout=2)
+        time.sleep(1.2)
+        assert not marker.exists()
+    finally:
+        if process.poll() is None:
+            tools._terminate_process_tree(process)
+            process.wait(timeout=2)
