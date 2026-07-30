@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import getpass
 import json
+import os
 from collections.abc import Callable, Sequence
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -39,6 +40,7 @@ def _parser() -> argparse.ArgumentParser:
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", default=8000, type=int)
     serve.add_argument("--repo", type=Path, default=Path.cwd())
+    serve.add_argument("--public-mock", action="store_true")
     demo = commands.add_parser("demo")
     demo.add_argument("--json", action="store_true", dest="as_json")
     credential = commands.add_parser("credential")
@@ -76,6 +78,13 @@ def _default_app_factory(repo: Path, mode: str) -> object:
     return create_app(build_service(repo), mode="local")
 
 
+def _serve_mode(public_mock: bool) -> str:
+    configured_mode = os.environ.get("PYQUALITY_MODE", "")
+    if configured_mode and configured_mode != "public_mock":
+        raise ValueError("invalid public mode")
+    return "public_mock" if public_mock or configured_mode else "local"
+
+
 def main(
     argv: Sequence[str] | None = None,
     *,
@@ -84,7 +93,8 @@ def main(
     app_factory: Callable[[str], object] | None = None,
     demo_runner: Callable[[], int] | None = None,
 ) -> int:
-    args = _parser().parse_args(argv)
+    parser = _parser()
+    args = parser.parse_args(argv)
     if args.command == "credential":
         if credentials is None:
             credentials = _default_credentials()
@@ -98,10 +108,14 @@ def main(
             print("credential cleared")
         return 0
     if args.command == "serve":
+        try:
+            mode = _serve_mode(args.public_mock)
+        except ValueError:
+            parser.error("invalid PYQUALITY_MODE")
         if app_factory is None:
-            app = _default_app_factory(args.repo, "local")
+            app = _default_app_factory(args.repo, mode)
         else:
-            app = app_factory("local")
+            app = app_factory(mode)
         uvicorn.run(app, host=args.host, port=args.port)
         return 0
     if args.command == "run":

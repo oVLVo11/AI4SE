@@ -6,6 +6,7 @@ import os
 import re
 import subprocess
 import sys
+import tarfile
 import tomllib
 import zipfile
 from pathlib import Path
@@ -38,6 +39,24 @@ def test_required_artifacts_and_readme_headings_exist() -> None:
         "## Known Limitations",
     ):
         assert heading in readme
+
+
+def test_readme_documents_safe_local_and_portable_delivery_limits() -> None:
+    readme = _read("README.md")
+    for text in (
+        "keyring-first",
+        "PYQUALITY_API_KEY",
+        "plaintext",
+        "pytest can execute repository code",
+        "not an operating-system sandbox",
+        "local SQLite and audit",
+        "python -m pip install --no-deps dist\\pyquality_harness-0.1.0-py3-none-any.whl",
+        "docker build -t pyquality-harness .",
+        "docker run --rm -p 8000:8000 pyquality-harness",
+        "### Render-compatible deployment",
+        "No hosted deployment is provided",
+    ):
+        assert text in readme
 
 
 def test_ci_files_define_the_course_commands_and_triggers() -> None:
@@ -116,6 +135,40 @@ def test_wheel_contains_runtime_assets_but_no_development_or_data_residue(tmp_pa
     )
 
 
+def test_sdist_excludes_development_and_local_data_but_keeps_runtime_inputs(
+    tmp_path: Path,
+) -> None:
+    distribution_directory = tmp_path / "dist"
+    subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "build",
+            "--sdist",
+            "--no-isolation",
+            "--outdir",
+            str(distribution_directory),
+        ],
+        cwd=REPOSITORY_ROOT,
+        check=True,
+    )
+    with tarfile.open(next(distribution_directory.glob("*.tar.gz"))) as sdist:
+        contents = sdist.getnames()
+
+    assert any(name.endswith("/pyproject.toml") for name in contents)
+    assert any(name.endswith("/README.md") for name in contents)
+    assert any(name.endswith("/src/pyquality/web/templates/base.html") for name in contents)
+    assert any(name.endswith("/src/pyquality/demo_fixture/calculator.py") for name in contents)
+    assert not any(
+        (relative_parts := Path(name).parts[1:])[:1] == ("tests",)
+        or any(part in {".git", ".superpowers", "__pycache__"} for part in relative_parts)
+        or name.endswith((".db", ".sqlite", ".sqlite3", ".log"))
+        or "/audit/" in name
+        or "/cache/" in name
+        for name in contents
+    )
+
+
 def test_dockerfile_builds_and_runs_only_the_public_mock_distribution() -> None:
     dockerfile = _read("Dockerfile")
     assert re.search(r"(?mi)^FROM\s+python:3\.12-slim\s+AS\s+builder\s*$", dockerfile)
@@ -152,7 +205,12 @@ def test_dockerignore_excludes_development_and_sensitive_local_data() -> None:
         "build/",
         "*.db",
         "*.sqlite",
+        "*.sqlite3",
         "*.log",
+        "audit/",
+        "cache/",
+        "AI4SE_Final_Project_A_Coding_Agent_Harness.md",
+        "通用要求.md",
     } <= ignored_paths
     assert "pyproject.toml" not in ignored_paths
     assert "src/" not in ignored_paths
