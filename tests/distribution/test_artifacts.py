@@ -97,6 +97,28 @@ EXPECTED_EARLY_TASK_ROWS = {
         "`73261de`, `a606267`",
     ),
 }
+EXPECTED_TASK_3_TO_10_ROWS = {
+    "3": ("Complete", "`/root/task3_policy`", "Human ruling: SPEC §14.2 is binding for revalidation; clean after fix round 1", "88 passed; 3 WinError-1314 symlink skips; Ruff clean; deferred Minor: threshold-boundary coverage", "`7b570c2`, `422382f`"),
+    "4": ("Complete", "`/root/task4_tools`, `/root/task4_fix_round4`", "Clean after fix round 4", "113 passed; 5 skipped; Ruff clean; portable POSIX syscall contract passed locally, while the POSIX rename/symlink end-to-end test was unavailable on the Windows host", "`b7a5d6c`, `ae7785d`, `c20a668`, `14becd2`, `6eea0e9`"),
+    "5": ("Complete", "Initial implementer identity unavailable after context compaction; `/root/task5_fix1` (fix rounds)", "`/root/task5_review`: clean after fix round 2", "140 passed; 5 skipped; Ruff and diff-check clean", "`411f7ae`, `ba45a82`, `f5e8145`"),
+    "6": ("Complete", "`/root/task6_feedback`", "`/root/task5_review`: clean after fix round 3", "Primary implementation verification: 164 passed; 5 skipped; focused 24 passed; Ruff and diff-check clean. Final reviewer full runs encountered unrelated pre-existing Task 4 one-second timeout flakes that passed in isolation; no Task 6 regression found", "`7a55808`, `c45d2da`, `4831d09`, `b8b54d6`"),
+    "7": ("Complete", "`/root/task7_llm_context`", "`/root/task7_review`: clean after fix round 1", "177 passed; 5 skipped; focused 13 passed; Ruff and diff-check clean; deferred Minor: explicit primitive-root, undeclared-extra-field, and lowered contextual-limit parser tests", "`9941c80`, `08b93a6`"),
+    "8": ("Complete", "`/root/task8_agent_loop`, `/root/task8_fix4`", "`/root/task8_review`: clean after fix round 4", "Pristine full suite: 264 passed; 6 skipped; focused 98 passed, 1 WinError-1314 alias skip; exact round-4 regression 3 passed; Ruff and diff-check clean; deferred Minor: constructor dependencies are not all protocols", "`80d54ec`, `7712349`, `adc6777`, `c3b5c0a`, `3a50249`, `4c9ea1a`"),
+    "9": ("Complete", "Initial implementer identity unavailable; `/root/task9a_remediation` (Task 9A)", "Task 9A clean after fix round 1; prior five-round breaker resolved by approved contract amendment", "Focused 90 passed, 2 skipped; full 354 passed, 8 skipped; Ruff and diff-check clean", "`66631d3`, `d6349b5`, `bc2b1c2`, `4f2fd8c`, `25a80e9`, `b593a49`, `6a2c885`, `4e4899b`, `964e818`, `9ab2f10`"),
+    "10": ("Complete", "Initial implementer and remediation identities unavailable after context compaction", "Independent Task 10A review clean after fix round 2; prior five-round breaker resolved by approved lifecycle amendment", "Affected 157 passed; pristine full 460 passed, 8 skipped; Ruff and cumulative diff-check clean", "`49072fe`, `65f26c2`, `88993f7`, `9fb90d0`, `67f4e39`, `3b3859f`, `f0c5fa4`, `71efb7c`, `0a4a15c`, `eb7afd3`, `6e4b44e`"),
+}
+EXPECTED_TASK_0_SUBSTANTIVE_FACTS = (
+    "exact fields/invariants for `QualityReport`, `TaskResult`, `PolicyOutcome`, `ToolResult`, `ApprovalDecision`, and `AuditEvent`",
+    "typed action envelope versus per-tool payloads",
+    "the Task 1 console entry point precedes `cli.py`",
+    "approval revalidation, canonicalization, digest, repository drift, lease, deadline, duplicate-decision, and terminal-resume semantics",
+    "persistence as intent/outbox versus simple pre-effect state save",
+    "no aggregate core-protocol constructor boundary",
+    "requested model/configuration contract",
+    "state-transition and round accounting",
+    "pre-Task-9 redacted audit sink",
+    "canonical plan and root `PLAN.md` add matching Task 1",
+)
 EXPECTED_PUBLIC_REPOSITORY_URL = "https://github.com/oVLVo11/AI4SE.git"
 EXPECTED_INITIAL_CI_URL = "https://github.com/oVLVo11/AI4SE/actions/runs/30544072702"
 EXPECTED_INITIAL_CI_SHA = "89544fc9d295fdbe0d6d20fd1ffc202d5238144f"
@@ -280,6 +302,8 @@ def _validate_root_evidence(plan: str, agent_log: str) -> None:
 
     for task, expected in EXPECTED_EARLY_TASK_ROWS.items():
         assert ledger[task] == expected
+    for task, expected in EXPECTED_TASK_3_TO_10_ROWS.items():
+        assert ledger[task] == expected
 
     assert ledger["11"][0] == "Implemented; breaker reached"
     assert ledger["11A"][0] == "Blocked; breaker reached"
@@ -307,6 +331,10 @@ def _validate_root_evidence(plan: str, agent_log: str) -> None:
         "0": ("2fdb099", "b5cdd29", "efc73b3"),
         "1": ("297d277", "6df8353", "a3908f9", "920983e", "a200b8b"),
         "2": ("73261de", "a606267"),
+        **{
+            task: tuple(re.findall(r"\b[0-9a-f]{7,40}\b", row[4]))
+            for task, row in EXPECTED_TASK_3_TO_10_ROWS.items()
+        },
         "11": (
             "593384e", "e80a17d", "6dcc2ec", "16b4edc", "ba8d95b", "d60a8bc", "10339c0",
             "7c21ce6", "39a21c4", "5ad427a", "f363ccc", "90b9c45", "9f44513",
@@ -331,6 +359,40 @@ def _validate_root_evidence(plan: str, agent_log: str) -> None:
     )
     heading_positions = [agent_log.index(heading) for heading in headings]
     assert heading_positions == sorted(heading_positions)
+
+    early_headings = (
+        "## 2026-07-28 Task 3 revalidation ruling",
+        "## 2026-07-28 Task 3 implementation and fix round 1",
+        "## 2026-07-28 Task 4 clarified tool restrictions",
+        "## 2026-07-28 Task 4 implementation and review fixes",
+        "## 2026-07-28 Task 5 implementation and review fixes",
+        "## 2026-07-29 Task 6 implementation and review fixes",
+        "## 2026-07-29 Task 7 implementation and review fix",
+        "## 2026-07-29 Task 8 implementation and review fixes",
+        "## 2026-07-29 Task 9 implementation, breaker, and Task 9A remediation",
+        "## 2026-07-29 Task 10 implementation, breaker, and Task 10A remediation",
+    )
+    early_positions = [agent_log.index(heading) for heading in early_headings]
+    assert early_positions == sorted(early_positions)
+    assert early_positions[-1] < heading_positions[0]
+    early_required = (
+        ("SPEC §14.2", "422382f", "clean"),
+        ("b7a5d6c", "6eea0e9", "fix round 4"),
+        ("411f7ae", "f5e8145", "clean"),
+        ("7a55808", "b8b54d6", "clean"),
+        ("9941c80", "08b93a6", "clean"),
+        ("80d54ec", "4c9ea1a", "clean"),
+        ("five formal fix rounds", "Task 9 breaker", "964e818", "9ab2f10"),
+        ("Five formal fix rounds", "breaker stopped Task 11", "0a4a15c", "6e4b44e"),
+    )
+    boundaries = ((0, 2), (2, 4), (4, 5), (5, 6), (6, 7), (7, 8), (8, 9), (9, None))
+    sections = [
+        agent_log[early_positions[start] : (early_positions[end] if end is not None else heading_positions[0])]
+        for start, end in boundaries
+    ]
+    for section, required in zip(sections, early_required, strict=True):
+        for text in required:
+            assert text.casefold() in section.casefold()
 
     task_11 = agent_log[heading_positions[0] : heading_positions[1]].lower()
     task_11a = agent_log[heading_positions[1] : heading_positions[2]].lower()
@@ -392,6 +454,8 @@ def _validate_task0_process_record(spec_process: str) -> None:
         "### Corrections Made",
         "These corrections directly address the findings above; no product code was written.",
     ):
+        assert text in spec_process
+    for text in EXPECTED_TASK_0_SUBSTANTIVE_FACTS:
         assert text in spec_process
 
 
@@ -751,6 +815,55 @@ def test_task0_process_record_rejects_missing_audit_facts(
 
     with pytest.raises(AssertionError):
         _validate_task0_process_record(process_record.replace(expected, replacement))
+
+
+@pytest.mark.parametrize("task", tuple(EXPECTED_TASK_3_TO_10_ROWS))
+def test_root_evidence_rejects_task_3_to_10_commit_tampering(task: str) -> None:
+    plan = _read("PLAN.md")
+    agent_log = _read("AGENT_LOG.md")
+    _validate_root_evidence(plan, agent_log)
+    commit = re.findall(r"\b[0-9a-f]{7,40}\b", EXPECTED_TASK_3_TO_10_ROWS[task][4])[0]
+    assert commit in plan
+    with pytest.raises(AssertionError):
+        _validate_root_evidence(plan.replace(f"`{commit}`", "`deadbee`", 1), agent_log)
+
+
+@pytest.mark.parametrize(
+    ("expected", "replacement"),
+    (
+        ("prior five-round breaker resolved by approved contract amendment", "review CLEAN"),
+        ("prior five-round breaker resolved by approved lifecycle amendment", "review CLEAN"),
+        ("`/root/task8_review`: clean after fix round 4", "review unavailable"),
+    ),
+)
+def test_root_evidence_rejects_erased_task_3_to_10_review_history(
+    expected: str, replacement: str
+) -> None:
+    plan = _read("PLAN.md")
+    agent_log = _read("AGENT_LOG.md")
+    _validate_root_evidence(plan, agent_log)
+    assert expected in plan
+    with pytest.raises(AssertionError):
+        _validate_root_evidence(plan.replace(expected, replacement), agent_log)
+
+
+def test_root_evidence_rejects_reordered_task_3_to_10_chronology() -> None:
+    plan = _read("PLAN.md")
+    agent_log = _read("AGENT_LOG.md")
+    first = "## 2026-07-28 Task 3 revalidation ruling"
+    second = "## 2026-07-28 Task 3 implementation and fix round 1"
+    _validate_root_evidence(plan, agent_log)
+    with pytest.raises(AssertionError):
+        _validate_root_evidence(plan, agent_log.replace(first, "TEMP", 1).replace(second, first, 1).replace("TEMP", second, 1))
+
+
+@pytest.mark.parametrize("expected", EXPECTED_TASK_0_SUBSTANTIVE_FACTS)
+def test_task0_process_record_rejects_fabricated_substantive_details(expected: str) -> None:
+    process_record = _read("SPEC_PROCESS.md")
+    _validate_task0_process_record(process_record)
+    assert expected in process_record
+    with pytest.raises(AssertionError):
+        _validate_task0_process_record(process_record.replace(expected, "fabricated detail", 1))
 
 
 def test_root_evidence_contract_does_not_require_git_history(
