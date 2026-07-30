@@ -413,6 +413,10 @@ def test_pyproject_declares_buildable_python_package_contract() -> None:
         dependency.startswith("build>=1.2")
         for dependency in project["project"]["optional-dependencies"]["dev"]
     )
+    assert any(
+        dependency.startswith("hatchling>=1.25")
+        for dependency in project["project"]["optional-dependencies"]["dev"]
+    )
     assert project["tool"]["hatch"]["build"]["targets"]["wheel"]["packages"] == ["src/pyquality"]
 
 

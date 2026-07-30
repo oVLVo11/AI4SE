@@ -57,6 +57,7 @@ def _set_process_environment(root: str) -> None:
 
 
 def _prepare_existing_audit(path: Path, content: bytes = b"") -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     if os.name == "nt":
         from pyquality import security
 
@@ -66,6 +67,18 @@ def _prepare_existing_audit(path: Path, content: bytes = b"") -> None:
             path.write_bytes(content)
         return
     path.write_bytes(content)
+
+
+def test_prepare_existing_audit_creates_a_missing_posix_parent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """POSIX migration fixtures must be able to seed nested legacy audit paths."""
+    path = tmp_path / "nested" / "audit.jsonl"
+    monkeypatch.setattr(os, "name", "posix")
+
+    _prepare_existing_audit(path, b"legacy\n")
+
+    assert path.read_bytes() == b"legacy\n"
 
 
 def _emit_in_process(path: str, start: int, count: int, environment_root: str) -> None:
