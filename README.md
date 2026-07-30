@@ -63,7 +63,7 @@ Create a Docker-based web service from this repository, configure its service po
 
 ### Release evidence
 
-Public repository: https://github.com/oVLVo11/AI4SE
+Public repository: https://github.com/oVLVo11/AI4SE.git
 
 Initial verified CI run: https://github.com/oVLVo11/AI4SE/actions/runs/30544072702
 

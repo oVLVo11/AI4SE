@@ -1008,7 +1008,7 @@ git commit -m "docs: complete packaging and course delivery contract"
 
 ### Task 13: Final Release and Hosted Demonstration Evidence
 
-**Recorded repository and CI evidence:** Public repository https://github.com/oVLVo11/AI4SE; GitHub Actions run https://github.com/oVLVo11/AI4SE/actions/runs/30544072702 completed with conclusion success for `89544fc9d295fdbe0d6d20fd1ffc202d5238144f`. Pytest, Ruff, package, and Docker build succeeded. Render deployment pending.
+**Recorded repository and CI evidence:** Public repository https://github.com/oVLVo11/AI4SE.git; GitHub Actions run https://github.com/oVLVo11/AI4SE/actions/runs/30544072702 completed with conclusion success for `89544fc9d295fdbe0d6d20fd1ffc202d5238144f`. Pytest, Ruff, package, and Docker build succeeded. Render deployment pending.
 
 **Files:**
 - Modify: `SPEC.md`
