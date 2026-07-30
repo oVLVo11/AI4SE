@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from importlib.metadata import requires
 from pathlib import Path
 
 import pytest
@@ -47,6 +48,16 @@ def _succeeded_demo_report() -> DemoReport:
         normalized_events=(),
         final_status=TaskStatus.SUCCEEDED,
     )
+
+
+def test_public_mock_runtime_includes_its_offline_quality_tools() -> None:
+    runtime_requirements = requires("pyquality-harness") or []
+
+    for tool in ("pytest", "ruff"):
+        assert any(
+            requirement.startswith(tool) and "extra ==" not in requirement
+            for requirement in runtime_requirements
+        )
 
 
 def test_default_public_app_executes_the_bundled_runner(

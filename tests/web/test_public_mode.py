@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from html import escape
 from pathlib import Path
 from threading import Event, Lock, Thread
 
@@ -405,6 +406,41 @@ def test_real_public_demo_capability_accepts_only_registered_offline_scenario() 
     )
 
     assert response.status_code == 303
+
+
+def test_public_demo_page_renders_only_fixed_sanitized_evidence() -> None:
+    report = succeeded_demo_report()
+    client = TestClient(
+        create_app(PublicDemoService({"broken_calculator": "public-demo"}, lambda: report), mode="public_mock")
+    )
+
+    submitted = client.post(
+        "/tasks",
+        data={"scenario": "broken_calculator", "csrf_token": csrf(client)},
+        follow_redirects=False,
+    )
+    page = client.get(submitted.headers["location"])
+
+    assert submitted.status_code == 303
+    assert page.status_code == 200
+    for label in (
+        "Status: succeeded",
+        "Remaining rounds: 0",
+        "Guardrail: outside action denied",
+        "Feedback: assertion",
+        escape("Progress: read_file -> apply_patch -> apply_patch -> finish"),
+    ):
+        assert label in page.text
+    for sentinel in (
+        "C:/local/private/path.py",
+        "def private_source(): return 'body'",
+        "*** Begin Patch\\n*** Update File: private.py",
+        "private prompt body",
+        "sk-provider-key",
+        '{"audit": "raw-payload"}',
+        repr(report),
+    ):
+        assert sentinel not in page.text
 
 
 def test_default_public_app_cannot_build_real_provider_or_credentials(
