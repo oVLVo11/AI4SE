@@ -5,15 +5,17 @@ from __future__ import annotations
 import hashlib
 import hmac
 import secrets
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Literal, Protocol
 
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
+from pydantic import ConfigDict, Field
 
-from ..domain.models import TaskStatus
+from ..demo import DemoReport
+from ..domain.models import PublicModel, TaskStatus
 from ..service import PreflightError, ProjectBusyError, TaskView
 
 
@@ -33,6 +35,20 @@ class WebService(Protocol):
 
 _TEMPLATES = Jinja2Templates(directory=str(Path(__file__).with_name("templates")))
 _BUNDLED_SCENARIO = "broken_calculator"
+_PUBLIC_DEMO_TASK_ID = "public-demo"
+_PUBLIC_DEMO_ACTION_ORDER = ("read_file", "apply_patch", "apply_patch", "finish")
+
+
+class PublicDemoEvidence(PublicModel):
+    """Small, source-free evidence from the bundled deterministic scenario."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    denied_action: bool
+    denied_dispatch_count: int = Field(ge=0)
+    first_failure_category: str
+    model_saw_first_failure: bool
+    action_order: tuple[str, ...]
 
 
 class _SessionCodec:
@@ -77,30 +93,73 @@ class _SessionCodec:
 
 
 class PublicDemoService:
-    """Capability-restricted, data-only registry for offline public scenarios."""
+    """Capability-restricted synchronous boundary for the offline public scenario."""
 
-    def __init__(self, scenarios: Mapping[str, str]) -> None:
+    def __init__(self, scenarios: Mapping[str, str], runner: Callable[[], DemoReport]) -> None:
         self._scenarios = dict(scenarios)
-        self._tasks: dict[str, TaskView] = {}
+        self._runner = runner
+        self._state: tuple[TaskView, PublicDemoEvidence] | None = None
 
     def run_scenario(self, scenario_id: str) -> TaskView:
         task_id = self._scenarios.get(scenario_id)
-        if not isinstance(task_id, str) or not task_id:
+        if (
+            scenario_id != _BUNDLED_SCENARIO
+            or task_id != _PUBLIC_DEMO_TASK_ID
+        ):
             raise PreflightError("public scenario is unavailable")
-        view = TaskView(
-            id=task_id,
-            status=TaskStatus.CREATED,
-            round_limit=8,
-            remaining_rounds=8,
-        )
-        self._tasks[task_id] = view
+
+        try:
+            report = self._runner()
+            if report.final_status is not TaskStatus.SUCCEEDED:
+                raise RuntimeError("public demo did not succeed")
+            evidence = PublicDemoEvidence(
+                denied_action=report.denied_action.attempted,
+                denied_dispatch_count=report.denied_action.dispatch_count,
+                first_failure_category=report.first_failure_category,
+                model_saw_first_failure=report.model_saw_first_failure,
+                action_order=report.action_order,
+            )
+            view = TaskView(
+                id=_PUBLIC_DEMO_TASK_ID,
+                status=TaskStatus.SUCCEEDED,
+                round_limit=1,
+                remaining_rounds=0,
+                verification_summary=self._summary(evidence),
+            )
+        except BaseException:  # noqa: BLE001 - sanitize all runner failures.
+            self._state = None
+            raise PreflightError("public demo execution failed") from None
+        self._state = (view, evidence)
         return view
 
     def get_task(self, task_id: str) -> TaskView:
-        try:
-            return self._tasks[task_id]
-        except KeyError:
-            raise PreflightError("task does not exist") from None
+        if self._state is None or task_id != _PUBLIC_DEMO_TASK_ID:
+            raise PreflightError("task does not exist")
+        return self._state[0]
+
+    def get_evidence(self, task_id: str) -> PublicDemoEvidence | None:
+        if self._state is None or task_id != _PUBLIC_DEMO_TASK_ID:
+            return None
+        return self._state[1]
+
+    @staticmethod
+    def _summary(evidence: PublicDemoEvidence) -> str:
+        guardrail = (
+            "outside action denied"
+            if evidence.denied_action
+            else "outside action unavailable"
+        )
+        feedback = (
+            "assertion"
+            if evidence.first_failure_category == "assertion"
+            else "unavailable"
+        )
+        progress = (
+            "read_file -> apply_patch -> apply_patch -> finish"
+            if evidence.action_order == _PUBLIC_DEMO_ACTION_ORDER
+            else "unavailable"
+        )
+        return f"Guardrail: {guardrail}; Feedback: {feedback}; Progress: {progress}"
 
 
 def create_app(

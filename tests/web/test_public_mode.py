@@ -6,10 +6,16 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
+import pyquality.web.app as web_app
 from pyquality.cli import _default_app_factory
+from pyquality.demo import DemoReport, DeniedActionEvidence
 from pyquality.domain.models import TaskStatus
-from pyquality.service import TaskView
-from pyquality.web.app import PublicDemoService, _SessionCodec, create_app
+from pyquality.service import PreflightError, TaskView
+from pyquality.web.app import (
+    PublicDemoService,
+    _SessionCodec,
+    create_app,
+)
 
 pytestmark = pytest.mark.filterwarnings(
     "ignore:Using `httpx` with `starlette.testclient` is deprecated:DeprecationWarning"
@@ -41,6 +47,117 @@ class PublicService:
         )
 
 
+def succeeded_demo_report() -> DemoReport:
+    return DemoReport(
+        denied_action=DeniedActionEvidence(attempted=True, dispatch_count=0),
+        action_order=("read_file", "apply_patch", "apply_patch", "finish"),
+        first_failure_category="assertion",
+        model_saw_first_failure=True,
+        first_patch_digest="1" * 64,
+        second_patch_digest="2" * 64,
+        first_fingerprint="3" * 64,
+        second_fingerprint="4" * 64,
+        normalized_events=(),
+        final_status=TaskStatus.SUCCEEDED,
+    )
+
+
+def public_demo_service() -> PublicDemoService:
+    return PublicDemoService({"broken_calculator": "public-demo"}, succeeded_demo_report)
+
+
+def test_public_scenario_executes_runner_and_returns_terminal_evidence() -> None:
+    calls = 0
+
+    def runner() -> DemoReport:
+        nonlocal calls
+        calls += 1
+        return succeeded_demo_report()
+
+    service = PublicDemoService({"broken_calculator": "public-demo"}, runner)
+
+    task = service.run_scenario("broken_calculator")
+
+    assert calls == 1
+    assert task.status is TaskStatus.SUCCEEDED
+    assert task.remaining_rounds == 0
+    assert service.get_evidence(task.id) == web_app.PublicDemoEvidence(
+        denied_action=True,
+        denied_dispatch_count=0,
+        first_failure_category="assertion",
+        model_saw_first_failure=True,
+        action_order=("read_file", "apply_patch", "apply_patch", "finish"),
+    )
+
+
+def test_public_scenario_failure_is_sanitized_and_retains_no_success() -> None:
+    calls = 0
+
+    def runner() -> DemoReport:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return succeeded_demo_report()
+        raise RuntimeError("secret C:/users/private/source.py prompt body")
+
+    service = PublicDemoService({"broken_calculator": "public-demo"}, runner)
+    service.run_scenario("broken_calculator")
+
+    with pytest.raises(PreflightError, match=r"^public demo execution failed$"):
+        service.run_scenario("broken_calculator")
+
+    assert service.get_evidence("public-demo") is None
+    with pytest.raises(PreflightError, match=r"^task does not exist$"):
+        service.get_task("public-demo")
+
+
+def test_public_scenario_replaces_prior_result_without_history_accumulation() -> None:
+    reports = iter(
+        (
+            succeeded_demo_report(),
+            succeeded_demo_report().model_copy(
+                update={
+                    "denied_action": DeniedActionEvidence(
+                        attempted=False, dispatch_count=0
+                    ),
+                    "action_order": ("finish",),
+                    "first_failure_category": "runtime",
+                    "model_saw_first_failure": False,
+                }
+            ),
+        )
+    )
+    calls = 0
+
+    def runner() -> DemoReport:
+        nonlocal calls
+        calls += 1
+        return next(reports)
+
+    service = PublicDemoService({"broken_calculator": "public-demo"}, runner)
+
+    first = service.run_scenario("broken_calculator")
+    first_evidence = service.get_evidence(first.id)
+    second = service.run_scenario("broken_calculator")
+
+    assert calls == 2
+    assert first.id == second.id == "public-demo"
+    assert first_evidence == web_app.PublicDemoEvidence(
+        denied_action=True,
+        denied_dispatch_count=0,
+        first_failure_category="assertion",
+        model_saw_first_failure=True,
+        action_order=("read_file", "apply_patch", "apply_patch", "finish"),
+    )
+    assert service.get_evidence(second.id) == web_app.PublicDemoEvidence(
+        denied_action=False,
+        denied_dispatch_count=0,
+        first_failure_category="runtime",
+        model_saw_first_failure=False,
+        action_order=("finish",),
+    )
+
+
 def csrf(client: TestClient) -> str:
     text = client.get("/tasks/new").text
     return re.search(r'name="csrf_token" value="([^"]+)"', text).group(1)  # type: ignore[union-attr]
@@ -61,9 +178,7 @@ def _retained_session_entries(app: object) -> int:
 
 
 def test_public_unknown_cookie_and_404_flood_retains_no_server_sessions() -> None:
-    app = create_app(
-        PublicDemoService({"broken_calculator": "demo-task"}), mode="public_mock"
-    )
+    app = create_app(public_demo_service(), mode="public_mock")
     client = TestClient(app)
 
     for sequence in range(256):
@@ -80,9 +195,7 @@ def test_public_unknown_cookie_and_404_flood_retains_no_server_sessions() -> Non
 
 
 def test_public_session_rejects_cookie_tampering_and_attacker_fixation() -> None:
-    app = create_app(
-        PublicDemoService({"broken_calculator": "demo-task"}), mode="public_mock"
-    )
+    app = create_app(public_demo_service(), mode="public_mock")
     client = TestClient(app)
     page = client.get("/tasks/new")
     token = re.search(r'name="csrf_token" value="([^"]+)"', page.text).group(1)  # type: ignore[union-attr]
@@ -113,12 +226,12 @@ def test_public_session_rejects_cookie_tampering_and_attacker_fixation() -> None
 def test_shared_session_secret_allows_multi_worker_cookie_verification() -> None:
     shared_secret = b"s" * 32
     first_app = create_app(
-        PublicDemoService({"broken_calculator": "demo-task"}),
+        public_demo_service(),
         mode="public_mock",
         session_secret=shared_secret,
     )
     second_app = create_app(
-        PublicDemoService({"broken_calculator": "demo-task"}),
+        public_demo_service(),
         mode="public_mock",
         session_secret=shared_secret,
     )
@@ -146,7 +259,7 @@ def test_session_codec_rejects_non_ascii_cookie_without_raising() -> None:
 
 
 def test_public_mock_rejects_paths_provider_changes_and_credentials() -> None:
-    service = PublicDemoService({"broken_calculator": "demo-task"})
+    service = public_demo_service()
     client = TestClient(create_app(service, mode="public_mock"))
     token = csrf(client)
 
@@ -167,7 +280,7 @@ def test_public_mock_rejects_service_with_repository_or_credential_capability() 
 
 
 def test_real_public_demo_capability_accepts_only_registered_offline_scenario() -> None:
-    service = PublicDemoService({"broken_calculator": "demo-task"})
+    service = public_demo_service()
     client = TestClient(create_app(service, mode="public_mock"))
 
     response = client.post(
@@ -199,7 +312,7 @@ def test_default_public_app_cannot_build_real_provider_or_credentials(
 
 
 def test_public_mock_accepts_only_bundled_scenario() -> None:
-    service = PublicDemoService({"broken_calculator": "demo-task"})
+    service = public_demo_service()
     client = TestClient(create_app(service, mode="public_mock"))
     response = client.post(
         "/tasks",
@@ -207,12 +320,12 @@ def test_public_mock_accepts_only_bundled_scenario() -> None:
         follow_redirects=False,
     )
     assert response.status_code == 303
-    assert service.get_task("demo-task").id == "demo-task"
+    assert service.get_task("public-demo").id == "public-demo"
 
 
 def test_public_mock_rejects_unknown_scenario() -> None:
     client = TestClient(
-        create_app(PublicDemoService({"broken_calculator": "demo-task"}), mode="public_mock")
+        create_app(public_demo_service(), mode="public_mock")
     )
     response = client.post(
         "/tasks", data={"scenario": "other", "csrf_token": csrf(client)}

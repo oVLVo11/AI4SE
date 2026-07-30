@@ -65,12 +65,21 @@ def _default_run_service(repo: Path) -> _RunService:
     return build_service(repo)
 
 
+def _run_public_demo():
+    from .demo import run_demo
+
+    with TemporaryDirectory(prefix="pyquality-public-demo-") as directory:
+        return run_demo(Path(directory))
+
+
 def _default_app_factory(repo: Path, mode: str) -> object:
     from .web.app import PublicDemoService, create_app
 
     if mode == "public_mock":
         return create_app(
-            PublicDemoService({"broken_calculator": "public-demo"}),
+            PublicDemoService(
+                {"broken_calculator": "public-demo"}, _run_public_demo
+            ),
             mode="public_mock",
         )
     from .application import build_service

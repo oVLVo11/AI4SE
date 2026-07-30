@@ -7,7 +7,9 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
-from pyquality.cli import main
+from pyquality.cli import _default_app_factory, main
+from pyquality.demo import DemoReport, DeniedActionEvidence
+from pyquality.domain.models import TaskStatus
 
 
 def _capture_server(monkeypatch: pytest.MonkeyPatch) -> list[object]:
@@ -30,6 +32,39 @@ def _assert_public_app_accepts_the_bundled_scenario(application: object) -> None
     )
     assert response.status_code == 303
     assert client.get("/settings").status_code == 404
+
+
+def _succeeded_demo_report() -> DemoReport:
+    return DemoReport(
+        denied_action=DeniedActionEvidence(attempted=True, dispatch_count=0),
+        action_order=("read_file", "apply_patch", "apply_patch", "finish"),
+        first_failure_category="assertion",
+        model_saw_first_failure=True,
+        first_patch_digest="1" * 64,
+        second_patch_digest="2" * 64,
+        first_fingerprint="3" * 64,
+        second_fingerprint="4" * 64,
+        normalized_events=(),
+        final_status=TaskStatus.SUCCEEDED,
+    )
+
+
+def test_default_public_app_executes_the_bundled_runner(
+    monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = 0
+
+    def runner() -> DemoReport:
+        nonlocal calls
+        calls += 1
+        return _succeeded_demo_report()
+
+    monkeypatch.setattr("pyquality.cli._run_public_demo", runner, raising=False)
+    application = _default_app_factory(Path("."), "public_mock")
+
+    _assert_public_app_accepts_the_bundled_scenario(application)
+
+    assert calls == 1
 
 
 def test_serve_public_mock_flag_uses_offline_public_composition(
