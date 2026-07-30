@@ -160,7 +160,7 @@ def test_sdist_excludes_development_and_local_data_but_keeps_runtime_inputs(
     assert any(name.endswith("/src/pyquality/web/templates/base.html") for name in contents)
     assert any(name.endswith("/src/pyquality/demo_fixture/calculator.py") for name in contents)
     assert not any(
-        (relative_parts := Path(name).parts[1:])[:1] == ("tests",)
+        (relative_parts := Path(name).parts[1:])[:1] in {("examples",), ("tests",)}
         or any(part in {".git", ".superpowers", "__pycache__"} for part in relative_parts)
         or name.endswith((".db", ".sqlite", ".sqlite3", ".log"))
         or "/audit/" in name
