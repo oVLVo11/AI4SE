@@ -911,16 +911,7 @@ def _install_exclusive(
 def _restore_exclusive(record: _CommitRecord) -> bool:
     assert record.backup is not None
     if _path_exists(record.item):
-        try:
-            target_stat = _stat_name(record.item, record.item.name)
-        except OSError:
-            return False
-        if not stat.S_ISLNK(target_stat.st_mode):
-            return False
-        try:
-            _unlink_name(record.item, record.item.name)
-        except OSError:
-            return False
+        return False
     return _install_exclusive(record, record.backup, record.item.name)
 
 

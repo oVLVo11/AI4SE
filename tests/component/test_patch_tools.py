@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import hashlib
 import os
+import stat
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+from pyquality import tools
 from pyquality.config import Settings
 from pyquality.domain.models import Action, PolicyDecision, PolicyOutcome
 from pyquality.policy import PolicyEngine, parse_validated_patch
@@ -483,5 +486,35 @@ def test_patch_aborts_when_target_parent_becomes_an_outside_symlink(
         action, decision, decision.repository_snapshot_digest
     )
 
-    assert (result.ok, result.code) == (False, "patch_target_changed")
+    assert (result.ok, result.code) == (False, "patch_rollback_incomplete")
     assert outside_target.read_text(encoding="utf-8") == "outside\n"
+
+
+def test_patch_rollback_preserves_a_regular_target_swapped_after_symlink_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stale symlink check must never authorize removal of a new regular target."""
+    target = tmp_path / "a.py"
+    target.write_text("concurrent\n", encoding="utf-8")
+    (tmp_path / "backup").write_text("original\n", encoding="utf-8")
+    item = SimpleNamespace(
+        target=target,
+        name="a.py",
+        parent=SimpleNamespace(operations=None),
+    )
+    record = SimpleNamespace(item=item, backup="backup")
+    original_stat_name = tools._stat_name
+    stat_calls = 0
+
+    def stat_name_with_race(item: object, name: str) -> os.stat_result:
+        nonlocal stat_calls
+        stat_calls += 1
+        if stat_calls == 2:
+            target.write_text("concurrent\n", encoding="utf-8")
+            return os.stat_result((stat.S_IFLNK,) + (0,) * 9)
+        return original_stat_name(item, name)
+
+    monkeypatch.setattr(tools, "_stat_name", stat_name_with_race)
+
+    assert tools._restore_exclusive(record) is False
+    assert target.read_text(encoding="utf-8") == "concurrent\n"
