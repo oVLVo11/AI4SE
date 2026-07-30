@@ -14,18 +14,15 @@ from pathlib import Path
 import pytest
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
-EXPECTED_TASK_12_STATUS = (
-    "In progress; Task 1 and Task 2 clean, broad final re-review pending"
-)
+EXPECTED_TASK_12_STATUS = "Complete"
+EXPECTED_TASK_12_FINAL_COMMIT = "e7892cd"
 EXPECTED_TASK_12_SPEC_REVIEW = (
-    "`/root/task12_task1_review`: Task 1 CLEAN after round 2; "
-    "Task 2 review CLEAN through round 4; broad final re-review pending"
+    "`/root/task12_task1_review`: final scoped review CLEAN; "
+    "broad final review CLEAN"
 )
 EXPECTED_TASK_12_QUALITY_REVIEW = (
-    "Task 1 review CLEAN; Task 2 review CLEAN through f916136; "
-    "broad final re-review pending; distribution 21 passed; "
-    "full isolated 606 passed, 10 skipped; wheel/sdist and wheel CLI/demo verified; "
-    "Docker CLI unavailable"
+    "Final controller/merged verification at e7892cd: full pytest to 100%; "
+    "Ruff and diff exit 0; Docker CLI unavailable; no local image build claimed"
 )
 EXPECTED_TASK_12_COMMITS = (
     "6d06a3e",
@@ -37,7 +34,13 @@ EXPECTED_TASK_12_COMMITS = (
     "469d268",
     "1d37067",
     "f916136",
+    EXPECTED_TASK_12_FINAL_COMMIT,
 )
+EXPECTED_TASK_13_STATUS = "In progress"
+EXPECTED_TASK_13_AGENT = "`/root/task13_local_gate`"
+EXPECTED_TASK_13_SPEC_REVIEW = "Public GitHub source publication explicitly authorized; repository, CI, Render, and hosted evidence pending"
+EXPECTED_TASK_13_QUALITY_REVIEW = "Pre-publication local gate pending; no repository URL, remote CI, Render URL, or hosted SUCCEEDED evidence yet"
+EXPECTED_TASK_13_COMMIT = "7f8dd42"
 
 
 def _read(relative_path: str) -> str:
@@ -59,7 +62,7 @@ def _task_ledger_rows(plan: str) -> dict[str, tuple[str, str, str, str, str]]:
 
 def _validate_root_evidence(plan: str, agent_log: str) -> None:
     ledger = _task_ledger_rows(plan)
-    for task in ("11", "11A", "11B", "12"):
+    for task in ("11", "11A", "11B", "12", "13"):
         assert task in ledger
         status, agent, spec_review, quality_review, commits = ledger[task]
         assert all((status, agent, spec_review, quality_review, commits))
@@ -72,6 +75,11 @@ def _validate_root_evidence(plan: str, agent_log: str) -> None:
     assert "CLEAN" in ledger["11B"][2]
     assert ledger["12"][0].strip() == EXPECTED_TASK_12_STATUS
     assert ledger["12"][2].strip() == EXPECTED_TASK_12_SPEC_REVIEW
+    assert ledger["12"][3].strip() == EXPECTED_TASK_12_QUALITY_REVIEW
+    assert ledger["13"][0].strip() == EXPECTED_TASK_13_STATUS
+    assert ledger["13"][1].strip() == EXPECTED_TASK_13_AGENT
+    assert ledger["13"][2].strip() == EXPECTED_TASK_13_SPEC_REVIEW
+    assert ledger["13"][3].strip() == EXPECTED_TASK_13_QUALITY_REVIEW
     assert "breaker" in ledger["11"][2].lower()
     assert "breaker" in ledger["11"][3].lower()
     assert "clean" not in ledger["11"][2].lower()
@@ -82,7 +90,6 @@ def _validate_root_evidence(plan: str, agent_log: str) -> None:
     assert "clean" not in ledger["11A"][3].lower()
     assert "CLEAN" in ledger["11B"][2]
     assert "CLEAN" in ledger["11B"][3]
-    assert ledger["12"][3].strip() == EXPECTED_TASK_12_QUALITY_REVIEW
 
     required_commits = {
         "11": (
@@ -92,6 +99,7 @@ def _validate_root_evidence(plan: str, agent_log: str) -> None:
         "11A": ("87e5ad7", "63b08cf", "07cffcd", "5eb42fb", "ea569a9", "47bed5d", "6de2411"),
         "11B": ("d396c24", "e7448ff", "cad8e17"),
         "12": EXPECTED_TASK_12_COMMITS,
+        "13": (EXPECTED_TASK_13_COMMIT,),
     }
     for task, expected in required_commits.items():
         actual = tuple(re.findall(r"\b[0-9a-f]{7,40}\b", ledger[task][4]))
@@ -103,6 +111,8 @@ def _validate_root_evidence(plan: str, agent_log: str) -> None:
         "## 2026-07-30 Task 11B remediation and CLEAN review",
         "## 2026-07-30 Task 12 distribution work",
         "## 2026-07-30 Task 12 Task 2 review CLEAN and broad final re-review pending",
+        "## 2026-07-30 Task 12 final unified fix and CLEAN closure",
+        "## 2026-07-30 Task 13 pre-publication gate",
     )
     heading_positions = [agent_log.index(heading) for heading in headings]
     assert heading_positions == sorted(heading_positions)
@@ -110,7 +120,9 @@ def _validate_root_evidence(plan: str, agent_log: str) -> None:
     task_11 = agent_log[heading_positions[0] : heading_positions[1]].lower()
     task_11a = agent_log[heading_positions[1] : heading_positions[2]].lower()
     task_11b = agent_log[heading_positions[2] : heading_positions[3]]
-    task_12_review = agent_log[heading_positions[4] :]
+    task_12_review = agent_log[heading_positions[4] : heading_positions[5]]
+    task_12_final = agent_log[heading_positions[5] : heading_positions[6]]
+    task_13 = agent_log[heading_positions[6] :]
     assert "breaker" in task_11
     assert "breaker" in task_11a
     assert "remaining" in task_11b.lower() and "defect" in task_11b.lower()
@@ -119,20 +131,52 @@ def _validate_root_evidence(plan: str, agent_log: str) -> None:
     assert "broad final re-review remains pending" in task_12_review
     assert "Task 12 is not complete" in task_12_review
     assert "Docker CLI remains unavailable" in task_12_review
+    for text in (
+        EXPECTED_TASK_12_FINAL_COMMIT,
+        "final scoped review CLEAN",
+        "broad final review CLEAN",
+        "full pytest to 100%",
+        "Ruff and diff exit 0",
+        "Docker CLI remains unavailable",
+        "no local image build claimed",
+    ):
+        assert text in task_12_final
+    for text in (
+        "public GitHub source publication",
+        "explicitly authorized",
+        "repository, CI, Render, and hosted evidence pending",
+        "no repository URL, remote CI, Render URL, or hosted SUCCEEDED evidence yet",
+    ):
+        assert text in task_13
+    for fabricated_claim in (
+        "https://github.com/",
+        "Remote CI: SUCCEEDED",
+        "Render URL:",
+        "Hosted acceptance: SUCCEEDED",
+        "Docker image build succeeded",
+    ):
+        assert fabricated_claim not in task_13
     for commit in ("6de2411", "cad8e17", *EXPECTED_TASK_12_COMMITS):
         assert commit in agent_log
 
 
-def test_root_evidence_records_preserve_task_11_breakers_and_task_12_review_state() -> None:
+def test_task12_completion_records_final_clean_local_evidence() -> None:
     _validate_root_evidence(_read("PLAN.md"), _read("AGENT_LOG.md"))
 
 
-def test_root_evidence_records_require_task_2_clean_and_broad_final_review_pending() -> None:
+def test_task13_prepublication_records_authorization_and_pending_remote_evidence() -> None:
     ledger = _task_ledger_rows(_read("PLAN.md"))
     assert ledger["12"][0].strip() == EXPECTED_TASK_12_STATUS
     assert ledger["12"][2].strip() == EXPECTED_TASK_12_SPEC_REVIEW
     assert ledger["12"][3].strip() == EXPECTED_TASK_12_QUALITY_REVIEW
     assert tuple(re.findall(r"\b[0-9a-f]{7,40}\b", ledger["12"][4])) == EXPECTED_TASK_12_COMMITS
+    assert ledger["13"] == (
+        EXPECTED_TASK_13_STATUS,
+        EXPECTED_TASK_13_AGENT,
+        EXPECTED_TASK_13_SPEC_REVIEW,
+        EXPECTED_TASK_13_QUALITY_REVIEW,
+        f"`{EXPECTED_TASK_13_COMMIT}`",
+    )
     _validate_root_evidence(_read("PLAN.md"), _read("AGENT_LOG.md"))
 
 
@@ -143,14 +187,14 @@ def test_root_evidence_records_require_task_2_clean_and_broad_final_review_pendi
         ("PLAN.md", "Blocked; breaker reached", "Complete; CLEAN"),
         (
             "PLAN.md",
-            "In progress; Task 1 and Task 2 clean, broad final re-review pending",
-            "Complete; CLEAN",
+            EXPECTED_TASK_12_STATUS,
+            "In progress; evidence pending",
         ),
         (
             "PLAN.md",
             (
                 "`6d06a3e`, `783a814`, `869dd20`, `8e1792d`, `2313c29`, `5ebe41b`, "
-                "`469d268`, `1d37067`, `f916136`"
+                "`469d268`, `1d37067`, `f916136`, `e7892cd`"
             ),
             "`deadbee`",
         ),
@@ -168,7 +212,7 @@ def test_root_evidence_contract_rejects_reviewed_history_mutations(
 
     monkeypatch.setitem(globals(), "_read", documents.__getitem__)
     with pytest.raises(AssertionError):
-        test_root_evidence_records_preserve_task_11_breakers_and_task_12_review_state()
+        test_task12_completion_records_final_clean_local_evidence()
 
 
 @pytest.mark.parametrize(
@@ -179,12 +223,12 @@ def test_root_evidence_contract_rejects_reviewed_history_mutations(
             (
                 (
                     (
-                        "`6d06a3e`, `783a814`, `869dd20`, `8e1792d`, `2313c29`, "
-                        "`5ebe41b`, `469d268`, `1d37067`, `f916136`"
+                "`6d06a3e`, `783a814`, `869dd20`, `8e1792d`, `2313c29`, "
+                "`5ebe41b`, `469d268`, `1d37067`, `f916136`, `e7892cd`"
                     ),
                     (
-                        "`6d06a3e`, `783a814`, `869dd20`, `8e1792d`, `2313c29`, "
-                        "`5ebe41b`, `469d268`, `1d37067`, `f916136`, `deadbee`"
+                "`6d06a3e`, `783a814`, `869dd20`, `8e1792d`, `2313c29`, "
+                "`5ebe41b`, `469d268`, `1d37067`, `f916136`, `e7892cd`, `deadbee`"
                     ),
                 ),
             ),
@@ -210,28 +254,28 @@ def test_root_evidence_contract_rejects_false_commits_and_review_verdicts(
 
     monkeypatch.setitem(globals(), "_read", documents.__getitem__)
     with pytest.raises(AssertionError):
-        test_root_evidence_records_preserve_task_11_breakers_and_task_12_review_state()
+        test_task12_completion_records_final_clean_local_evidence()
 
 
-def test_root_evidence_contract_rejects_completed_task_12_and_docker_success(
+def test_root_evidence_contract_rejects_task12_docker_success(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     documents = {name: _read(name) for name in ("PLAN.md", "AGENT_LOG.md")}
     documents["PLAN.md"] = documents["PLAN.md"].replace(
         EXPECTED_TASK_12_QUALITY_REVIEW,
-        "Task 12 COMPLETE; Docker image build succeeded",
+        "Task 12 complete; Docker image build succeeded",
     )
 
     monkeypatch.setitem(globals(), "_read", documents.__getitem__)
     with pytest.raises(AssertionError):
-        test_root_evidence_records_preserve_task_11_breakers_and_task_12_review_state()
+        test_task12_completion_records_final_clean_local_evidence()
 
 
 @pytest.mark.parametrize(
     "contradiction",
     (
         "Docker build succeeded",
-        "Task 12 finished and final review passed",
+        "local Docker image build succeeded",
     ),
 )
 def test_root_evidence_contract_rejects_appended_task_12_quality_contradictions(
@@ -246,7 +290,29 @@ def test_root_evidence_contract_rejects_appended_task_12_quality_contradictions(
 
     monkeypatch.setitem(globals(), "_read", documents.__getitem__)
     with pytest.raises(AssertionError):
-        test_root_evidence_records_preserve_task_11_breakers_and_task_12_review_state()
+        test_task12_completion_records_final_clean_local_evidence()
+
+
+@pytest.mark.parametrize(
+    "fabricated_claim",
+    (
+        "Repository URL: https://github.com/example/pyquality-harness",
+        "Remote CI: SUCCEEDED",
+        "Render URL: https://pyquality-harness.onrender.com",
+        "Hosted acceptance: SUCCEEDED",
+        "Docker image build succeeded",
+    ),
+)
+def test_task13_prepublication_rejects_fabricated_remote_or_docker_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+    fabricated_claim: str,
+) -> None:
+    documents = {name: _read(name) for name in ("PLAN.md", "AGENT_LOG.md")}
+    documents["AGENT_LOG.md"] = f"{documents['AGENT_LOG.md']}\n{fabricated_claim}\n"
+
+    monkeypatch.setitem(globals(), "_read", documents.__getitem__)
+    with pytest.raises(AssertionError):
+        test_task13_prepublication_records_authorization_and_pending_remote_evidence()
 
 
 def test_root_evidence_contract_does_not_require_git_history(

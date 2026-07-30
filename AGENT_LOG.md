@@ -95,3 +95,11 @@ Agent `/root/task12_artifacts` implemented Task 12 delivery commits `6d06a3e`, `
 ## 2026-07-30 Task 12 Task 2 review CLEAN and broad final re-review pending
 
 Controller-supplied review evidence marks Task 2 review CLEAN through implementation commit `2313c29` and fix commits `5ebe41b`, `469d268`, `1d37067`, and `f916136`. Its latest verified evidence records distribution 21 passed, full isolated verification 606 passed with 10 skipped, Ruff and diff checks clean, and no secret-pattern matches. Task 1 remains CLEAN through delivery commits `6d06a3e`, `783a814`, `869dd20`, and `8e1792d`. The broad final re-review remains pending, so Task 12 is not complete. Docker CLI remains unavailable on this controller, and no local image-build success is claimed.
+
+## 2026-07-30 Task 12 final unified fix and CLEAN closure
+
+Final unified fix `e7892cd` closed Task 12. The final scoped review CLEAN and broad final review CLEAN found no new Critical or Important findings. Controller verification at `e7892cd` ran full pytest to 100%; Ruff and diff exit 0. Docker CLI remains unavailable, and no local image build claimed. Task 12 is complete.
+
+## 2026-07-30 Task 13 pre-publication gate
+
+Task 13 is In progress. The user explicitly authorized public GitHub source publication; repository, CI, Render, and hosted evidence pending. The pre-publication local gate remains pending: no repository URL, remote CI, Render URL, or hosted SUCCEEDED evidence yet.
