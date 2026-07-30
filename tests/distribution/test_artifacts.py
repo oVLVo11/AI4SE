@@ -14,10 +14,29 @@ from pathlib import Path
 import pytest
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+EXPECTED_TASK_12_STATUS = (
+    "In progress; Task 1 and Task 2 clean, broad final re-review pending"
+)
+EXPECTED_TASK_12_SPEC_REVIEW = (
+    "`/root/task12_task1_review`: Task 1 CLEAN after round 2; "
+    "Task 2 review CLEAN through round 4; broad final re-review pending"
+)
 EXPECTED_TASK_12_QUALITY_REVIEW = (
-    "Task 1 review CLEAN; Task 2 review pending; focused 12 passed; "
-    "full isolated 593 passed, 10 skipped; wheel/sdist and wheel CLI/demo verified; "
+    "Task 1 review CLEAN; Task 2 review CLEAN through f916136; "
+    "broad final re-review pending; distribution 21 passed; "
+    "full isolated 606 passed, 10 skipped; wheel/sdist and wheel CLI/demo verified; "
     "Docker CLI unavailable"
+)
+EXPECTED_TASK_12_COMMITS = (
+    "6d06a3e",
+    "783a814",
+    "869dd20",
+    "8e1792d",
+    "2313c29",
+    "5ebe41b",
+    "469d268",
+    "1d37067",
+    "f916136",
 )
 
 
@@ -51,8 +70,8 @@ def _validate_root_evidence(plan: str, agent_log: str) -> None:
     assert ledger["11A"][0] == "Blocked; breaker reached"
     assert ledger["11B"][0] == "Complete"
     assert "CLEAN" in ledger["11B"][2]
-    assert ledger["12"][0] == "In progress; Task 1 clean, Task 2 under review"
-    assert "Task 2 review pending" in ledger["12"][2]
+    assert ledger["12"][0].strip() == EXPECTED_TASK_12_STATUS
+    assert ledger["12"][2].strip() == EXPECTED_TASK_12_SPEC_REVIEW
     assert "breaker" in ledger["11"][2].lower()
     assert "breaker" in ledger["11"][3].lower()
     assert "clean" not in ledger["11"][2].lower()
@@ -63,10 +82,6 @@ def _validate_root_evidence(plan: str, agent_log: str) -> None:
     assert "clean" not in ledger["11A"][3].lower()
     assert "CLEAN" in ledger["11B"][2]
     assert "CLEAN" in ledger["11B"][3]
-    assert "Task 1 clean" in ledger["12"][0]
-    assert "Task 2 under review" in ledger["12"][0]
-    assert "CLEAN" in ledger["12"][2]
-    assert "Task 2 review pending" in ledger["12"][2]
     assert ledger["12"][3].strip() == EXPECTED_TASK_12_QUALITY_REVIEW
 
     required_commits = {
@@ -76,7 +91,7 @@ def _validate_root_evidence(plan: str, agent_log: str) -> None:
         ),
         "11A": ("87e5ad7", "63b08cf", "07cffcd", "5eb42fb", "ea569a9", "47bed5d", "6de2411"),
         "11B": ("d396c24", "e7448ff", "cad8e17"),
-        "12": ("6d06a3e", "783a814", "869dd20", "8e1792d"),
+        "12": EXPECTED_TASK_12_COMMITS,
     }
     for task, expected in required_commits.items():
         actual = tuple(re.findall(r"\b[0-9a-f]{7,40}\b", ledger[task][4]))
@@ -87,6 +102,7 @@ def _validate_root_evidence(plan: str, agent_log: str) -> None:
         "## 2026-07-30 Task 11A remediation and breaker",
         "## 2026-07-30 Task 11B remediation and CLEAN review",
         "## 2026-07-30 Task 12 distribution work",
+        "## 2026-07-30 Task 12 Task 2 review CLEAN and broad final re-review pending",
     )
     heading_positions = [agent_log.index(heading) for heading in headings]
     assert heading_positions == sorted(heading_positions)
@@ -94,15 +110,29 @@ def _validate_root_evidence(plan: str, agent_log: str) -> None:
     task_11 = agent_log[heading_positions[0] : heading_positions[1]].lower()
     task_11a = agent_log[heading_positions[1] : heading_positions[2]].lower()
     task_11b = agent_log[heading_positions[2] : heading_positions[3]]
+    task_12_review = agent_log[heading_positions[4] :]
     assert "breaker" in task_11
     assert "breaker" in task_11a
     assert "remaining" in task_11b.lower() and "defect" in task_11b.lower()
     assert "CLEAN" in task_11b
-    for commit in ("6de2411", "cad8e17", "6d06a3e", "783a814", "869dd20", "8e1792d"):
+    assert "Task 2 review CLEAN" in task_12_review
+    assert "broad final re-review remains pending" in task_12_review
+    assert "Task 12 is not complete" in task_12_review
+    assert "Docker CLI remains unavailable" in task_12_review
+    for commit in ("6de2411", "cad8e17", *EXPECTED_TASK_12_COMMITS):
         assert commit in agent_log
 
 
 def test_root_evidence_records_preserve_task_11_breakers_and_task_12_review_state() -> None:
+    _validate_root_evidence(_read("PLAN.md"), _read("AGENT_LOG.md"))
+
+
+def test_root_evidence_records_require_task_2_clean_and_broad_final_review_pending() -> None:
+    ledger = _task_ledger_rows(_read("PLAN.md"))
+    assert ledger["12"][0].strip() == EXPECTED_TASK_12_STATUS
+    assert ledger["12"][2].strip() == EXPECTED_TASK_12_SPEC_REVIEW
+    assert ledger["12"][3].strip() == EXPECTED_TASK_12_QUALITY_REVIEW
+    assert tuple(re.findall(r"\b[0-9a-f]{7,40}\b", ledger["12"][4])) == EXPECTED_TASK_12_COMMITS
     _validate_root_evidence(_read("PLAN.md"), _read("AGENT_LOG.md"))
 
 
@@ -111,8 +141,19 @@ def test_root_evidence_records_preserve_task_11_breakers_and_task_12_review_stat
     (
         ("PLAN.md", "Implemented; breaker reached", "Complete; CLEAN"),
         ("PLAN.md", "Blocked; breaker reached", "Complete; CLEAN"),
-        ("PLAN.md", "In progress; Task 1 clean, Task 2 under review", "Complete; CLEAN"),
-        ("PLAN.md", "`6d06a3e`, `783a814`, `869dd20`, `8e1792d`", "`deadbee`"),
+        (
+            "PLAN.md",
+            "In progress; Task 1 and Task 2 clean, broad final re-review pending",
+            "Complete; CLEAN",
+        ),
+        (
+            "PLAN.md",
+            (
+                "`6d06a3e`, `783a814`, `869dd20`, `8e1792d`, `2313c29`, `5ebe41b`, "
+                "`469d268`, `1d37067`, `f916136`"
+            ),
+            "`deadbee`",
+        ),
         ("AGENT_LOG.md", "`783a814`", "`amendment unavailable`"),
     ),
 )
@@ -135,7 +176,18 @@ def test_root_evidence_contract_rejects_reviewed_history_mutations(
     (
         (
             "PLAN.md",
-            (("`6d06a3e`, `783a814`, `869dd20`, `8e1792d`", "`6d06a3e`, `783a814`, `869dd20`, `8e1792d`, `deadbee`"),),
+            (
+                (
+                    (
+                        "`6d06a3e`, `783a814`, `869dd20`, `8e1792d`, `2313c29`, "
+                        "`5ebe41b`, `469d268`, `1d37067`, `f916136`"
+                    ),
+                    (
+                        "`6d06a3e`, `783a814`, `869dd20`, `8e1792d`, `2313c29`, "
+                        "`5ebe41b`, `469d268`, `1d37067`, `f916136`, `deadbee`"
+                    ),
+                ),
+            ),
         ),
         (
             "PLAN.md",
@@ -166,7 +218,7 @@ def test_root_evidence_contract_rejects_completed_task_12_and_docker_success(
 ) -> None:
     documents = {name: _read(name) for name in ("PLAN.md", "AGENT_LOG.md")}
     documents["PLAN.md"] = documents["PLAN.md"].replace(
-        "Task 1 review CLEAN; Task 2 review pending; focused 12 passed; full isolated 593 passed, 10 skipped; wheel/sdist and wheel CLI/demo verified; Docker CLI unavailable",
+        EXPECTED_TASK_12_QUALITY_REVIEW,
         "Task 12 COMPLETE; Docker image build succeeded",
     )
 
@@ -187,14 +239,9 @@ def test_root_evidence_contract_rejects_appended_task_12_quality_contradictions(
     contradiction: str,
 ) -> None:
     documents = {name: _read(name) for name in ("PLAN.md", "AGENT_LOG.md")}
-    current_quality_review = (
-        "Task 1 review CLEAN; Task 2 review pending; focused 12 passed; "
-        "full isolated 593 passed, 10 skipped; wheel/sdist and wheel CLI/demo verified; "
-        "Docker CLI unavailable"
-    )
     documents["PLAN.md"] = documents["PLAN.md"].replace(
-        current_quality_review,
-        f"{current_quality_review}; {contradiction}",
+        EXPECTED_TASK_12_QUALITY_REVIEW,
+        f"{EXPECTED_TASK_12_QUALITY_REVIEW}; {contradiction}",
     )
 
     monkeypatch.setitem(globals(), "_read", documents.__getitem__)
@@ -244,13 +291,30 @@ def test_readme_documents_safe_local_and_portable_delivery_limits() -> None:
         "pytest can execute repository code",
         "not an operating-system sandbox",
         "local SQLite and audit",
-        "python -m pip install --no-deps dist\\pyquality_harness-0.1.0-py3-none-any.whl",
         "docker build -t pyquality-harness .",
         "docker run --rm -p 8000:8000 pyquality-harness",
         "### Render-compatible deployment",
         "No hosted deployment is provided",
     ):
         assert text in readme
+
+
+def test_readme_documents_exact_local_webui_command() -> None:
+    assert "pyquality serve --host 127.0.0.1 --port 8000" in _read("README.md").splitlines()
+
+
+def test_readme_ordinary_wheel_install_includes_runtime_dependencies() -> None:
+    readme_lines = _read("README.md").splitlines()
+    wheel_install = (
+        "python -m pip install dist\\pyquality_harness-0.1.0-py3-none-any.whl"
+    )
+    assert wheel_install in readme_lines
+    for index, line in enumerate(readme_lines):
+        if "--no-deps" not in line:
+            continue
+        context = " ".join(readme_lines[max(0, index - 3) : index + 4]).lower()
+        assert "controlled verification" in context
+        assert "system-site-packages" in context
 
 
 def test_ci_files_define_the_course_commands_and_triggers() -> None:
@@ -397,6 +461,7 @@ def test_dockerignore_excludes_development_and_sensitive_local_data() -> None:
         "tests/",
         "dist/",
         "build/",
+        "*.db*",
         "*.db",
         "*.sqlite",
         "*.sqlite3",

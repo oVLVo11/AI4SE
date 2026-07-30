@@ -91,3 +91,7 @@ Controller and reviewer evidence identify `/root/task11b_impl` and `/root/task11
 ## 2026-07-30 Task 12 distribution work
 
 Agent `/root/task12_artifacts` implemented Task 12 delivery commits `6d06a3e`, `783a814`, `869dd20`, and `8e1792d`; reviewer `/root/task12_task1_review` marked Task 1 CLEAN after round 2. Task 1 evidence records focused distribution/CLI 12 passed, full isolated verification 593 passed with 10 skipped, inspected wheel and clean sdist, and an isolated wheel CLI/demo passing without credentials or network activity. The human-approved public-mock amendment is `783a814`. `docker version` produced PowerShell `CommandNotFoundException` because the Docker CLI is absent, so no local image-build success is claimed. Task 12 remains in progress while its Task 2 evidence synchronization and final review are pending.
+
+## 2026-07-30 Task 12 Task 2 review CLEAN and broad final re-review pending
+
+Controller-supplied review evidence marks Task 2 review CLEAN through implementation commit `2313c29` and fix commits `5ebe41b`, `469d268`, `1d37067`, and `f916136`. Its latest verified evidence records distribution 21 passed, full isolated verification 606 passed with 10 skipped, Ruff and diff checks clean, and no secret-pattern matches. Task 1 remains CLEAN through delivery commits `6d06a3e`, `783a814`, `869dd20`, and `8e1792d`. The broad final re-review remains pending, so Task 12 is not complete. Docker CLI remains unavailable on this controller, and no local image-build success is claimed.

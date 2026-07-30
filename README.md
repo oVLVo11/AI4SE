@@ -22,7 +22,13 @@ Run the deterministic local demonstration:
 pyquality demo --json
 ```
 
-Start the local public-mock server:
+Start the local WebUI in normal local mode:
+
+```powershell
+pyquality serve --host 127.0.0.1 --port 8000
+```
+
+For a deterministic credential-free public-mock WebUI, run:
 
 ```powershell
 pyquality serve --host 127.0.0.1 --port 8000 --public-mock
@@ -41,7 +47,7 @@ python -m build --no-isolation
 Install the generated wheel in a fresh environment with:
 
 ```powershell
-python -m pip install --no-deps dist\pyquality_harness-0.1.0-py3-none-any.whl
+python -m pip install dist\pyquality_harness-0.1.0-py3-none-any.whl
 ```
 
 Build and run the public-mock container locally:

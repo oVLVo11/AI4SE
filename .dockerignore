@@ -12,6 +12,7 @@ tests/
 dist/
 build/
 *.egg-info/
+*.db*
 *.db
 *.sqlite
 *.sqlite3
